@@ -580,6 +580,7 @@ def compute_point_total(db: Session, merchant_id: int, point_code: str, y: int, 
 
 
 def get_points_for_month(db: Session, merchant_id: int, y: int, m: int) -> list[str]:
+    ensure_submissions_table(db)
     start = month_start(y, m)
     end = month_end_exclusive(y, m)
 
@@ -628,3 +629,84 @@ def compute_overall_total(db: Session, merchant_id: int, y: int, m: int):
         "per_point": per_point,
         "per_point_details": per_point_details
     }
+
+
+def get_all_tu_values(db: Session) -> list[str]:
+    rows = db.execute(text("""
+        SELECT DISTINCT tu
+        FROM merchants
+        WHERE tu IS NOT NULL AND TRIM(tu) <> ''
+        ORDER BY tu
+    """)).all()
+    return [r[0] for r in rows if r and r[0]]
+
+
+def get_admin_report_rows(
+    db: Session,
+    y: int,
+    m: int,
+    tu: str | None = None,
+    status: str | None = None
+):
+    ensure_submissions_table(db)
+    mk = month_start(y, m)
+
+    sql = """
+        SELECT
+            ps.merchant_id,
+            ps.point_code,
+            ps.month_key,
+            ps.comment,
+            ps.extra_amount,
+            ps.receipt_path,
+            ps.status,
+            m.fio,
+            m.tu
+        FROM point_submissions ps
+        JOIN merchants m ON m.id = ps.merchant_id
+        WHERE ps.month_key = :month_key
+    """
+
+    params = {"month_key": mk}
+
+    if tu:
+        sql += " AND m.tu = :tu"
+        params["tu"] = tu
+
+    if status:
+        sql += " AND ps.status = :status"
+        params["status"] = status
+
+    sql += " ORDER BY m.tu NULLS LAST, m.fio, ps.point_code"
+
+    rows = db.execute(text(sql), params).mappings().all()
+
+    result = []
+    for row in rows:
+        detail = compute_point_total(db, row["merchant_id"], row["point_code"], y, m)
+        result.append({
+            "merchant_id": row["merchant_id"],
+            "fio": row["fio"],
+            "tu": row["tu"] or "",
+            "point_code": row["point_code"],
+            "month_key": str(row["month_key"]),
+            "status": row["status"],
+            "comment": row["comment"] or "",
+            "extra_amount": int(row["extra_amount"] or 0),
+            "receipt_path": row["receipt_path"],
+            "cnt_supply": detail["cnt_supply"],
+            "cnt_no_supply": detail["cnt_no_supply"],
+            "cnt_full_inv": detail["cnt_full_inv"],
+            "sum_supply": detail["sum_supply"],
+            "sum_no_supply": detail["sum_no_supply"],
+            "sum_inventory": detail["sum_inventory"],
+            "coffee_cnt": detail["coffee_cnt"],
+            "coffee_rate": detail["coffee_rate"],
+            "coffee_sum": detail["coffee_sum"],
+            "total": detail["total"],
+            "rate_supply": detail["rate_supply"],
+            "rate_no_supply": detail["rate_no_supply"],
+            "rate_inventory": detail["rate_inventory"],
+        })
+
+    return result
