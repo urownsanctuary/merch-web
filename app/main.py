@@ -1,4 +1,8 @@
-from fastapi import FastAPI, Depends, HTTPException, Form
+import os
+import uuid
+from pathlib import Path
+
+from fastapi import FastAPI, Depends, HTTPException, Form, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
@@ -21,11 +25,19 @@ from app.services import (
     days_in_month,
     weekday_of,
     month_title,
+    get_submission,
+    upsert_submission_draft,
+    submit_submission,
+    reopen_submission,
 )
 
 app = FastAPI()
 
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
+
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 
 def get_db():
@@ -90,12 +102,11 @@ def base_css():
             --soft: #EEF4EF;
             --soft-2: #F3F7F3;
             --error: #B91C1C;
+            --ok: #166534;
             --shadow: 0 12px 32px rgba(0, 0, 0, 0.08);
         }
 
-        * {
-            box-sizing: border-box;
-        }
+        * { box-sizing: border-box; }
 
         body {
             margin: 0;
@@ -156,10 +167,6 @@ def base_css():
             margin-bottom: 18px;
         }
 
-        .muted {
-            color: var(--muted);
-        }
-
         label {
             display: block;
             margin: 14px 0 6px;
@@ -168,16 +175,22 @@ def base_css():
             color: var(--text);
         }
 
-        input {
+        input, textarea {
             width: 100%;
             padding: 14px 16px;
             border: 1px solid var(--line);
             border-radius: 14px;
             font-size: 16px;
             background: #fff;
+            font-family: inherit;
         }
 
-        input:focus {
+        textarea {
+            resize: vertical;
+            min-height: 92px;
+        }
+
+        input:focus, textarea:focus {
             outline: none;
             border-color: var(--green);
             box-shadow: 0 0 0 3px rgba(46, 125, 50, 0.10);
@@ -186,7 +199,7 @@ def base_css():
         .btn {
             display: inline-block;
             width: 100%;
-            margin-top: 20px;
+            margin-top: 16px;
             padding: 15px 16px;
             border: none;
             border-radius: 14px;
@@ -199,33 +212,19 @@ def base_css():
             cursor: pointer;
         }
 
-        .btn:hover {
-            background: var(--green-dark);
-        }
+        .btn:hover { background: var(--green-dark); }
 
         .btn-secondary {
             background: var(--soft);
             color: var(--text);
         }
 
-        .btn-secondary:hover {
-            background: #e3ece3;
-        }
+        .btn-secondary:hover { background: #e3ece3; }
 
         .btn-small {
             margin-top: 12px;
             padding: 12px 14px;
             font-size: 15px;
-        }
-
-        .hint {
-            margin-top: 16px;
-            padding: 12px 14px;
-            border-radius: 14px;
-            background: var(--soft);
-            color: var(--muted);
-            font-size: 13px;
-            line-height: 1.4;
         }
 
         .footer {
@@ -243,10 +242,30 @@ def base_css():
             font-weight: 800;
         }
 
+        .hint {
+            margin-top: 16px;
+            padding: 12px 14px;
+            border-radius: 14px;
+            background: var(--soft);
+            color: var(--muted);
+            font-size: 13px;
+            line-height: 1.4;
+        }
+
         .error-box {
             margin-top: 16px;
             background: #FEF2F2;
             color: var(--error);
+            border-radius: 14px;
+            padding: 14px;
+            line-height: 1.45;
+            font-weight: 700;
+        }
+
+        .success-box {
+            margin-top: 16px;
+            background: #ECFDF3;
+            color: var(--ok);
             border-radius: 14px;
             padding: 14px;
             line-height: 1.45;
@@ -334,20 +353,15 @@ def base_css():
             line-height: 1.5;
         }
 
-        .calendar-wrap {
-            margin-top: 4px;
-        }
+        .calendar-wrap { margin-top: 4px; }
 
-        .weekdays,
-        .calendar-grid {
+        .weekdays, .calendar-grid {
             display: grid;
             grid-template-columns: repeat(7, 1fr);
             gap: 10px;
         }
 
-        .weekdays {
-            margin-bottom: 10px;
-        }
+        .weekdays { margin-bottom: 10px; }
 
         .weekday {
             text-align: center;
@@ -357,8 +371,7 @@ def base_css():
             padding: 6px 0;
         }
 
-        .day,
-        .day-empty {
+        .day, .day-empty {
             min-height: 90px;
             border-radius: 18px;
             padding: 10px;
@@ -380,8 +393,12 @@ def base_css():
             box-shadow: 0 0 0 2px rgba(46, 125, 50, 0.06);
         }
 
-        .day-empty {
-            background: transparent;
+        .day-empty { background: transparent; }
+
+        .day-disabled {
+            opacity: 0.65;
+            cursor: default;
+            pointer-events: none;
         }
 
         .day-number {
@@ -448,53 +465,44 @@ def base_css():
             font-size: 14px;
         }
 
-        .action-list {
-            display: grid;
-            gap: 12px;
-            margin-top: 20px;
+        details.point-detail {
+            margin-top: 10px;
+            border: 1px solid #E5E7EB;
+            border-radius: 14px;
+            background: #FAFCFA;
+            padding: 10px 14px;
+        }
+
+        details.point-detail summary {
+            cursor: pointer;
+            font-weight: 800;
+            list-style: none;
+        }
+
+        details.point-detail summary::-webkit-details-marker {
+            display: none;
+        }
+
+        .summary-content {
+            margin-top: 10px;
+            color: var(--text);
+            line-height: 1.6;
         }
 
         @media (max-width: 760px) {
-            .page {
-                align-items: flex-start;
-            }
-
-            .card-wide {
-                padding: 18px 14px 24px;
-            }
-
-            .sum-strip,
-            .details-grid {
-                grid-template-columns: 1fr;
-            }
-
-            .weekdays,
-            .calendar-grid {
-                gap: 8px;
-            }
-
-            .day,
-            .day-empty {
+            .page { align-items: flex-start; }
+            .card-wide { padding: 18px 14px 24px; }
+            .sum-strip, .details-grid { grid-template-columns: 1fr; }
+            .weekdays, .calendar-grid { gap: 8px; }
+            .day, .day-empty {
                 min-height: 80px;
                 border-radius: 14px;
                 padding: 8px;
             }
-
-            .day-number {
-                font-size: 16px;
-            }
-
-            h1 {
-                font-size: 30px;
-            }
-
-            .brand {
-                font-size: 24px;
-            }
-
-            .calendar-month {
-                font-size: 24px;
-            }
+            .day-number { font-size: 16px; }
+            h1 { font-size: 30px; }
+            .brand { font-size: 24px; }
+            .calendar-month { font-size: 24px; }
         }
     </style>
     """
@@ -517,41 +525,21 @@ def login_page():
         <div class="card">
             <div class="brand">ВкусВилл</div>
             <h1>Сверки мерчендайзеров</h1>
-            <div class="subtitle">
-                Введите ФИО и последние 4 цифры телефона
-            </div>
+            <div class="subtitle">Введите ФИО и последние 4 цифры телефона</div>
 
             <form method="post" action="/login-page">
                 <label for="fio">ФИО</label>
-                <input
-                    id="fio"
-                    name="fio"
-                    type="text"
-                    placeholder="Иванов Иван Иванович"
-                    required
-                />
+                <input id="fio" name="fio" type="text" placeholder="Иванов Иван Иванович" required />
 
                 <label for="last4">Последние 4 цифры телефона</label>
-                <input
-                    id="last4"
-                    name="last4"
-                    type="text"
-                    inputmode="numeric"
-                    maxlength="4"
-                    placeholder="1234"
-                    required
-                />
+                <input id="last4" name="last4" type="text" inputmode="numeric" maxlength="4" placeholder="1234" required />
 
                 <button class="btn" type="submit">Войти</button>
             </form>
 
-            <div class="hint">
-                Сейчас открыт период за {month_title(period["year"], period["month"])}.
-            </div>
+            <div class="hint">Сейчас открыт период за {month_title(period["year"], period["month"])}.</div>
 
-            <div class="footer">
-                Веб-версия сверок мерчендайзеров
-            </div>
+            <div class="footer">Веб-версия сверок мерчендайзеров</div>
         </div>
     </div>
 </body>
@@ -581,9 +569,7 @@ def login_submit(
     <div class="page">
         <div class="card">
             <h1>Ошибка входа</h1>
-            <div class="error-box">
-                Неверные данные. Проверьте ФИО и последние 4 цифры телефона.
-            </div>
+            <div class="error-box">Неверные данные. Проверьте ФИО и последние 4 цифры телефона.</div>
             <a class="back" href="/login-page">← Попробовать снова</a>
         </div>
     </div>
@@ -591,11 +577,7 @@ def login_submit(
 </html>
 """
 
-    fio_safe = user["fio"]
-    return RedirectResponse(
-        url=f"/menu-page?fio={fio_safe}",
-        status_code=303
-    )
+    return RedirectResponse(url=f"/menu-page?fio={user['fio']}", status_code=303)
 
 
 @app.get("/menu-page", response_class=HTMLResponse)
@@ -621,9 +603,7 @@ def menu_page(fio: str = "", db: Session = Depends(get_db)):
             <div class="brand">ВкусВилл</div>
             <h1>Главное меню</h1>
             <div class="subtitle">{fio}</div>
-            <div class="hint">
-                Сейчас открыт период за {month_title(period["year"], period["month"])}.
-            </div>
+            <div class="hint">Сейчас открыт период за {month_title(period["year"], period["month"])}.</div>
 
             <div class="sum-card" style="margin-top: 18px;">
                 <div class="sum-title">Общая сумма за месяц</div>
@@ -711,12 +691,7 @@ def point_submit(
 </html>
 """
 
-    has_supply = point_has_any_supply_in_month(
-        db=db,
-        point_code=point_code,
-        y=period["year"],
-        m=period["month"]
-    )
+    has_supply = point_has_any_supply_in_month(db, point_code, period["year"], period["month"])
 
     if not has_supply:
         return f"""
@@ -744,20 +719,27 @@ def point_submit(
 </html>
 """
 
-    return RedirectResponse(
-        url=f"/calendar-page?fio={fio}&point_code={point_code}",
-        status_code=303
-    )
+    return RedirectResponse(url=f"/calendar-page?fio={fio}&point_code={point_code}", status_code=303)
 
 
-def build_day_href(fio: str, point_code: str, y: int, m: int, day: int) -> str:
+def build_day_href(fio: str, point_code: str, y: int, m: int, day: int, is_submitted: bool) -> str:
+    if is_submitted:
+        return "#"
     wd = weekday_of(y, m, day)
     if wd in (4, 5):
         return f"/day-action-page?fio={fio}&point_code={point_code}&day={day}"
     return f"/toggle-day?fio={fio}&point_code={point_code}&day={day}"
 
 
-def build_calendar_html(fio: str, point_code: str, y: int, m: int, boxes_map: dict[int, int], visits: dict[int, set[str]]) -> str:
+def build_calendar_html(
+    fio: str,
+    point_code: str,
+    y: int,
+    m: int,
+    boxes_map: dict[int, int],
+    visits: dict[int, set[str]],
+    is_submitted: bool
+) -> str:
     dim = days_in_month(y, m)
     first_wd = weekday_of(y, m, 1)
 
@@ -781,17 +763,16 @@ def build_calendar_html(fio: str, point_code: str, y: int, m: int, boxes_map: di
 
         if boxes > 0:
             badges += '<span class="badge badge-supply">П</span>'
-
         if "DAY" in day_visits:
             badges += '<span class="badge badge-day">В</span>'
-
         if "FULL_INVENT" in day_visits:
             badges += '<span class="badge badge-inv">И</span>'
 
-        href = build_day_href(fio, point_code, y, m, day)
+        href = build_day_href(fio, point_code, y, m, day, is_submitted)
+        cls = "day day-disabled" if is_submitted else "day"
 
         html += f"""
-        <a class="day" href="{href}">
+        <a class="{cls}" href="{href}">
             <div class="day-number">{day}</div>
             <div class="day-badges">{badges}</div>
         </a>
@@ -805,6 +786,10 @@ def build_calendar_html(fio: str, point_code: str, y: int, m: int, boxes_map: di
 def calendar_page(
     fio: str,
     point_code: str,
+    saved: str = "",
+    submitted: str = "",
+    reopened: str = "",
+    error: str = "",
     db: Session = Depends(get_db)
 ):
     period = get_active_period()
@@ -815,13 +800,84 @@ def calendar_page(
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
 
+    point_code = normalize_point_code(point_code)
+
     boxes_map = get_supply_boxes_map(db, point_code, y, m)
     visits = get_visits_for_month(db, merchant["id"], point_code, y, m)
     point_total = compute_point_total(db, merchant["id"], point_code, y, m)
     overall = compute_overall_total(db, merchant["id"], y, m)
-    calendar_html = build_calendar_html(fio, point_code, y, m, boxes_map, visits)
 
-    coffee_text = "Да" if point_total["coffee_enabled"] else "Нет"
+    is_submitted = point_total["submission_status"] == "submitted"
+
+    calendar_html = build_calendar_html(
+        fio=fio,
+        point_code=point_code,
+        y=y,
+        m=m,
+        boxes_map=boxes_map,
+        visits=visits,
+        is_submitted=is_submitted
+    )
+
+    comment_value = point_total["comment"] or ""
+    extra_amount_value = point_total["extra_amount"] or 0
+    receipt_link = ""
+    if point_total["receipt_path"]:
+        receipt_link = f"<div class='hint' style='margin-top:10px'>Чек: <a href='/{point_total['receipt_path']}' target='_blank'>открыть файл</a></div>"
+
+    info_box = ""
+    if saved == "1":
+        info_box += "<div class='success-box'>Черновик сохранён.</div>"
+    if submitted == "1":
+        info_box += "<div class='success-box'>Сверка отправлена.</div>"
+    if reopened == "1":
+        info_box += "<div class='success-box'>Сверка разблокирована для редактирования.</div>"
+    if error == "receipt_required":
+        info_box += "<div class='error-box'>Для возмещения необходимо приложить чек.</div>"
+
+    form_block = ""
+    if is_submitted:
+        form_block = f"""
+        <div class="detail-card" style="margin-top:18px;">
+            <div class="detail-title">Примечание</div>
+            <div class="detail-line">{comment_value if comment_value else "—"}</div>
+
+            <div class="detail-title" style="margin-top:14px;">Возмещение</div>
+            <div class="detail-line">{extra_amount_value} ₽</div>
+
+            {receipt_link}
+
+            <a class="btn btn-secondary" href="/reopen-submission?fio={fio}&point_code={point_code}">Редактировать сверку</a>
+        </div>
+        """
+    else:
+        form_block = f"""
+        <form method="post" action="/save-submission" enctype="multipart/form-data" class="detail-card" style="margin-top:18px;">
+            <input type="hidden" name="fio" value="{fio}" />
+            <input type="hidden" name="point_code" value="{point_code}" />
+
+            <label for="comment">Примечание</label>
+            <textarea id="comment" name="comment">{comment_value}</textarea>
+
+            <label for="extra_amount">Возмещение, ₽</label>
+            <input id="extra_amount" name="extra_amount" type="number" min="0" value="{extra_amount_value}" />
+
+            <label for="receipt">Чек</label>
+            <input id="receipt" name="receipt" type="file" accept=".jpg,.jpeg,.png,.pdf,.webp" />
+
+            {receipt_link}
+
+            <button class="btn btn-secondary" type="submit">Сохранить черновик</button>
+        </form>
+
+        <form method="post" action="/submit-submission" enctype="multipart/form-data">
+            <input type="hidden" name="fio" value="{fio}" />
+            <input type="hidden" name="point_code" value="{point_code}" />
+            <input type="hidden" name="comment" value="{comment_value}" />
+            <input type="hidden" name="extra_amount" value="{extra_amount_value}" />
+            <button class="btn" type="submit">Отправить сверку</button>
+        </form>
+        """
 
     return f"""
 <!DOCTYPE html>
@@ -844,9 +900,12 @@ def calendar_page(
                 <div class="calendar-meta">
                     <div class="mini-pill">Точка: {point_code}</div>
                     <div class="mini-pill">{fio}</div>
-                    <div class="mini-pill">КМ: {coffee_text}</div>
+                    <div class="mini-pill">КМ: {"Да" if point_total["coffee_enabled"] else "Нет"}</div>
+                    <div class="mini-pill">Статус: {"Отправлено" if is_submitted else "Черновик"}</div>
                 </div>
             </div>
+
+            {info_box}
 
             <div class="sum-strip">
                 <div class="sum-card">
@@ -882,6 +941,11 @@ def calendar_page(
                 </div>
             </div>
 
+            <div class="detail-card" style="margin-bottom:18px;">
+                <div class="detail-title">Возмещение</div>
+                <div class="detail-line">{point_total["extra_amount"]} ₽</div>
+            </div>
+
             <div class="calendar-wrap">
                 {calendar_html}
             </div>
@@ -901,12 +965,140 @@ def calendar_page(
                 Поставки до 5 коробок не оплачиваются.
             </div>
 
+            {form_block}
+
             <a class="back" href="/point-page?fio={fio}">← Выбрать другую точку</a>
         </div>
     </div>
 </body>
 </html>
 """
+
+
+@app.post("/save-submission")
+async def save_submission(
+    fio: str = Form(...),
+    point_code: str = Form(...),
+    comment: str = Form(""),
+    extra_amount: int = Form(0),
+    receipt: UploadFile | None = File(None),
+    db: Session = Depends(get_db)
+):
+    period = get_active_period()
+    merchant = get_merchant_by_fio(db, fio)
+    if not merchant:
+        return RedirectResponse(url="/login-page", status_code=303)
+
+    point_code = normalize_point_code(point_code)
+
+    receipt_path = None
+    if receipt and receipt.filename:
+        ext = Path(receipt.filename).suffix.lower()
+        filename = f"{uuid.uuid4().hex}{ext}"
+        filepath = UPLOAD_DIR / filename
+        content = await receipt.read()
+        filepath.write_bytes(content)
+        receipt_path = f"uploads/{filename}"
+
+    upsert_submission_draft(
+        db=db,
+        merchant_id=merchant["id"],
+        point_code=point_code,
+        y=period["year"],
+        m=period["month"],
+        comment=comment or "",
+        extra_amount=max(0, int(extra_amount or 0)),
+        receipt_path=receipt_path
+    )
+
+    return RedirectResponse(
+        url=f"/calendar-page?fio={fio}&point_code={point_code}&saved=1",
+        status_code=303
+    )
+
+
+@app.post("/submit-submission")
+async def submit_submission_route(
+    fio: str = Form(...),
+    point_code: str = Form(...),
+    comment: str = Form(""),
+    extra_amount: int = Form(0),
+    receipt: UploadFile | None = File(None),
+    db: Session = Depends(get_db)
+):
+    period = get_active_period()
+    merchant = get_merchant_by_fio(db, fio)
+    if not merchant:
+        return RedirectResponse(url="/login-page", status_code=303)
+
+    point_code = normalize_point_code(point_code)
+    extra_amount = max(0, int(extra_amount or 0))
+
+    existing = get_submission(db, merchant["id"], point_code, period["year"], period["month"])
+
+    receipt_path = None
+    if receipt and receipt.filename:
+        ext = Path(receipt.filename).suffix.lower()
+        filename = f"{uuid.uuid4().hex}{ext}"
+        filepath = UPLOAD_DIR / filename
+        content = await receipt.read()
+        filepath.write_bytes(content)
+        receipt_path = f"uploads/{filename}"
+
+    effective_receipt = receipt_path or (existing.get("receipt_path") if existing else None)
+
+    if extra_amount > 0 and not effective_receipt:
+        upsert_submission_draft(
+            db=db,
+            merchant_id=merchant["id"],
+            point_code=point_code,
+            y=period["year"],
+            m=period["month"],
+            comment=comment or "",
+            extra_amount=extra_amount,
+            receipt_path=receipt_path
+        )
+        return RedirectResponse(
+            url=f"/calendar-page?fio={fio}&point_code={point_code}&error=receipt_required",
+            status_code=303
+        )
+
+    upsert_submission_draft(
+        db=db,
+        merchant_id=merchant["id"],
+        point_code=point_code,
+        y=period["year"],
+        m=period["month"],
+        comment=comment or "",
+        extra_amount=extra_amount,
+        receipt_path=receipt_path
+    )
+
+    submit_submission(db, merchant["id"], point_code, period["year"], period["month"])
+
+    return RedirectResponse(
+        url=f"/calendar-page?fio={fio}&point_code={point_code}&submitted=1",
+        status_code=303
+    )
+
+
+@app.get("/reopen-submission")
+def reopen_submission_route(
+    fio: str,
+    point_code: str,
+    db: Session = Depends(get_db)
+):
+    period = get_active_period()
+    merchant = get_merchant_by_fio(db, fio)
+    if not merchant:
+        return RedirectResponse(url="/login-page", status_code=303)
+
+    reopen_submission(db, merchant["id"], normalize_point_code(point_code), period["year"], period["month"])
+
+    return RedirectResponse(
+        url=f"/calendar-page?fio={fio}&point_code={normalize_point_code(point_code)}&reopened=1",
+        status_code=303
+    )
 
 
 @app.get("/day-action-page", response_class=HTMLResponse)
@@ -923,6 +1115,10 @@ def day_action_page(
     merchant = get_merchant_by_fio(db, fio)
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
+
+    point_total = compute_point_total(db, merchant["id"], point_code, y, m)
+    if point_total["submission_status"] == "submitted":
+        return RedirectResponse(url=f"/calendar-page?fio={fio}&point_code={point_code}", status_code=303)
 
     if day < 1 or day > days_in_month(y, m):
         return RedirectResponse(url=f"/calendar-page?fio={fio}&point_code={point_code}", status_code=303)
@@ -958,15 +1154,13 @@ def day_action_page(
                 Дата: {day:02d}.{m:02d}.{y}
             </div>
 
-            <div class="action-list">
-                <a class="btn btn-small" href="/toggle-day?fio={fio}&point_code={point_code}&day={day}">
-                    {day_btn_text}
-                </a>
+            <a class="btn btn-small" href="/toggle-day?fio={fio}&point_code={point_code}&day={day}">
+                {day_btn_text}
+            </a>
 
-                <a class="btn btn-secondary btn-small" href="/toggle-inventory?fio={fio}&point_code={point_code}&day={day}">
-                    {inv_btn_text}
-                </a>
-            </div>
+            <a class="btn btn-secondary btn-small" href="/toggle-inventory?fio={fio}&point_code={point_code}&day={day}">
+                {inv_btn_text}
+            </a>
 
             <a class="back" href="/calendar-page?fio={fio}&point_code={point_code}">← Назад к календарю</a>
         </div>
@@ -991,13 +1185,14 @@ def toggle_day(
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
 
+    point_total = compute_point_total(db, merchant["id"], point_code, y, m)
+    if point_total["submission_status"] == "submitted":
+        return RedirectResponse(url=f"/calendar-page?fio={fio}&point_code={point_code}", status_code=303)
+
     if 1 <= day <= days_in_month(y, m):
         toggle_day_visit(db, merchant["id"], point_code, y, m, day)
 
-    return RedirectResponse(
-        url=f"/calendar-page?fio={fio}&point_code={point_code}",
-        status_code=303
-    )
+    return RedirectResponse(url=f"/calendar-page?fio={fio}&point_code={point_code}", status_code=303)
 
 
 @app.get("/toggle-inventory")
@@ -1015,32 +1210,51 @@ def toggle_inventory(
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
 
+    point_total = compute_point_total(db, merchant["id"], point_code, y, m)
+    if point_total["submission_status"] == "submitted":
+        return RedirectResponse(url=f"/calendar-page?fio={fio}&point_code={point_code}", status_code=303)
+
     if 1 <= day <= days_in_month(y, m):
         wd = weekday_of(y, m, day)
         if wd in (4, 5):
             toggle_inventory_visit(db, merchant["id"], point_code, y, m, day)
 
-    return RedirectResponse(
-        url=f"/calendar-page?fio={fio}&point_code={point_code}",
-        status_code=303
-    )
+    return RedirectResponse(url=f"/calendar-page?fio={fio}&point_code={point_code}", status_code=303)
 
 
 @app.get("/summary-page", response_class=HTMLResponse)
 def summary_page(fio: str = "", db: Session = Depends(get_db)):
     period = get_active_period()
     merchant = get_merchant_by_fio(db, fio)
-    overall = {"total": 0, "per_point": {}}
+    overall = {"total": 0, "per_point": {}, "per_point_details": {}}
 
     if merchant:
         overall = compute_overall_total(db, merchant["id"], period["year"], period["month"])
 
-    point_lines = ""
-    if overall["per_point"]:
-        for p, total in overall["per_point"].items():
-            point_lines += f"<div class='hint' style='margin-top:10px'>{p} — {total} ₽</div>"
+    details_html = ""
+    if overall["per_point_details"]:
+        for point_code, d in overall["per_point_details"].items():
+            receipt_line = ""
+            if d["receipt_path"]:
+                receipt_line = f"<div>Чек: <a href='/{d['receipt_path']}' target='_blank'>открыть</a></div>"
+
+            details_html += f"""
+            <details class="point-detail">
+                <summary>{point_code} — {d["total"]} ₽</summary>
+                <div class="summary-content">
+                    <div>С поставкой: {d["cnt_supply"]} × {d["rate_supply"]} ₽ = {d["sum_supply"]} ₽</div>
+                    <div>Без поставки: {d["cnt_no_supply"]} × {d["rate_no_supply"]} ₽ = {d["sum_no_supply"]} ₽</div>
+                    <div>Полный инвент: {d["cnt_full_inv"]} × {d["rate_inventory"]} ₽ = {d["sum_inventory"]} ₽</div>
+                    <div>Кофемашина: {d["coffee_cnt"]} × {d["coffee_rate"]} ₽ = {d["coffee_sum"]} ₽</div>
+                    <div>Возмещение: {d["extra_amount"]} ₽</div>
+                    <div>Примечание: {d["comment"] if d["comment"] else "—"}</div>
+                    {receipt_line}
+                    <div><strong>Итого: {d["total"]} ₽</strong></div>
+                </div>
+            </details>
+            """
     else:
-        point_lines = "<div class='hint' style='margin-top:10px'>Пока нет отмеченных точек за этот месяц.</div>"
+        details_html = "<div class='hint' style='margin-top:10px'>Пока нет отмеченных точек за этот месяц.</div>"
 
     return f"""
 <!DOCTYPE html>
@@ -1063,11 +1277,9 @@ def summary_page(fio: str = "", db: Session = Depends(get_db)):
                 <div class="sum-value">{overall["total"]} ₽</div>
             </div>
 
-            {point_lines}
+            {details_html}
 
-            <div class="hint">
-                Сейчас открыт период за {month_title(period["year"], period["month"])}.
-            </div>
+            <div class="hint">Сейчас открыт период за {month_title(period["year"], period["month"])}.</div>
 
             <a class="back" href="/menu-page?fio={fio}">← Назад</a>
         </div>
