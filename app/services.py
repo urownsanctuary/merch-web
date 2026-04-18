@@ -362,6 +362,10 @@ def compute_point_total(db: Session, merchant_id: int, point_code: str, y: int, 
     cnt_day_total = 0
     cnt_full_inv = 0
 
+    sum_supply = 0
+    sum_no_supply = 0
+    sum_inventory = 0
+
     for day, slots in visits.items():
         if SLOT_DAY in slots:
             cnt_day_total += 1
@@ -369,28 +373,41 @@ def compute_point_total(db: Session, merchant_id: int, point_code: str, y: int, 
             if effective_has_supply(boxes, rates["pay_lt5"]):
                 cnt_supply += 1
                 total += rates["rate_supply"]
+                sum_supply += rates["rate_supply"]
             else:
                 cnt_no_supply += 1
                 total += rates["rate_no_supply"]
+                sum_no_supply += rates["rate_no_supply"]
 
         if SLOT_FULL_INVENT in slots:
             cnt_full_inv += 1
             total += rates["rate_inventory"]
+            sum_inventory += rates["rate_inventory"]
 
     coffee_sum = 0
+    coffee_cnt = 0
     if rates["coffee_enabled"] and cnt_day_total > 0:
+        coffee_cnt = cnt_day_total
         coffee_sum = rates["coffee_rate"] * cnt_day_total
         total += coffee_sum
 
     return {
         "total": total,
+
         "cnt_supply": cnt_supply,
         "cnt_no_supply": cnt_no_supply,
         "cnt_day_total": cnt_day_total,
         "cnt_full_inv": cnt_full_inv,
+
+        "sum_supply": sum_supply,
+        "sum_no_supply": sum_no_supply,
+        "sum_inventory": sum_inventory,
+
         "coffee_enabled": rates["coffee_enabled"],
         "coffee_rate": rates["coffee_rate"],
         "coffee_sum": coffee_sum,
+        "coffee_cnt": coffee_cnt,
+
         "pay_lt5": rates["pay_lt5"],
         "rate_supply": rates["rate_supply"],
         "rate_no_supply": rates["rate_no_supply"],
