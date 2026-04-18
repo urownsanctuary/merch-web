@@ -1,9 +1,11 @@
+
 import os
 import uuid
 import hashlib
 from io import BytesIO
 from html import escape
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI, Depends, HTTPException, Form, UploadFile, File, Cookie
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
@@ -38,6 +40,11 @@ from app.services import (
     get_admin_payroll_rows,
     get_intersections_rows,
     get_all_tu_values,
+    import_supplies_xlsx,
+    import_rates_xlsx,
+    import_merchants_xlsx,
+    clear_month_data,
+    clear_merchants_by_tu,
 )
 
 app = FastAPI()
@@ -66,7 +73,7 @@ def get_admin_cookie_value() -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def is_admin_authenticated(admin_auth: str | None) -> bool:
+def is_admin_authenticated(admin_auth: Optional[str]) -> bool:
     if not ADMIN_LOGIN or not ADMIN_PASSWORD or not SECRET_SALT:
         return False
     return admin_auth == get_admin_cookie_value()
@@ -90,37 +97,15 @@ def style_sheet(ws):
     ws.freeze_panes = "A2"
 
 
-@app.get("/")
-def root():
-    return RedirectResponse(url="/login-page")
-
-
-@app.get("/db-check")
-def db_check():
-    with engine.connect() as conn:
-        conn.execute(text("SELECT 1"))
-    return {"status": "ok", "db": "connected"}
-
-
-@app.get("/active-period")
-def active_period():
-    return get_active_period()
-
-
-@app.get("/debug/merchants-columns")
-def merchants_columns(db: Session = Depends(get_db)):
-    cols = get_merchants_columns(db)
-    return {"table": "merchants", "columns": cols}
-
-
-@app.post("/login")
-def login_api(fio: str, last4: str, db: Session = Depends(get_db)):
-    user = login_user(db, fio, last4)
-
-    if not user:
-        raise HTTPException(status_code=401, detail="Неверные данные")
-
-    return {"status": "ok", "active_period": get_active_period(), "user": user}
+def build_excel_response(wb: Workbook, filename: str) -> StreamingResponse:
+    buffer = BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
 
 
 def base_css():
@@ -262,6 +247,15 @@ def base_css():
         }
 
         .btn-secondary:hover { background: #e3ece3; }
+
+        .btn-danger {
+            background: #B91C1C;
+            color: #fff;
+        }
+
+        .btn-danger:hover {
+            background: #991B1B;
+        }
 
         .btn-small {
             margin-top: 12px;
@@ -540,7 +534,7 @@ def base_css():
 
         .filter-grid {
             display: grid;
-            grid-template-columns: 140px 140px 220px 220px;
+            grid-template-columns: 140px 140px 240px 220px;
             gap: 12px;
             margin-bottom: 16px;
             align-items: end;
@@ -573,7 +567,7 @@ def base_css():
             font-weight: 800;
         }
 
-        .admin-actions, .admin-top-buttons {
+        .admin-actions {
             display: flex;
             gap: 12px;
             justify-content: space-between;
@@ -589,10 +583,16 @@ def base_css():
             margin-top: 14px;
         }
 
+        .data-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+        }
+
         @media (max-width: 960px) {
             .page { align-items: flex-start; }
             .card-wide { padding: 18px 14px 24px; }
-            .sum-strip, .details-grid, .filter-grid { grid-template-columns: 1fr; }
+            .sum-strip, .details-grid, .filter-grid, .data-grid { grid-template-columns: 1fr; }
             .weekdays, .calendar-grid { gap: 8px; }
             .day, .day-empty {
                 min-height: 80px;
@@ -610,15 +610,37 @@ def base_css():
     """
 
 
-def build_excel_response(wb: Workbook, filename: str) -> StreamingResponse:
-    buffer = BytesIO()
-    wb.save(buffer)
-    buffer.seek(0)
-    return StreamingResponse(
-        buffer,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
-    )
+@app.get("/")
+def root():
+    return RedirectResponse(url="/login-page")
+
+
+@app.get("/db-check")
+def db_check():
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+    return {"status": "ok", "db": "connected"}
+
+
+@app.get("/active-period")
+def active_period():
+    return get_active_period()
+
+
+@app.get("/debug/merchants-columns")
+def merchants_columns(db: Session = Depends(get_db)):
+    cols = get_merchants_columns(db)
+    return {"table": "merchants", "columns": cols}
+
+
+@app.post("/login")
+def login_api(fio: str, last4: str, db: Session = Depends(get_db)):
+    user = login_user(db, fio, last4)
+
+    if not user:
+        raise HTTPException(status_code=401, detail="Неверные данные")
+
+    return {"status": "ok", "active_period": get_active_period(), "user": user}
 
 
 @app.get("/login-page", response_class=HTMLResponse)
@@ -873,7 +895,6 @@ def build_calendar_html(
         day_visits = visits.get(day, set())
 
         badges = ""
-
         if boxes > 0:
             badges += '<span class="badge badge-supply">П</span>'
         if "DAY" in day_visits:
@@ -1537,7 +1558,7 @@ def admin_report(
     month: int | None = None,
     tu: str = "",
     status: str = "",
-    admin_auth: str | None = Cookie(default=None),
+    admin_auth: Optional[str] = Cookie(default=None),
     db: Session = Depends(get_db)
 ):
     if not is_admin_authenticated(admin_auth):
@@ -1621,7 +1642,8 @@ def admin_report(
                     <h1>Отчёт по сверкам</h1>
                     <div class="subtitle">Админ-панель</div>
                 </div>
-                <div>
+                <div class="admin-export-buttons">
+                    <a class="btn btn-secondary btn-inline" href="/admin-data">Управление данными</a>
                     <a class="btn btn-secondary btn-inline" href="/admin-logout">Выйти</a>
                 </div>
             </div>
@@ -1699,13 +1721,220 @@ def admin_report(
 """
 
 
+@app.get("/admin-data", response_class=HTMLResponse)
+def admin_data_page(
+    success: str = "",
+    error: str = "",
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db)
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+
+    period = get_active_period()
+    tu_values = get_all_tu_values(db)
+
+    tu_options = ""
+    for item in tu_values:
+        tu_options += f"<option value='{escape(item)}'>{escape(item)}</option>"
+
+    info_box = ""
+    if success:
+        info_box += f"<div class='success-box'>{escape(success)}</div>"
+    if error:
+        info_box += f"<div class='error-box'>{escape(error)}</div>"
+
+    return f"""
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Управление данными</title>
+    {base_css()}
+</head>
+<body>
+    <div class="page">
+        <div class="card-wide">
+            <div class="admin-actions">
+                <div>
+                    <div class="brand">ВкусВилл</div>
+                    <h1>Управление данными</h1>
+                    <div class="subtitle">Загрузка файлов и очистка месяца</div>
+                </div>
+                <div class="admin-export-buttons">
+                    <a class="btn btn-secondary btn-inline" href="/admin-report">Назад к отчёту</a>
+                    <a class="btn btn-secondary btn-inline" href="/admin-logout">Выйти</a>
+                </div>
+            </div>
+
+            {info_box}
+
+            <div class="data-grid">
+                <div class="detail-card">
+                    <div class="detail-title">Загрузка поставок</div>
+                    <form method="post" action="/admin-upload-supplies" enctype="multipart/form-data">
+                        <label for="supplies_file">Файл поставок</label>
+                        <input id="supplies_file" name="file" type="file" accept=".xlsx" required />
+                        <button class="btn" type="submit">Загрузить поставки</button>
+                    </form>
+                </div>
+
+                <div class="detail-card">
+                    <div class="detail-title">Загрузка ставок</div>
+                    <form method="post" action="/admin-upload-rates" enctype="multipart/form-data">
+                        <label for="rates_year">Год</label>
+                        <input id="rates_year" name="year" type="number" value="{period["year"]}" required />
+
+                        <label for="rates_month">Месяц</label>
+                        <input id="rates_month" name="month" type="number" value="{period["month"]}" min="1" max="12" required />
+
+                        <label for="rates_file">Файл ставок</label>
+                        <input id="rates_file" name="file" type="file" accept=".xlsx" required />
+
+                        <button class="btn" type="submit">Загрузить ставки</button>
+                    </form>
+                </div>
+
+                <div class="detail-card">
+                    <div class="detail-title">Загрузка мерчей</div>
+                    <form method="post" action="/admin-upload-merchants" enctype="multipart/form-data">
+                        <label for="merchants_tu">Территориальный управляющий</label>
+                        <input id="merchants_tu" name="tu" type="text" placeholder="Например: Хрупов" required />
+
+                        <label for="merchants_file">Файл мерчей</label>
+                        <input id="merchants_file" name="file" type="file" accept=".xlsx" required />
+
+                        <button class="btn" type="submit">Загрузить мерчей</button>
+                    </form>
+                </div>
+
+                <div class="detail-card">
+                    <div class="detail-title">Очистка месяца</div>
+                    <form method="post" action="/admin-clear-month">
+                        <label for="clear_year">Год</label>
+                        <input id="clear_year" name="year" type="number" value="{period["year"]}" required />
+
+                        <label for="clear_month">Месяц</label>
+                        <input id="clear_month" name="month" type="number" value="{period["month"]}" min="1" max="12" required />
+
+                        <button class="btn btn-danger" type="submit">Очистить данные месяца</button>
+                    </form>
+                </div>
+
+                <div class="detail-card">
+                    <div class="detail-title">Очистка мерчей по ТУ</div>
+                    <form method="post" action="/admin-clear-merchants">
+                        <label for="clear_tu">Территориальный управляющий</label>
+                        <select id="clear_tu" name="tu" required>
+                            {tu_options}
+                        </select>
+
+                        <button class="btn btn-danger" type="submit">Удалить мерчей этого ТУ</button>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+
+@app.post("/admin-upload-supplies")
+async def admin_upload_supplies(
+    file: UploadFile = File(...),
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db)
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+
+    try:
+        result = import_supplies_xlsx(db, file.file)
+        msg = f"Поставки загружены: строк {result['loaded_rows']}, точек {result['loaded_points']}."
+        return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
+    except Exception as e:
+        return RedirectResponse(url=f"/admin-data?error={str(e)}", status_code=303)
+
+
+@app.post("/admin-upload-rates")
+async def admin_upload_rates(
+    year: int = Form(...),
+    month: int = Form(...),
+    file: UploadFile = File(...),
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db)
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+
+    try:
+        result = import_rates_xlsx(db, file.file, year, month)
+        msg = f"Ставки загружены: строк {result['loaded_rows']}."
+        return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
+    except Exception as e:
+        return RedirectResponse(url=f"/admin-data?error={str(e)}", status_code=303)
+
+
+@app.post("/admin-upload-merchants")
+async def admin_upload_merchants(
+    tu: str = Form(...),
+    file: UploadFile = File(...),
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db)
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+
+    try:
+        result = import_merchants_xlsx(db, file.file, tu)
+        msg = f"Мерчи загружены: строк {result['loaded_rows']}."
+        return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
+    except Exception as e:
+        return RedirectResponse(url=f"/admin-data?error={str(e)}", status_code=303)
+
+
+@app.post("/admin-clear-month")
+def admin_clear_month(
+    year: int = Form(...),
+    month: int = Form(...),
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db)
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+
+    result = clear_month_data(db, year, month)
+    msg = (
+        f"Месяц очищен. Визиты: {result['deleted_visits']}, "
+        f"поставки: {result['deleted_supplies']}, ставки: {result['deleted_rates']}, "
+        f"месячные сверки: {result['deleted_monthly']}."
+    )
+    return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
+
+
+@app.post("/admin-clear-merchants")
+def admin_clear_merchants(
+    tu: str = Form(...),
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db)
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+
+    deleted = clear_merchants_by_tu(db, tu)
+    msg = f"Удалено мерчей ТУ {tu}: {deleted}."
+    return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
+
+
 @app.get("/admin-export-check")
 def admin_export_check(
     year: int,
     month: int,
     tu: str = "",
     status: str = "",
-    admin_auth: str | None = Cookie(default=None),
+    admin_auth: Optional[str] = Cookie(default=None),
     db: Session = Depends(get_db)
 ):
     if not is_admin_authenticated(admin_auth):
@@ -1774,7 +2003,7 @@ def admin_export_payroll(
     month: int,
     tu: str = "",
     status: str = "",
-    admin_auth: str | None = Cookie(default=None),
+    admin_auth: Optional[str] = Cookie(default=None),
     db: Session = Depends(get_db)
 ):
     if not is_admin_authenticated(admin_auth):
@@ -1818,7 +2047,7 @@ def admin_export_overlaps(
     year: int,
     month: int,
     tu: str = "",
-    admin_auth: str | None = Cookie(default=None),
+    admin_auth: Optional[str] = Cookie(default=None),
     db: Session = Depends(get_db)
 ):
     if not is_admin_authenticated(admin_auth):
@@ -1860,3 +2089,4 @@ def admin_export_overlaps(
 
     style_sheet(ws)
     return build_excel_response(wb, f"peresecheniya_{year}_{month:02d}.xlsx")
+
