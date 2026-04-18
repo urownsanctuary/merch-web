@@ -2,9 +2,10 @@ import os
 import re
 import math
 import hashlib
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+from openpyxl import load_workbook
 
 SECRET_SALT = os.getenv("SECRET_SALT")
 
@@ -630,22 +631,14 @@ def get_admin_report_rows(
             v.merchant_id,
             v.point_code,
             m.fio,
-            m.tu,
-            ms.status AS monthly_status,
-            ms.comment,
-            ms.extra_amount,
-            ms.receipt_path
+            m.tu
         FROM visits v
         JOIN merchants m ON m.id = v.merchant_id
-        LEFT JOIN monthly_submissions ms
-            ON ms.merchant_id = v.merchant_id
-           AND ms.month_key = :month_key
         WHERE v.visit_date >= :start_date
           AND v.visit_date < :end_date
     """
 
     params = {
-        "month_key": start,
         "start_date": start,
         "end_date": end
     }
@@ -821,3 +814,269 @@ def get_intersections_rows(
         })
 
     return result
+
+
+# ===== загрузка файлов в админке =====
+
+def upsert_supply_row(db: Session, point_code: str, supply_date: date, boxes: int):
+    db.execute(text("""
+        DELETE FROM supplies
+        WHERE point_code = :point_code
+          AND supply_date = :supply_date
+    """), {
+        "point_code": point_code,
+        "supply_date": supply_date
+    })
+
+    db.execute(text("""
+        INSERT INTO supplies (point_code, supply_date, boxes)
+        VALUES (:point_code, :supply_date, :boxes)
+    """), {
+        "point_code": point_code,
+        "supply_date": supply_date,
+        "boxes": boxes
+    })
+
+
+def import_supplies_xlsx(db: Session, file_obj) -> dict:
+    wb = load_workbook(file_obj, data_only=True)
+    ws = wb[wb.sheetnames[0]]
+
+    loaded_rows = 0
+    loaded_points = set()
+
+    headers = [cell.value for cell in ws[1]]
+    date_columns = []
+
+    for idx, value in enumerate(headers[1:], start=2):
+        if isinstance(value, datetime):
+            date_columns.append((idx, value.date()))
+        elif isinstance(value, date):
+            date_columns.append((idx, value))
+
+    for row_idx in range(2, ws.max_row + 1):
+        raw_point = ws.cell(row=row_idx, column=1).value
+        point_code = normalize_point_code(raw_point)
+        if not point_code:
+            continue
+
+        loaded_points.add(point_code)
+
+        for col_idx, supply_date in date_columns:
+            raw_boxes = ws.cell(row=row_idx, column=col_idx).value
+            if raw_boxes is None or raw_boxes == "":
+                continue
+
+            try:
+                boxes = int(float(raw_boxes))
+            except Exception:
+                continue
+
+            upsert_supply_row(db, point_code, supply_date, boxes)
+            loaded_rows += 1
+
+    db.commit()
+    return {
+        "loaded_rows": loaded_rows,
+        "loaded_points": len(loaded_points)
+    }
+
+
+def upsert_rate_row(
+    db: Session,
+    point_code: str,
+    month_key: date,
+    rate_supply: int,
+    rate_no_supply: int,
+    rate_inventory: int,
+    coffee_enabled: bool,
+    coffee_rate: int,
+    pay_lt5: bool
+):
+    db.execute(text("""
+        DELETE FROM point_rates
+        WHERE point_code = :point_code
+          AND month_key = :month_key
+    """), {
+        "point_code": point_code,
+        "month_key": month_key
+    })
+
+    db.execute(text("""
+        INSERT INTO point_rates (
+            point_code, month_key, rate_supply, rate_no_supply, rate_inventory,
+            coffee_enabled, coffee_rate, pay_lt5
+        )
+        VALUES (
+            :point_code, :month_key, :rate_supply, :rate_no_supply, :rate_inventory,
+            :coffee_enabled, :coffee_rate, :pay_lt5
+        )
+    """), {
+        "point_code": point_code,
+        "month_key": month_key,
+        "rate_supply": rate_supply,
+        "rate_no_supply": rate_no_supply,
+        "rate_inventory": rate_inventory,
+        "coffee_enabled": coffee_enabled,
+        "coffee_rate": coffee_rate,
+        "pay_lt5": pay_lt5
+    })
+
+
+def import_rates_xlsx(db: Session, file_obj, year: int, month: int) -> dict:
+    wb = load_workbook(file_obj, data_only=True)
+    ws = wb[wb.sheetnames[0]]
+
+    month_key = month_start(year, month)
+    loaded_rows = 0
+
+    for row_idx in range(2, ws.max_row + 1):
+        point_code = normalize_point_code(ws.cell(row=row_idx, column=1).value)
+        if not point_code:
+            continue
+
+        rate_supply = int(ws.cell(row=row_idx, column=2).value or 0)
+        rate_no_supply = int(ws.cell(row=row_idx, column=3).value or 0)
+        rate_inventory = int(ws.cell(row=row_idx, column=4).value or 0)
+
+        coffee_enabled_raw = str(ws.cell(row=row_idx, column=5).value or "").strip().lower()
+        coffee_enabled = coffee_enabled_raw == "да"
+
+        pay_lt5_raw = str(ws.cell(row=row_idx, column=6).value or "").strip().lower()
+        pay_lt5 = pay_lt5_raw == "да"
+
+        coffee_rate = int(ws.cell(row=row_idx, column=7).value or 0)
+
+        upsert_rate_row(
+            db=db,
+            point_code=point_code,
+            month_key=month_key,
+            rate_supply=rate_supply,
+            rate_no_supply=rate_no_supply,
+            rate_inventory=rate_inventory,
+            coffee_enabled=coffee_enabled,
+            coffee_rate=coffee_rate,
+            pay_lt5=pay_lt5
+        )
+        loaded_rows += 1
+
+    db.commit()
+    return {"loaded_rows": loaded_rows}
+
+
+def upsert_merchant_row(db: Session, fio: str, last4: str, tu: str):
+    fio_clean = str(fio).strip()
+    fio_normalized = fio_norm(fio_clean)
+    pass_hash = hash_last4(str(last4).strip())
+
+    existing = db.execute(text("""
+        SELECT id
+        FROM merchants
+        WHERE fio_norm = :fio_norm
+        LIMIT 1
+    """), {"fio_norm": fio_normalized}).scalar()
+
+    if existing:
+        db.execute(text("""
+            UPDATE merchants
+            SET fio = :fio,
+                fio_norm = :fio_norm,
+                pass_hash = :pass_hash,
+                tu = :tu
+            WHERE id = :id
+        """), {
+            "id": existing,
+            "fio": fio_clean,
+            "fio_norm": fio_normalized,
+            "pass_hash": pass_hash,
+            "tu": tu
+        })
+    else:
+        db.execute(text("""
+            INSERT INTO merchants (fio, fio_norm, pass_hash, tu)
+            VALUES (:fio, :fio_norm, :pass_hash, :tu)
+        """), {
+            "fio": fio_clean,
+            "fio_norm": fio_normalized,
+            "pass_hash": pass_hash,
+            "tu": tu
+        })
+
+
+def import_merchants_xlsx(db: Session, file_obj, tu: str) -> dict:
+    wb = load_workbook(file_obj, data_only=True)
+    ws = wb[wb.sheetnames[0]]
+
+    loaded_rows = 0
+
+    for row_idx in range(2, ws.max_row + 1):
+        fio = ws.cell(row=row_idx, column=1).value
+        last4 = ws.cell(row=row_idx, column=2).value
+
+        if not fio or last4 is None:
+            continue
+
+        last4_str = re.sub(r"\D", "", str(last4))[-4:]
+        if len(last4_str) != 4:
+            continue
+
+        upsert_merchant_row(db, str(fio), last4_str, tu)
+        loaded_rows += 1
+
+    db.commit()
+    return {"loaded_rows": loaded_rows}
+
+
+def clear_month_data(db: Session, year: int, month: int) -> dict:
+    start = month_start(year, month)
+    end = month_end_exclusive(year, month)
+
+    deleted_visits = db.execute(text("""
+        DELETE FROM visits
+        WHERE visit_date >= :start_date
+          AND visit_date < :end_date
+    """), {
+        "start_date": start,
+        "end_date": end
+    }).rowcount or 0
+
+    deleted_supplies = db.execute(text("""
+        DELETE FROM supplies
+        WHERE supply_date >= :start_date
+          AND supply_date < :end_date
+    """), {
+        "start_date": start,
+        "end_date": end
+    }).rowcount or 0
+
+    deleted_rates = db.execute(text("""
+        DELETE FROM point_rates
+        WHERE month_key = :month_key
+    """), {
+        "month_key": start
+    }).rowcount or 0
+
+    deleted_monthly = db.execute(text("""
+        DELETE FROM monthly_submissions
+        WHERE month_key = :month_key
+    """), {
+        "month_key": start
+    }).rowcount or 0
+
+    db.commit()
+
+    return {
+        "deleted_visits": deleted_visits,
+        "deleted_supplies": deleted_supplies,
+        "deleted_rates": deleted_rates,
+        "deleted_monthly": deleted_monthly
+    }
+
+
+def clear_merchants_by_tu(db: Session, tu: str) -> int:
+    deleted = db.execute(text("""
+        DELETE FROM merchants
+        WHERE tu = :tu
+    """), {"tu": tu}).rowcount or 0
+    db.commit()
+    return deleted
