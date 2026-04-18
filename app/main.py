@@ -129,7 +129,7 @@ def base_css():
             max-width: 960px;
             background: var(--card);
             border-radius: 24px;
-            padding: 32px 28px;
+            padding: 22px 20px 28px;
             box-shadow: var(--shadow);
         }
 
@@ -138,14 +138,14 @@ def base_css():
             font-size: 28px;
             line-height: 1;
             color: var(--green);
-            margin-bottom: 10px;
+            margin-bottom: 8px;
         }
 
         h1 {
             font-family: 'Villula', -apple-system, sans-serif;
             font-size: 34px;
             line-height: 1.05;
-            margin: 0 0 10px 0;
+            margin: 0 0 8px 0;
             color: var(--text);
         }
 
@@ -153,7 +153,7 @@ def base_css():
             color: var(--muted);
             font-size: 15px;
             line-height: 1.45;
-            margin-bottom: 24px;
+            margin-bottom: 18px;
         }
 
         .muted {
@@ -253,32 +253,63 @@ def base_css():
             font-weight: 700;
         }
 
-        .top-grid {
+        .calendar-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 14px;
+            flex-wrap: wrap;
+        }
+
+        .calendar-month {
+            font-family: 'Villula', -apple-system, sans-serif;
+            font-size: 28px;
+            line-height: 1;
+        }
+
+        .calendar-meta {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .mini-pill {
+            background: var(--soft-2);
+            border-radius: 999px;
+            padding: 8px 12px;
+            font-size: 13px;
+            color: var(--text);
+            font-weight: 700;
+        }
+
+        .sum-strip {
             display: grid;
             grid-template-columns: 1fr 1fr;
-            gap: 14px;
-            margin-bottom: 24px;
+            gap: 12px;
+            margin-bottom: 16px;
         }
 
-        .info-box {
-            background: var(--soft-2);
+        .sum-card {
+            background: #F7FBF8;
+            border: 1px solid #E5E7EB;
             border-radius: 16px;
-            padding: 16px;
+            padding: 14px 16px;
         }
 
-        .info-label {
+        .sum-title {
             color: var(--muted);
             font-size: 13px;
             margin-bottom: 6px;
         }
 
-        .info-value {
-            font-size: 18px;
-            font-weight: 800;
+        .sum-value {
+            font-size: 22px;
+            font-weight: 900;
         }
 
         .calendar-wrap {
-            margin-top: 10px;
+            margin-top: 4px;
         }
 
         .weekdays,
@@ -302,7 +333,7 @@ def base_css():
 
         .day,
         .day-empty {
-            min-height: 96px;
+            min-height: 90px;
             border-radius: 18px;
             padding: 10px;
         }
@@ -369,7 +400,7 @@ def base_css():
         }
 
         .legend {
-            margin-top: 20px;
+            margin-top: 18px;
             display: flex;
             flex-wrap: wrap;
             gap: 10px;
@@ -385,9 +416,10 @@ def base_css():
         }
 
         .calendar-note {
-            margin-top: 18px;
+            margin-top: 14px;
             color: var(--muted);
             line-height: 1.5;
+            font-size: 14px;
         }
 
         .action-list {
@@ -396,42 +428,16 @@ def base_css():
             margin-top: 20px;
         }
 
-        .sum-grid {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 14px;
-            margin-bottom: 24px;
-        }
-
-        .sum-box {
-            background: #F7FBF8;
-            border: 1px solid #E5E7EB;
-            border-radius: 16px;
-            padding: 16px;
-        }
-
-        .sum-title {
-            color: var(--muted);
-            font-size: 13px;
-            margin-bottom: 8px;
-        }
-
-        .sum-value {
-            font-size: 22px;
-            font-weight: 900;
-        }
-
         @media (max-width: 760px) {
             .page {
                 align-items: flex-start;
             }
 
             .card-wide {
-                padding: 24px 16px;
+                padding: 18px 14px 24px;
             }
 
-            .top-grid,
-            .sum-grid {
+            .sum-strip {
                 grid-template-columns: 1fr;
             }
 
@@ -442,7 +448,7 @@ def base_css():
 
             .day,
             .day-empty {
-                min-height: 84px;
+                min-height: 80px;
                 border-radius: 14px;
                 padding: 8px;
             }
@@ -456,6 +462,10 @@ def base_css():
             }
 
             .brand {
+                font-size: 24px;
+            }
+
+            .calendar-month {
                 font-size: 24px;
             }
         }
@@ -588,7 +598,7 @@ def menu_page(fio: str = "", db: Session = Depends(get_db)):
                 Сейчас открыт период за {month_title(period["year"], period["month"])}.
             </div>
 
-            <div class="sum-box" style="margin-top: 18px;">
+            <div class="sum-card" style="margin-top: 18px;">
                 <div class="sum-title">Общая сумма за месяц</div>
                 <div class="sum-value">{overall["total"]} ₽</div>
             </div>
@@ -713,6 +723,13 @@ def point_submit(
     )
 
 
+def build_day_href(fio: str, point_code: str, y: int, m: int, day: int) -> str:
+    wd = weekday_of(y, m, day)
+    if wd in (4, 5):
+        return f"/day-action-page?fio={fio}&point_code={point_code}&day={day}"
+    return f"/toggle-day?fio={fio}&point_code={point_code}&day={day}"
+
+
 def build_calendar_html(fio: str, point_code: str, y: int, m: int, boxes_map: dict[int, int], visits: dict[int, set[str]]) -> str:
     dim = days_in_month(y, m)
     first_wd = weekday_of(y, m, 1)
@@ -744,8 +761,10 @@ def build_calendar_html(fio: str, point_code: str, y: int, m: int, boxes_map: di
         if "FULL_INVENT" in day_visits:
             badges += '<span class="badge badge-inv">И</span>'
 
+        href = build_day_href(fio, point_code, y, m, day)
+
         html += f"""
-        <a class="day" href="/day-action-page?fio={fio}&point_code={point_code}&day={day}">
+        <a class="day" href="{href}">
             <div class="day-number">{day}</div>
             <div class="day-badges">{badges}</div>
         </a>
@@ -775,9 +794,6 @@ def calendar_page(
     overall = compute_overall_total(db, merchant["id"], y, m)
     calendar_html = build_calendar_html(fio, point_code, y, m, boxes_map, visits)
 
-    coffee_text = "Да" if point_total["coffee_enabled"] else "Нет"
-    coffee_rate_text = f'{point_total["coffee_rate"]} ₽' if point_total["coffee_enabled"] else "—"
-
     return f"""
 <!DOCTYPE html>
 <html lang="ru">
@@ -790,59 +806,28 @@ def calendar_page(
 <body>
     <div class="page">
         <div class="card-wide">
-            <div class="brand">ВкусВилл</div>
-            <h1>Сверка точки</h1>
-            <div class="subtitle">
-                Нажмите на нужный день.
-                Для пятницы и субботы можно добавить полный инвент.
-            </div>
-
-            <div class="top-grid">
-                <div class="info-box">
-                    <div class="info-label">ФИО</div>
-                    <div class="info-value">{fio}</div>
+            <div class="calendar-head">
+                <div>
+                    <div class="brand">ВкусВилл</div>
+                    <div class="calendar-month">{month_title(y, m)}</div>
                 </div>
 
-                <div class="info-box">
-                    <div class="info-label">Точка</div>
-                    <div class="info-value">{point_code}</div>
-                </div>
-
-                <div class="info-box">
-                    <div class="info-label">Расчётный месяц</div>
-                    <div class="info-value">{month_title(y, m)}</div>
-                </div>
-
-                <div class="info-box">
-                    <div class="info-label">Кофемашина</div>
-                    <div class="info-value">{coffee_text}</div>
-                </div>
-
-                <div class="info-box">
-                    <div class="info-label">Ставка кофемашины</div>
-                    <div class="info-value">{coffee_rate_text}</div>
-                </div>
-
-                <div class="info-box">
-                    <div class="info-label">Правило поставок</div>
-                    <div class="info-value">До 5 коробок не оплачивается</div>
+                <div class="calendar-meta">
+                    <div class="mini-pill">Точка: {point_code}</div>
+                    <div class="mini-pill">{fio}</div>
+                    <div class="mini-pill">КМ: {"Да" if point_total["coffee_enabled"] else "Нет"}</div>
                 </div>
             </div>
 
-            <div class="sum-grid">
-                <div class="sum-box">
+            <div class="sum-strip">
+                <div class="sum-card">
                     <div class="sum-title">Сумма по точке</div>
                     <div class="sum-value">{point_total["total"]} ₽</div>
                 </div>
 
-                <div class="sum-box">
+                <div class="sum-card">
                     <div class="sum-title">Общая сумма за месяц</div>
                     <div class="sum-value">{overall["total"]} ₽</div>
-                </div>
-
-                <div class="sum-box">
-                    <div class="sum-title">Начислено за кофемашину</div>
-                    <div class="sum-value">{point_total["coffee_sum"]} ₽</div>
                 </div>
             </div>
 
@@ -851,14 +836,14 @@ def calendar_page(
             </div>
 
             <div class="legend">
-                <div class="legend-item">П — в этот день была поставка</div>
+                <div class="legend-item">П — была поставка</div>
                 <div class="legend-item">В — отмечен выход</div>
-                <div class="legend-item">И — отмечен полный инвент</div>
+                <div class="legend-item">И — полный инвент</div>
             </div>
 
             <div class="calendar-note">
-                Выход считается по ставке «с поставкой» или «без поставки» автоматически.
-                Кофемашина начисляется автоматически за каждый дневной выход.
+                В обычные дни нажатие по дню сразу ставит или убирает выход.
+                В пятницу и субботу открывается выбор: выход или полный инвент.
             </div>
 
             <div class="calendar-note">
@@ -900,6 +885,9 @@ def day_action_page(
     day_btn_text = "Убрать выход" if "DAY" in day_visits else "Добавить выход"
     inv_btn_text = "Убрать полный инвент" if "FULL_INVENT" in day_visits else "Добавить полный инвент"
 
+    if not is_fri_or_sat:
+        return RedirectResponse(url=f"/toggle-day?fio={fio}&point_code={point_code}&day={day}", status_code=303)
+
     return f"""
 <!DOCTYPE html>
 <html lang="ru">
@@ -924,11 +912,9 @@ def day_action_page(
                     {day_btn_text}
                 </a>
 
-                {f'''
                 <a class="btn btn-secondary btn-small" href="/toggle-inventory?fio={fio}&point_code={point_code}&day={day}">
                     {inv_btn_text}
                 </a>
-                ''' if is_fri_or_sat else ''}
             </div>
 
             <a class="back" href="/calendar-page?fio={fio}&point_code={point_code}">← Назад к календарю</a>
@@ -1021,7 +1007,7 @@ def summary_page(fio: str = "", db: Session = Depends(get_db)):
             <h1>Моя сумма</h1>
             <div class="subtitle">{fio}</div>
 
-            <div class="sum-box">
+            <div class="sum-card">
                 <div class="sum-title">Общая сумма за месяц</div>
                 <div class="sum-value">{overall["total"]} ₽</div>
             </div>
