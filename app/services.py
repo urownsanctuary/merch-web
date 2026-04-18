@@ -8,7 +8,6 @@ from sqlalchemy import text
 from openpyxl import load_workbook
 
 SECRET_SALT = os.getenv("SECRET_SALT")
-
 if not SECRET_SALT:
     raise RuntimeError("SECRET_SALT is not set")
 
@@ -37,7 +36,6 @@ def hash_last4(last4: str) -> str:
 
 def get_active_period():
     today = date.today()
-
     if today.day <= 5:
         if today.month == 1:
             report_year = today.year - 1
@@ -56,42 +54,43 @@ def get_active_period():
         editable_until_year += 1
 
     editable_until = date(editable_until_year, editable_until_month, 5)
-
     return {
         "year": report_year,
         "month": report_month,
-        "editable_until": editable_until.isoformat()
+        "editable_until": editable_until.isoformat(),
     }
 
 
 def get_merchants_columns(db: Session):
-    query = text("""
+    query = text(
+        """
         SELECT column_name
         FROM information_schema.columns
         WHERE table_name = 'merchants'
         ORDER BY ordinal_position
-    """)
+        """
+    )
     rows = db.execute(query).fetchall()
     return [row[0] for row in rows]
 
 
 def login_user(db: Session, fio: str, last4: str):
     fio_n = fio_norm(fio)
-
-    query = text("""
-        SELECT id, fio, fio_norm, pass_hash, telegram_id, tu, created_at
-        FROM merchants
-        WHERE fio_norm = :fio_norm
-        LIMIT 1
-    """)
-
-    result = db.execute(query, {"fio_norm": fio_n}).mappings().first()
+    result = db.execute(
+        text(
+            """
+            SELECT id, fio, fio_norm, pass_hash, telegram_id, tu, created_at
+            FROM merchants
+            WHERE fio_norm = :fio_norm
+            LIMIT 1
+            """
+        ),
+        {"fio_norm": fio_n},
+    ).mappings().first()
 
     if not result:
         return None
-
-    incoming_hash = hash_last4(last4)
-    if incoming_hash != result["pass_hash"]:
+    if hash_last4(last4) != result["pass_hash"]:
         return None
 
     return {
@@ -100,19 +99,23 @@ def login_user(db: Session, fio: str, last4: str):
         "fio_norm": result["fio_norm"],
         "telegram_id": result["telegram_id"],
         "tu": result["tu"],
-        "created_at": str(result["created_at"]) if result["created_at"] else None
+        "created_at": str(result["created_at"]) if result["created_at"] else None,
     }
 
 
 def get_merchant_by_fio(db: Session, fio: str):
     fio_n = fio_norm(fio)
-
-    result = db.execute(text("""
-        SELECT id, fio, fio_norm, telegram_id, tu, created_at
-        FROM merchants
-        WHERE fio_norm = :fio_norm
-        LIMIT 1
-    """), {"fio_norm": fio_n}).mappings().first()
+    result = db.execute(
+        text(
+            """
+            SELECT id, fio, fio_norm, telegram_id, tu, created_at
+            FROM merchants
+            WHERE fio_norm = :fio_norm
+            LIMIT 1
+            """
+        ),
+        {"fio_norm": fio_n},
+    ).mappings().first()
 
     if not result:
         return None
@@ -123,7 +126,7 @@ def get_merchant_by_fio(db: Session, fio: str):
         "fio_norm": result["fio_norm"],
         "telegram_id": result["telegram_id"],
         "tu": result["tu"],
-        "created_at": str(result["created_at"]) if result["created_at"] else None
+        "created_at": str(result["created_at"]) if result["created_at"] else None,
     }
 
 
@@ -146,7 +149,7 @@ def weekday_of(y: int, m: int, d: int) -> int:
 def month_title(y: int, m: int) -> str:
     names = [
         "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
-        "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"
+        "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
     ]
     return f"{names[m - 1]} {y}"
 
@@ -160,167 +163,179 @@ def normalize_point_code(v) -> str:
 def point_has_any_supply_in_month(db: Session, point_code: str, y: int, m: int) -> bool:
     start = month_start(y, m)
     end = month_end_exclusive(y, m)
-
-    result = db.execute(text("""
-        SELECT 1
-        FROM supplies
-        WHERE point_code = :point_code
-          AND supply_date >= :start_date
-          AND supply_date < :end_date
-        LIMIT 1
-    """), {
-        "point_code": point_code,
-        "start_date": start,
-        "end_date": end
-    }).first()
-
+    result = db.execute(
+        text(
+            """
+            SELECT 1
+            FROM supplies
+            WHERE point_code = :point_code
+              AND supply_date >= :start_date
+              AND supply_date < :end_date
+            LIMIT 1
+            """
+        ),
+        {"point_code": point_code, "start_date": start, "end_date": end},
+    ).first()
     return result is not None
 
 
 def get_supply_boxes_map(db: Session, point_code: str, y: int, m: int) -> dict[int, int]:
     start = month_start(y, m)
     end = month_end_exclusive(y, m)
-
-    rows = db.execute(text("""
-        SELECT supply_date, boxes
-        FROM supplies
-        WHERE point_code = :point_code
-          AND supply_date >= :start_date
-          AND supply_date < :end_date
-        ORDER BY supply_date
-    """), {
-        "point_code": point_code,
-        "start_date": start,
-        "end_date": end
-    }).mappings().all()
-
-    result = {}
+    rows = db.execute(
+        text(
+            """
+            SELECT supply_date, boxes
+            FROM supplies
+            WHERE point_code = :point_code
+              AND supply_date >= :start_date
+              AND supply_date < :end_date
+            ORDER BY supply_date
+            """
+        ),
+        {"point_code": point_code, "start_date": start, "end_date": end},
+    ).mappings().all()
+    result: dict[int, int] = {}
     for row in rows:
-        day = row["supply_date"].day
-        result[day] = int(row["boxes"] or 0)
-
+        result[row["supply_date"].day] = int(row["boxes"] or 0)
     return result
 
 
 def get_visits_for_month(db: Session, merchant_id: int, point_code: str, y: int, m: int) -> dict[int, set[str]]:
     start = month_start(y, m)
     end = month_end_exclusive(y, m)
+    rows = db.execute(
+        text(
+            """
+            SELECT visit_date, slot
+            FROM visits
+            WHERE merchant_id = :merchant_id
+              AND point_code = :point_code
+              AND visit_date >= :start_date
+              AND visit_date < :end_date
+            """
+        ),
+        {
+            "merchant_id": merchant_id,
+            "point_code": point_code,
+            "start_date": start,
+            "end_date": end,
+        },
+    ).mappings().all()
 
-    rows = db.execute(text("""
-        SELECT visit_date, slot
-        FROM visits
-        WHERE merchant_id = :merchant_id
-          AND point_code = :point_code
-          AND visit_date >= :start_date
-          AND visit_date < :end_date
-    """), {
-        "merchant_id": merchant_id,
-        "point_code": point_code,
-        "start_date": start,
-        "end_date": end
-    }).mappings().all()
-
-    result = {}
+    result: dict[int, set[str]] = {}
     for row in rows:
         day = row["visit_date"].day
         result.setdefault(day, set()).add(str(row["slot"]))
-
     return result
 
 
 def toggle_day_visit(db: Session, merchant_id: int, point_code: str, y: int, m: int, day: int):
     visit_date = date(y, m, day)
-
-    existing = db.execute(text("""
-        SELECT id
-        FROM visits
-        WHERE merchant_id = :merchant_id
-          AND point_code = :point_code
-          AND visit_date = :visit_date
-          AND slot = :slot
-        LIMIT 1
-    """), {
-        "merchant_id": merchant_id,
-        "point_code": point_code,
-        "visit_date": visit_date,
-        "slot": SLOT_DAY
-    }).scalar()
+    existing = db.execute(
+        text(
+            """
+            SELECT id
+            FROM visits
+            WHERE merchant_id = :merchant_id
+              AND point_code = :point_code
+              AND visit_date = :visit_date
+              AND slot = :slot
+            LIMIT 1
+            """
+        ),
+        {
+            "merchant_id": merchant_id,
+            "point_code": point_code,
+            "visit_date": visit_date,
+            "slot": SLOT_DAY,
+        },
+    ).scalar()
 
     if existing:
         db.execute(text("DELETE FROM visits WHERE id = :id"), {"id": existing})
         db.commit()
         return "removed"
 
-    db.execute(text("""
-        INSERT INTO visits (merchant_id, point_code, visit_date, slot)
-        VALUES (:merchant_id, :point_code, :visit_date, :slot)
-        ON CONFLICT DO NOTHING
-    """), {
-        "merchant_id": merchant_id,
-        "point_code": point_code,
-        "visit_date": visit_date,
-        "slot": SLOT_DAY
-    })
+    db.execute(
+        text(
+            """
+            INSERT INTO visits (merchant_id, point_code, visit_date, slot)
+            VALUES (:merchant_id, :point_code, :visit_date, :slot)
+            ON CONFLICT DO NOTHING
+            """
+        ),
+        {
+            "merchant_id": merchant_id,
+            "point_code": point_code,
+            "visit_date": visit_date,
+            "slot": SLOT_DAY,
+        },
+    )
     db.commit()
     return "added"
 
 
 def toggle_inventory_visit(db: Session, merchant_id: int, point_code: str, y: int, m: int, day: int):
     visit_date = date(y, m, day)
-
-    existing = db.execute(text("""
-        SELECT id
-        FROM visits
-        WHERE merchant_id = :merchant_id
-          AND point_code = :point_code
-          AND visit_date = :visit_date
-          AND slot = :slot
-        LIMIT 1
-    """), {
-        "merchant_id": merchant_id,
-        "point_code": point_code,
-        "visit_date": visit_date,
-        "slot": SLOT_FULL_INVENT
-    }).scalar()
+    existing = db.execute(
+        text(
+            """
+            SELECT id
+            FROM visits
+            WHERE merchant_id = :merchant_id
+              AND point_code = :point_code
+              AND visit_date = :visit_date
+              AND slot = :slot
+            LIMIT 1
+            """
+        ),
+        {
+            "merchant_id": merchant_id,
+            "point_code": point_code,
+            "visit_date": visit_date,
+            "slot": SLOT_FULL_INVENT,
+        },
+    ).scalar()
 
     if existing:
         db.execute(text("DELETE FROM visits WHERE id = :id"), {"id": existing})
         db.commit()
         return "removed"
 
-    db.execute(text("""
-        INSERT INTO visits (merchant_id, point_code, visit_date, slot)
-        VALUES (:merchant_id, :point_code, :visit_date, :slot)
-        ON CONFLICT DO NOTHING
-    """), {
-        "merchant_id": merchant_id,
-        "point_code": point_code,
-        "visit_date": visit_date,
-        "slot": SLOT_FULL_INVENT
-    })
+    db.execute(
+        text(
+            """
+            INSERT INTO visits (merchant_id, point_code, visit_date, slot)
+            VALUES (:merchant_id, :point_code, :visit_date, :slot)
+            ON CONFLICT DO NOTHING
+            """
+        ),
+        {
+            "merchant_id": merchant_id,
+            "point_code": point_code,
+            "visit_date": visit_date,
+            "slot": SLOT_FULL_INVENT,
+        },
+    )
     db.commit()
     return "added"
 
 
 def get_point_rates(db: Session, point_code: str, y: int, m: int):
     mk = month_start(y, m)
-
-    row = db.execute(text("""
-        SELECT
-            rate_supply,
-            rate_no_supply,
-            rate_inventory,
-            coffee_enabled,
-            coffee_rate,
-            pay_lt5
-        FROM point_rates
-        WHERE point_code = :point_code
-          AND month_key = :month_key
-        LIMIT 1
-    """), {
-        "point_code": point_code,
-        "month_key": mk
-    }).mappings().first()
+    row = db.execute(
+        text(
+            """
+            SELECT rate_supply, rate_no_supply, rate_inventory, coffee_enabled, coffee_rate, pay_lt5
+            FROM point_rates
+            WHERE point_code = :point_code
+              AND month_key = :month_key
+            LIMIT 1
+            """
+        ),
+        {"point_code": point_code, "month_key": mk},
+    ).mappings().first()
 
     if not row:
         return {
@@ -348,53 +363,47 @@ def effective_has_supply(boxes: int, pay_lt5: bool) -> bool:
     return True if pay_lt5 else (boxes >= 5)
 
 
-# ===== monthly submissions =====
-
 def ensure_monthly_submissions_table(db: Session):
-    db.execute(text("""
-        CREATE TABLE IF NOT EXISTS monthly_submissions (
-            id SERIAL PRIMARY KEY,
-            merchant_id INTEGER NOT NULL,
-            month_key DATE NOT NULL,
-            comment TEXT,
-            extra_amount INTEGER NOT NULL DEFAULT 0,
-            receipt_path TEXT,
-            status TEXT NOT NULL DEFAULT 'draft',
-            created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
-            UNIQUE (merchant_id, month_key)
+    db.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS monthly_submissions (
+                id SERIAL PRIMARY KEY,
+                merchant_id INTEGER NOT NULL,
+                month_key DATE NOT NULL,
+                comment TEXT,
+                extra_amount INTEGER NOT NULL DEFAULT 0,
+                receipt_path TEXT,
+                status TEXT NOT NULL DEFAULT 'draft',
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                UNIQUE (merchant_id, month_key)
+            )
+            """
         )
-    """))
+    )
     db.commit()
 
 
 def get_monthly_submission(db: Session, merchant_id: int, y: int, m: int):
     ensure_monthly_submissions_table(db)
     mk = month_start(y, m)
-
-    row = db.execute(text("""
-        SELECT *
-        FROM monthly_submissions
-        WHERE merchant_id = :merchant_id
-          AND month_key = :month_key
-        LIMIT 1
-    """), {
-        "merchant_id": merchant_id,
-        "month_key": mk
-    }).mappings().first()
-
+    row = db.execute(
+        text(
+            """
+            SELECT *
+            FROM monthly_submissions
+            WHERE merchant_id = :merchant_id
+              AND month_key = :month_key
+            LIMIT 1
+            """
+        ),
+        {"merchant_id": merchant_id, "month_key": mk},
+    ).mappings().first()
     return dict(row) if row else None
 
 
-def upsert_monthly_submission_draft(
-    db: Session,
-    merchant_id: int,
-    y: int,
-    m: int,
-    comment: str,
-    extra_amount: int,
-    receipt_path: str | None,
-):
+def upsert_monthly_submission_draft(db: Session, merchant_id: int, y: int, m: int, comment: str, extra_amount: int, receipt_path: str | None):
     ensure_monthly_submissions_table(db)
     mk = month_start(y, m)
     existing = get_monthly_submission(db, merchant_id, y, m)
@@ -403,108 +412,74 @@ def upsert_monthly_submission_draft(
         if receipt_path:
             db.execute(text("""
                 UPDATE monthly_submissions
-                SET comment = :comment,
-                    extra_amount = :extra_amount,
-                    receipt_path = :receipt_path,
-                    updated_at = NOW()
-                WHERE merchant_id = :merchant_id
-                  AND month_key = :month_key
+                SET comment=:comment, extra_amount=:extra_amount, receipt_path=:receipt_path, updated_at=NOW()
+                WHERE merchant_id=:merchant_id AND month_key=:month_key
             """), {
                 "comment": comment,
                 "extra_amount": extra_amount,
                 "receipt_path": receipt_path,
                 "merchant_id": merchant_id,
-                "month_key": mk
+                "month_key": mk,
             })
         else:
             db.execute(text("""
                 UPDATE monthly_submissions
-                SET comment = :comment,
-                    extra_amount = :extra_amount,
-                    updated_at = NOW()
-                WHERE merchant_id = :merchant_id
-                  AND month_key = :month_key
+                SET comment=:comment, extra_amount=:extra_amount, updated_at=NOW()
+                WHERE merchant_id=:merchant_id AND month_key=:month_key
             """), {
                 "comment": comment,
                 "extra_amount": extra_amount,
                 "merchant_id": merchant_id,
-                "month_key": mk
+                "month_key": mk,
             })
     else:
         db.execute(text("""
-            INSERT INTO monthly_submissions (
-                merchant_id, month_key, comment, extra_amount, receipt_path, status
-            )
-            VALUES (
-                :merchant_id, :month_key, :comment, :extra_amount, :receipt_path, 'draft'
-            )
+            INSERT INTO monthly_submissions (merchant_id, month_key, comment, extra_amount, receipt_path, status)
+            VALUES (:merchant_id, :month_key, :comment, :extra_amount, :receipt_path, 'draft')
         """), {
             "merchant_id": merchant_id,
             "month_key": mk,
             "comment": comment,
             "extra_amount": extra_amount,
-            "receipt_path": receipt_path
+            "receipt_path": receipt_path,
         })
-
     db.commit()
 
 
 def submit_monthly_submission(db: Session, merchant_id: int, y: int, m: int):
     ensure_monthly_submissions_table(db)
     mk = month_start(y, m)
-
     db.execute(text("""
-        INSERT INTO monthly_submissions (
-            merchant_id, month_key, comment, extra_amount, receipt_path, status
-        )
-        VALUES (
-            :merchant_id, :month_key, '', 0, NULL, 'submitted'
-        )
+        INSERT INTO monthly_submissions (merchant_id, month_key, comment, extra_amount, receipt_path, status)
+        VALUES (:merchant_id, :month_key, '', 0, NULL, 'submitted')
         ON CONFLICT (merchant_id, month_key)
-        DO UPDATE SET
-            status = 'submitted',
-            updated_at = NOW()
-    """), {
-        "merchant_id": merchant_id,
-        "month_key": mk
-    })
+        DO UPDATE SET status='submitted', updated_at=NOW()
+    """), {"merchant_id": merchant_id, "month_key": mk})
     db.commit()
 
 
 def reopen_monthly_submission(db: Session, merchant_id: int, y: int, m: int):
     ensure_monthly_submissions_table(db)
     mk = month_start(y, m)
-
     db.execute(text("""
         UPDATE monthly_submissions
-        SET status = 'draft',
-            updated_at = NOW()
-        WHERE merchant_id = :merchant_id
-          AND month_key = :month_key
-    """), {
-        "merchant_id": merchant_id,
-        "month_key": mk
-    })
+        SET status='draft', updated_at=NOW()
+        WHERE merchant_id=:merchant_id AND month_key=:month_key
+    """), {"merchant_id": merchant_id, "month_key": mk})
     db.commit()
 
 
 def get_points_for_month(db: Session, merchant_id: int, y: int, m: int) -> list[str]:
     start = month_start(y, m)
     end = month_end_exclusive(y, m)
-
     rows = db.execute(text("""
         SELECT DISTINCT point_code
         FROM visits
-        WHERE merchant_id = :merchant_id
+        WHERE merchant_id=:merchant_id
           AND visit_date >= :start_date
           AND visit_date < :end_date
         ORDER BY point_code
-    """), {
-        "merchant_id": merchant_id,
-        "start_date": start,
-        "end_date": end
-    }).all()
-
+    """), {"merchant_id": merchant_id, "start_date": start, "end_date": end}).all()
     return [r[0] for r in rows if r and r[0]]
 
 
@@ -518,7 +493,6 @@ def compute_point_total(db: Session, merchant_id: int, point_code: str, y: int, 
     cnt_no_supply = 0
     cnt_day_total = 0
     cnt_full_inv = 0
-
     sum_supply = 0
     sum_no_supply = 0
     sum_inventory = 0
@@ -576,17 +550,16 @@ def compute_overall_total(db: Session, merchant_id: int, y: int, m: int):
     per_point_details = {}
 
     for point_code in points:
-        point_result = compute_point_total(db, merchant_id, point_code, y, m)
-        per_point[point_code] = point_result["total"]
-        per_point_details[point_code] = point_result
-        total += point_result["total"]
+        detail = compute_point_total(db, merchant_id, point_code, y, m)
+        per_point[point_code] = detail["total"]
+        per_point_details[point_code] = detail
+        total += detail["total"]
 
     monthly = get_monthly_submission(db, merchant_id, y, m)
     extra_amount = 0
     comment = ""
     receipt_path = None
     submission_status = "draft"
-
     if monthly:
         extra_amount = int(monthly.get("extra_amount") or 0)
         comment = monthly.get("comment") or ""
@@ -615,61 +588,39 @@ def get_all_tu_values(db: Session) -> list[str]:
     return [r[0] for r in rows if r and r[0]]
 
 
-def get_admin_report_rows(
-    db: Session,
-    y: int,
-    m: int,
-    tu: str | None = None,
-    status: str | None = None
-):
+def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, status: str | None = None):
     ensure_monthly_submissions_table(db)
     start = month_start(y, m)
     end = month_end_exclusive(y, m)
-
     sql = """
-        SELECT DISTINCT
-            v.merchant_id,
-            v.point_code,
-            m.fio,
-            m.tu
+        SELECT DISTINCT v.merchant_id, v.point_code, m.fio, m.tu
         FROM visits v
         JOIN merchants m ON m.id = v.merchant_id
         WHERE v.visit_date >= :start_date
           AND v.visit_date < :end_date
     """
-
-    params = {
-        "start_date": start,
-        "end_date": end
-    }
-
+    params = {"start_date": start, "end_date": end}
     if tu:
         sql += " AND m.tu = :tu"
         params["tu"] = tu
-
     sql += " ORDER BY m.tu NULLS LAST, m.fio, v.point_code"
-
     rows = db.execute(text(sql), params).mappings().all()
 
     result = []
     for row in rows:
         detail = compute_point_total(db, row["merchant_id"], row["point_code"], y, m)
         monthly = get_monthly_submission(db, row["merchant_id"], y, m)
-
         status_value = "не отправлено"
         comment = ""
         extra_amount = 0
         receipt_path = None
-
         if monthly:
             status_value = monthly.get("status") or "draft"
             comment = monthly.get("comment") or ""
             extra_amount = int(monthly.get("extra_amount") or 0)
             receipt_path = monthly.get("receipt_path")
-
         if status and status_value != status:
             continue
-
         result.append({
             "merchant_id": row["merchant_id"],
             "fio": row["fio"],
@@ -691,60 +642,38 @@ def get_admin_report_rows(
             "coffee_sum": detail["coffee_sum"],
             "point_total": detail["total"],
         })
-
     return result
 
 
-def get_admin_payroll_rows(
-    db: Session,
-    y: int,
-    m: int,
-    tu: str | None = None,
-    status: str | None = None
-):
+def get_admin_payroll_rows(db: Session, y: int, m: int, tu: str | None = None, status: str | None = None):
     ensure_monthly_submissions_table(db)
     start = month_start(y, m)
     end = month_end_exclusive(y, m)
-
     sql = """
-        SELECT DISTINCT
-            v.merchant_id,
-            m.fio,
-            m.tu
+        SELECT DISTINCT v.merchant_id, m.fio, m.tu
         FROM visits v
         JOIN merchants m ON m.id = v.merchant_id
         WHERE v.visit_date >= :start_date
           AND v.visit_date < :end_date
     """
-
-    params = {
-        "start_date": start,
-        "end_date": end
-    }
-
+    params = {"start_date": start, "end_date": end}
     if tu:
         sql += " AND m.tu = :tu"
         params["tu"] = tu
-
     sql += " ORDER BY m.tu NULLS LAST, m.fio"
-
     rows = db.execute(text(sql), params).mappings().all()
 
     result = []
     for row in rows:
         overall = compute_overall_total(db, row["merchant_id"], y, m)
         monthly = get_monthly_submission(db, row["merchant_id"], y, m)
-
         status_value = "не отправлено"
         if monthly:
             status_value = monthly.get("status") or "draft"
-
         if status and status_value != status:
             continue
-
         clean_total = overall["total"]
         payroll_total = math.ceil(clean_total / 0.87) if clean_total > 0 else 0
-
         result.append({
             "merchant_id": row["merchant_id"],
             "fio": row["fio"],
@@ -753,29 +682,17 @@ def get_admin_payroll_rows(
             "payroll_total": payroll_total,
             "status": status_value,
         })
-
     return result
 
 
-def get_intersections_rows(
-    db: Session,
-    y: int,
-    m: int,
-    tu: str | None = None
-):
+def get_intersections_rows(db: Session, y: int, m: int, tu: str | None = None):
     start = month_start(y, m)
     end = month_end_exclusive(y, m)
-
     sql = """
-        SELECT
-            v1.visit_date,
-            v1.point_code,
-            m1.fio AS fio1,
-            m1.tu AS tu1,
-            m2.fio AS fio2,
-            m2.tu AS tu2,
-            v1.slot AS slot1,
-            v2.slot AS slot2
+        SELECT v1.visit_date, v1.point_code,
+               m1.fio AS fio1, m1.tu AS tu1,
+               m2.fio AS fio2, m2.tu AS tu2,
+               v1.slot AS slot1, v2.slot AS slot2
         FROM visits v1
         JOIN visits v2
           ON v1.visit_date = v2.visit_date
@@ -786,67 +703,42 @@ def get_intersections_rows(
         WHERE v1.visit_date >= :start_date
           AND v1.visit_date < :end_date
     """
-
-    params = {
-        "start_date": start,
-        "end_date": end
-    }
-
+    params = {"start_date": start, "end_date": end}
     if tu:
         sql += " AND (m1.tu = :tu OR m2.tu = :tu)"
         params["tu"] = tu
-
     sql += " ORDER BY v1.visit_date, v1.point_code, m1.fio, m2.fio"
-
     rows = db.execute(text(sql), params).mappings().all()
-
-    result = []
-    for row in rows:
-        result.append({
-            "visit_date": str(row["visit_date"]),
-            "point_code": row["point_code"],
-            "fio1": row["fio1"],
-            "tu1": row["tu1"] or "",
-            "slot1": row["slot1"],
-            "fio2": row["fio2"],
-            "tu2": row["tu2"] or "",
-            "slot2": row["slot2"],
-        })
-
-    return result
+    return [{
+        "visit_date": str(r["visit_date"]),
+        "point_code": r["point_code"],
+        "fio1": r["fio1"],
+        "tu1": r["tu1"] or "",
+        "slot1": r["slot1"],
+        "fio2": r["fio2"],
+        "tu2": r["tu2"] or "",
+        "slot2": r["slot2"],
+    } for r in rows]
 
 
-# ===== загрузка файлов в админке =====
+# ===== импорт файлов =====
 
 def upsert_supply_row(db: Session, point_code: str, supply_date: date, boxes: int):
-    db.execute(text("""
-        DELETE FROM supplies
-        WHERE point_code = :point_code
-          AND supply_date = :supply_date
-    """), {
-        "point_code": point_code,
-        "supply_date": supply_date
+    db.execute(text("DELETE FROM supplies WHERE point_code=:point_code AND supply_date=:supply_date"), {
+        "point_code": point_code, "supply_date": supply_date
     })
-
-    db.execute(text("""
-        INSERT INTO supplies (point_code, supply_date, boxes)
-        VALUES (:point_code, :supply_date, :boxes)
-    """), {
-        "point_code": point_code,
-        "supply_date": supply_date,
-        "boxes": boxes
+    db.execute(text("INSERT INTO supplies (point_code, supply_date, boxes) VALUES (:point_code, :supply_date, :boxes)"), {
+        "point_code": point_code, "supply_date": supply_date, "boxes": boxes
     })
 
 
 def import_supplies_xlsx(db: Session, file_obj) -> dict:
     wb = load_workbook(file_obj, data_only=True)
     ws = wb[wb.sheetnames[0]]
-
-    loaded_rows = 0
-    loaded_points = set()
-
     headers = [cell.value for cell in ws[1]]
     date_columns = []
+    loaded_rows = 0
+    loaded_points = set()
 
     for idx, value in enumerate(headers[1:], start=2):
         if isinstance(value, datetime):
@@ -855,59 +747,34 @@ def import_supplies_xlsx(db: Session, file_obj) -> dict:
             date_columns.append((idx, value))
 
     for row_idx in range(2, ws.max_row + 1):
-        raw_point = ws.cell(row=row_idx, column=1).value
-        point_code = normalize_point_code(raw_point)
+        point_code = normalize_point_code(ws.cell(row=row_idx, column=1).value)
         if not point_code:
             continue
-
         loaded_points.add(point_code)
-
         for col_idx, supply_date in date_columns:
             raw_boxes = ws.cell(row=row_idx, column=col_idx).value
-            if raw_boxes is None or raw_boxes == "":
+            if raw_boxes in (None, ""):
                 continue
-
             try:
                 boxes = int(float(raw_boxes))
             except Exception:
                 continue
-
             upsert_supply_row(db, point_code, supply_date, boxes)
             loaded_rows += 1
 
     db.commit()
-    return {
-        "loaded_rows": loaded_rows,
-        "loaded_points": len(loaded_points)
-    }
+    return {"loaded_rows": loaded_rows, "loaded_points": len(loaded_points)}
 
 
-def upsert_rate_row(
-    db: Session,
-    point_code: str,
-    month_key: date,
-    rate_supply: int,
-    rate_no_supply: int,
-    rate_inventory: int,
-    coffee_enabled: bool,
-    coffee_rate: int,
-    pay_lt5: bool
-):
-    db.execute(text("""
-        DELETE FROM point_rates
-        WHERE point_code = :point_code
-          AND month_key = :month_key
-    """), {
-        "point_code": point_code,
-        "month_key": month_key
+def upsert_rate_row(db: Session, point_code: str, month_key: date, rate_supply: int, rate_no_supply: int, rate_inventory: int, coffee_enabled: bool, coffee_rate: int, pay_lt5: bool):
+    db.execute(text("DELETE FROM point_rates WHERE point_code=:point_code AND month_key=:month_key"), {
+        "point_code": point_code, "month_key": month_key
     })
-
     db.execute(text("""
         INSERT INTO point_rates (
             point_code, month_key, rate_supply, rate_no_supply, rate_inventory,
             coffee_enabled, coffee_rate, pay_lt5
-        )
-        VALUES (
+        ) VALUES (
             :point_code, :month_key, :rate_supply, :rate_no_supply, :rate_inventory,
             :coffee_enabled, :coffee_rate, :pay_lt5
         )
@@ -919,14 +786,13 @@ def upsert_rate_row(
         "rate_inventory": rate_inventory,
         "coffee_enabled": coffee_enabled,
         "coffee_rate": coffee_rate,
-        "pay_lt5": pay_lt5
+        "pay_lt5": pay_lt5,
     })
 
 
 def import_rates_xlsx(db: Session, file_obj, year: int, month: int) -> dict:
     wb = load_workbook(file_obj, data_only=True)
     ws = wb[wb.sheetnames[0]]
-
     month_key = month_start(year, month)
     loaded_rows = 0
 
@@ -934,30 +800,13 @@ def import_rates_xlsx(db: Session, file_obj, year: int, month: int) -> dict:
         point_code = normalize_point_code(ws.cell(row=row_idx, column=1).value)
         if not point_code:
             continue
-
         rate_supply = int(ws.cell(row=row_idx, column=2).value or 0)
         rate_no_supply = int(ws.cell(row=row_idx, column=3).value or 0)
         rate_inventory = int(ws.cell(row=row_idx, column=4).value or 0)
-
-        coffee_enabled_raw = str(ws.cell(row=row_idx, column=5).value or "").strip().lower()
-        coffee_enabled = coffee_enabled_raw == "да"
-
-        pay_lt5_raw = str(ws.cell(row=row_idx, column=6).value or "").strip().lower()
-        pay_lt5 = pay_lt5_raw == "да"
-
+        coffee_enabled = str(ws.cell(row=row_idx, column=5).value or "").strip().lower() == "да"
+        pay_lt5 = str(ws.cell(row=row_idx, column=6).value or "").strip().lower() == "да"
         coffee_rate = int(ws.cell(row=row_idx, column=7).value or 0)
-
-        upsert_rate_row(
-            db=db,
-            point_code=point_code,
-            month_key=month_key,
-            rate_supply=rate_supply,
-            rate_no_supply=rate_no_supply,
-            rate_inventory=rate_inventory,
-            coffee_enabled=coffee_enabled,
-            coffee_rate=coffee_rate,
-            pay_lt5=pay_lt5
-        )
+        upsert_rate_row(db, point_code, month_key, rate_supply, rate_no_supply, rate_inventory, coffee_enabled, coffee_rate, pay_lt5)
         loaded_rows += 1
 
     db.commit()
@@ -968,28 +817,18 @@ def upsert_merchant_row(db: Session, fio: str, last4: str, tu: str):
     fio_clean = str(fio).strip()
     fio_normalized = fio_norm(fio_clean)
     pass_hash = hash_last4(str(last4).strip())
-
-    existing = db.execute(text("""
-        SELECT id
-        FROM merchants
-        WHERE fio_norm = :fio_norm
-        LIMIT 1
-    """), {"fio_norm": fio_normalized}).scalar()
-
+    existing = db.execute(text("SELECT id FROM merchants WHERE fio_norm=:fio_norm LIMIT 1"), {"fio_norm": fio_normalized}).scalar()
     if existing:
         db.execute(text("""
             UPDATE merchants
-            SET fio = :fio,
-                fio_norm = :fio_norm,
-                pass_hash = :pass_hash,
-                tu = :tu
-            WHERE id = :id
+            SET fio=:fio, fio_norm=:fio_norm, pass_hash=:pass_hash, tu=:tu
+            WHERE id=:id
         """), {
             "id": existing,
             "fio": fio_clean,
             "fio_norm": fio_normalized,
             "pass_hash": pass_hash,
-            "tu": tu
+            "tu": tu,
         })
     else:
         db.execute(text("""
@@ -999,30 +838,24 @@ def upsert_merchant_row(db: Session, fio: str, last4: str, tu: str):
             "fio": fio_clean,
             "fio_norm": fio_normalized,
             "pass_hash": pass_hash,
-            "tu": tu
+            "tu": tu,
         })
 
 
 def import_merchants_xlsx(db: Session, file_obj, tu: str) -> dict:
     wb = load_workbook(file_obj, data_only=True)
     ws = wb[wb.sheetnames[0]]
-
     loaded_rows = 0
-
     for row_idx in range(2, ws.max_row + 1):
         fio = ws.cell(row=row_idx, column=1).value
         last4 = ws.cell(row=row_idx, column=2).value
-
         if not fio or last4 is None:
             continue
-
         last4_str = re.sub(r"\D", "", str(last4))[-4:]
         if len(last4_str) != 4:
             continue
-
         upsert_merchant_row(db, str(fio), last4_str, tu)
         loaded_rows += 1
-
     db.commit()
     return {"loaded_rows": loaded_rows}
 
@@ -1030,53 +863,25 @@ def import_merchants_xlsx(db: Session, file_obj, tu: str) -> dict:
 def clear_month_data(db: Session, year: int, month: int) -> dict:
     start = month_start(year, month)
     end = month_end_exclusive(year, month)
-
-    deleted_visits = db.execute(text("""
-        DELETE FROM visits
-        WHERE visit_date >= :start_date
-          AND visit_date < :end_date
-    """), {
-        "start_date": start,
-        "end_date": end
+    deleted_visits = db.execute(text("DELETE FROM visits WHERE visit_date >= :start_date AND visit_date < :end_date"), {
+        "start_date": start, "end_date": end
     }).rowcount or 0
-
-    deleted_supplies = db.execute(text("""
-        DELETE FROM supplies
-        WHERE supply_date >= :start_date
-          AND supply_date < :end_date
-    """), {
-        "start_date": start,
-        "end_date": end
+    deleted_supplies = db.execute(text("DELETE FROM supplies WHERE supply_date >= :start_date AND supply_date < :end_date"), {
+        "start_date": start, "end_date": end
     }).rowcount or 0
-
-    deleted_rates = db.execute(text("""
-        DELETE FROM point_rates
-        WHERE month_key = :month_key
-    """), {
-        "month_key": start
-    }).rowcount or 0
-
-    deleted_monthly = db.execute(text("""
-        DELETE FROM monthly_submissions
-        WHERE month_key = :month_key
-    """), {
-        "month_key": start
-    }).rowcount or 0
-
+    deleted_rates = db.execute(text("DELETE FROM point_rates WHERE month_key = :month_key"), {"month_key": start}).rowcount or 0
+    deleted_monthly = db.execute(text("DELETE FROM monthly_submissions WHERE month_key = :month_key"), {"month_key": start}).rowcount or 0
     db.commit()
-
     return {
         "deleted_visits": deleted_visits,
         "deleted_supplies": deleted_supplies,
         "deleted_rates": deleted_rates,
-        "deleted_monthly": deleted_monthly
+        "deleted_monthly": deleted_monthly,
     }
 
 
 def clear_merchants_by_tu(db: Session, tu: str) -> int:
-    deleted = db.execute(text("""
-        DELETE FROM merchants
-        WHERE tu = :tu
-    """), {"tu": tu}).rowcount or 0
+    deleted = db.execute(text("DELETE FROM merchants WHERE tu = :tu"), {"tu": tu}).rowcount or 0
     db.commit()
     return deleted
+
