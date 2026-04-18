@@ -579,7 +579,39 @@ def compute_point_total(db: Session, merchant_id: int, point_code: str, y: int, 
     }
 
 
+def get_points_for_month(db: Session, merchant_id: int, y: int, m: int) -> list[str]:
+    start = month_start(y, m)
+    end = month_end_exclusive(y, m)
+
+    rows = db.execute(text("""
+        SELECT DISTINCT point_code
+        FROM (
+            SELECT point_code
+            FROM visits
+            WHERE merchant_id = :merchant_id
+              AND visit_date >= :start_date
+              AND visit_date < :end_date
+
+            UNION
+
+            SELECT point_code
+            FROM point_submissions
+            WHERE merchant_id = :merchant_id
+              AND month_key = :month_key
+        ) q
+        ORDER BY point_code
+    """), {
+        "merchant_id": merchant_id,
+        "start_date": start,
+        "end_date": end,
+        "month_key": start
+    }).all()
+
+    return [r[0] for r in rows if r and r[0]]
+
+
 def compute_overall_total(db: Session, merchant_id: int, y: int, m: int):
+    ensure_submissions_table(db)
     points = get_points_for_month(db, merchant_id, y, m)
     total = 0
     per_point = {}
