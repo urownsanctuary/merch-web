@@ -1,14 +1,17 @@
 import os
 import uuid
 import hashlib
+from io import BytesIO
 from html import escape
 from pathlib import Path
 
 from fastapi import FastAPI, Depends, HTTPException, Form, UploadFile, File, Cookie
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
 
 from app.db import SessionLocal, engine
 from app.services import (
@@ -27,11 +30,13 @@ from app.services import (
     days_in_month,
     weekday_of,
     month_title,
-    get_submission,
-    upsert_submission_draft,
-    submit_submission,
-    reopen_submission,
+    get_monthly_submission,
+    upsert_monthly_submission_draft,
+    submit_monthly_submission,
+    reopen_monthly_submission,
     get_admin_report_rows,
+    get_admin_payroll_rows,
+    get_intersections_rows,
     get_all_tu_values,
 )
 
@@ -65,6 +70,24 @@ def is_admin_authenticated(admin_auth: str | None) -> bool:
     if not ADMIN_LOGIN or not ADMIN_PASSWORD or not SECRET_SALT:
         return False
     return admin_auth == get_admin_cookie_value()
+
+
+def style_sheet(ws):
+    green_fill = PatternFill("solid", fgColor="E8F5E9")
+    bold = Font(bold=True)
+    for cell in ws[1]:
+        cell.font = bold
+        cell.fill = green_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for col in ws.columns:
+        max_len = 0
+        col_letter = col[0].column_letter
+        for cell in col:
+            value = "" if cell.value is None else str(cell.value)
+            max_len = max(max_len, len(value))
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+        ws.column_dimensions[col_letter].width = min(max(max_len + 2, 12), 35)
+    ws.freeze_panes = "A2"
 
 
 @app.get("/")
@@ -137,7 +160,7 @@ def base_css():
         }
 
         .page {
-            max-width: 1100px;
+            max-width: 1580px;
             margin: 0 auto;
             min-height: calc(100vh - 40px);
             display: flex;
@@ -156,7 +179,7 @@ def base_css():
 
         .card-wide {
             width: 100%;
-            max-width: 1100px;
+            max-width: 1580px;
             background: var(--card);
             border-radius: 24px;
             padding: 22px 20px 28px;
@@ -244,6 +267,13 @@ def base_css():
             margin-top: 12px;
             padding: 12px 14px;
             font-size: 15px;
+        }
+
+        .btn-inline {
+            width: auto;
+            margin-top: 0;
+            padding: 12px 16px;
+            font-size: 14px;
         }
 
         .footer {
@@ -510,30 +540,32 @@ def base_css():
 
         .filter-grid {
             display: grid;
-            grid-template-columns: 1fr 1fr 1fr 1fr;
+            grid-template-columns: 140px 140px 220px 220px;
             gap: 12px;
             margin-bottom: 16px;
+            align-items: end;
         }
 
         .table-wrap {
-            overflow-x: auto;
             border: 1px solid #E5E7EB;
             border-radius: 16px;
             background: #fff;
+            overflow: visible;
         }
 
         table {
             width: 100%;
             border-collapse: collapse;
-            min-width: 1200px;
+            table-layout: fixed;
         }
 
         th, td {
-            padding: 12px 10px;
+            padding: 10px 8px;
             border-bottom: 1px solid #E5E7EB;
             text-align: left;
             vertical-align: top;
-            font-size: 14px;
+            font-size: 12px;
+            word-break: break-word;
         }
 
         th {
@@ -541,7 +573,7 @@ def base_css():
             font-weight: 800;
         }
 
-        .admin-actions {
+        .admin-actions, .admin-top-buttons {
             display: flex;
             gap: 12px;
             justify-content: space-between;
@@ -550,7 +582,14 @@ def base_css():
             flex-wrap: wrap;
         }
 
-        @media (max-width: 760px) {
+        .admin-export-buttons {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-top: 14px;
+        }
+
+        @media (max-width: 960px) {
             .page { align-items: flex-start; }
             .card-wide { padding: 18px 14px 24px; }
             .sum-strip, .details-grid, .filter-grid { grid-template-columns: 1fr; }
@@ -564,9 +603,22 @@ def base_css():
             h1 { font-size: 30px; }
             .brand { font-size: 24px; }
             .calendar-month { font-size: 24px; }
+            .table-wrap { overflow-x: auto; }
+            table { min-width: 1200px; }
         }
     </style>
     """
+
+
+def build_excel_response(wb: Workbook, filename: str) -> StreamingResponse:
+    buffer = BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
 
 
 @app.get("/login-page", response_class=HTMLResponse)
@@ -673,6 +725,7 @@ def menu_page(fio: str = "", db: Session = Depends(get_db)):
 
             <a class="btn" href="/point-page?fio={escape(fio)}">Заполнить сверку</a>
             <a class="btn btn-secondary" href="/summary-page?fio={escape(fio)}">Моя сумма</a>
+            <a class="btn btn-secondary" href="/monthly-submit-page?fio={escape(fio)}">Отправить сверку за месяц</a>
         </div>
     </div>
 </body>
@@ -803,7 +856,6 @@ def build_calendar_html(
 ) -> str:
     dim = days_in_month(y, m)
     first_wd = weekday_of(y, m, 1)
-
     weekdays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
     html = '<div class="weekdays">'
@@ -847,10 +899,6 @@ def build_calendar_html(
 def calendar_page(
     fio: str,
     point_code: str,
-    saved: str = "",
-    submitted: str = "",
-    reopened: str = "",
-    error: str = "",
     db: Session = Depends(get_db)
 ):
     period = get_active_period()
@@ -863,12 +911,12 @@ def calendar_page(
 
     point_code = normalize_point_code(point_code)
 
+    overall = compute_overall_total(db, merchant["id"], y, m)
+    monthly_submitted = overall["submission_status"] == "submitted"
+
     boxes_map = get_supply_boxes_map(db, point_code, y, m)
     visits = get_visits_for_month(db, merchant["id"], point_code, y, m)
     point_total = compute_point_total(db, merchant["id"], point_code, y, m)
-    overall = compute_overall_total(db, merchant["id"], y, m)
-
-    is_submitted = point_total["submission_status"] == "submitted"
 
     calendar_html = build_calendar_html(
         fio=fio,
@@ -877,66 +925,8 @@ def calendar_page(
         m=m,
         boxes_map=boxes_map,
         visits=visits,
-        is_submitted=is_submitted
+        is_submitted=monthly_submitted
     )
-
-    comment_value = point_total["comment"] or ""
-    extra_amount_value = point_total["extra_amount"] or 0
-    receipt_link = ""
-    if point_total["receipt_path"]:
-        receipt_link = f"<div class='hint' style='margin-top:10px'>Чек: <a href='/{point_total['receipt_path']}' target='_blank'>открыть файл</a></div>"
-
-    info_box = ""
-    if saved == "1":
-        info_box += "<div class='success-box'>Черновик сохранён.</div>"
-    if submitted == "1":
-        info_box += "<div class='success-box'>Сверка отправлена.</div>"
-    if reopened == "1":
-        info_box += "<div class='success-box'>Сверка разблокирована для редактирования.</div>"
-    if error == "receipt_required":
-        info_box += "<div class='error-box'>Для возмещения необходимо приложить чек.</div>"
-
-    form_block = ""
-    if is_submitted:
-        form_block = f"""
-        <div class="detail-card" style="margin-top:18px;">
-            <div class="detail-title">Примечание</div>
-            <div class="detail-line">{escape(comment_value) if comment_value else "—"}</div>
-
-            <div class="detail-title" style="margin-top:14px;">Возмещение</div>
-            <div class="detail-line">{extra_amount_value} ₽</div>
-
-            {receipt_link}
-
-            <a class="btn btn-secondary" href="/reopen-submission?fio={escape(fio)}&point_code={escape(point_code)}">Редактировать сверку</a>
-        </div>
-        """
-    else:
-        form_block = f"""
-        <form method="post" action="/save-submission" enctype="multipart/form-data" class="detail-card" style="margin-top:18px;">
-            <input type="hidden" name="fio" value="{escape(fio)}" />
-            <input type="hidden" name="point_code" value="{escape(point_code)}" />
-
-            <label for="comment">Примечание</label>
-            <textarea id="comment" name="comment">{escape(comment_value)}</textarea>
-
-            <label for="extra_amount">Возмещение, ₽</label>
-            <input id="extra_amount" name="extra_amount" type="number" min="0" value="{extra_amount_value}" />
-
-            <label for="receipt">Чек</label>
-            <input id="receipt" name="receipt" type="file" accept=".jpg,.jpeg,.png,.pdf,.webp" />
-
-            {receipt_link}
-
-            <button class="btn btn-secondary" type="submit">Сохранить черновик</button>
-        </form>
-
-        <form method="post" action="/submit-submission" enctype="multipart/form-data">
-            <input type="hidden" name="fio" value="{escape(fio)}" />
-            <input type="hidden" name="point_code" value="{escape(point_code)}" />
-            <button class="btn" type="submit">Отправить сверку</button>
-        </form>
-        """
 
     return f"""
 <!DOCTYPE html>
@@ -960,11 +950,9 @@ def calendar_page(
                     <div class="mini-pill">Точка: {escape(point_code)}</div>
                     <div class="mini-pill">{escape(fio)}</div>
                     <div class="mini-pill">КМ: {"Да" if point_total["coffee_enabled"] else "Нет"}</div>
-                    <div class="mini-pill">Статус: {"Отправлено" if is_submitted else "Черновик"}</div>
+                    <div class="mini-pill">Месячная сверка: {"Отправлена" if monthly_submitted else "Черновик"}</div>
                 </div>
             </div>
-
-            {info_box}
 
             <div class="sum-strip">
                 <div class="sum-card">
@@ -1000,11 +988,6 @@ def calendar_page(
                 </div>
             </div>
 
-            <div class="detail-card" style="margin-bottom:18px;">
-                <div class="detail-title">Возмещение</div>
-                <div class="detail-line">{point_total["extra_amount"]} ₽</div>
-            </div>
-
             <div class="calendar-wrap">
                 {calendar_html}
             </div>
@@ -1024,8 +1007,6 @@ def calendar_page(
                 Поставки до 5 коробок не оплачиваются.
             </div>
 
-            {form_block}
-
             <a class="back" href="/point-page?fio={escape(fio)}">← Выбрать другую точку</a>
         </div>
     </div>
@@ -1034,10 +1015,147 @@ def calendar_page(
 """
 
 
-@app.post("/save-submission")
-async def save_submission(
+@app.get("/monthly-submit-page", response_class=HTMLResponse)
+def monthly_submit_page(
+    fio: str,
+    saved: str = "",
+    submitted: str = "",
+    reopened: str = "",
+    error: str = "",
+    db: Session = Depends(get_db)
+):
+    period = get_active_period()
+    y = period["year"]
+    m = period["month"]
+
+    merchant = get_merchant_by_fio(db, fio)
+    if not merchant:
+        return RedirectResponse(url="/login-page", status_code=303)
+
+    overall = compute_overall_total(db, merchant["id"], y, m)
+    monthly_submitted = overall["submission_status"] == "submitted"
+
+    info_box = ""
+    if saved == "1":
+        info_box += "<div class='success-box'>Черновик месячной сверки сохранён.</div>"
+    if submitted == "1":
+        info_box += "<div class='success-box'>Месячная сверка отправлена.</div>"
+    if reopened == "1":
+        info_box += "<div class='success-box'>Месячная сверка разблокирована для редактирования.</div>"
+    if error == "receipt_required":
+        info_box += "<div class='error-box'>Для возмещения необходимо приложить чек.</div>"
+
+    points_html = ""
+    if overall["per_point_details"]:
+        for point_code, d in overall["per_point_details"].items():
+            points_html += f"""
+            <details class="point-detail">
+                <summary>{escape(point_code)} — {d["total"]} ₽</summary>
+                <div class="summary-content">
+                    <div>С поставкой: {d["cnt_supply"]} × {d["rate_supply"]} ₽ = {d["sum_supply"]} ₽</div>
+                    <div>Без поставки: {d["cnt_no_supply"]} × {d["rate_no_supply"]} ₽ = {d["sum_no_supply"]} ₽</div>
+                    <div>Полный инвент: {d["cnt_full_inv"]} × {d["rate_inventory"]} ₽ = {d["sum_inventory"]} ₽</div>
+                    <div>Кофемашина: {d["coffee_cnt"]} × {d["coffee_rate"]} ₽ = {d["coffee_sum"]} ₽</div>
+                </div>
+            </details>
+            """
+    else:
+        points_html = "<div class='hint'>В этом месяце пока нет отмеченных точек.</div>"
+
+    receipt_link = ""
+    if overall["receipt_path"]:
+        receipt_link = f"<div class='hint' style='margin-top:10px'>Чек: <a href='/{overall['receipt_path']}' target='_blank'>открыть файл</a></div>"
+
+    form_block = ""
+    if monthly_submitted:
+        form_block = f"""
+        <div class="detail-card" style="margin-top:18px;">
+            <div class="detail-title">Примечание</div>
+            <div class="detail-line">{escape(overall["comment"]) if overall["comment"] else "—"}</div>
+
+            <div class="detail-title" style="margin-top:14px;">Возмещение</div>
+            <div class="detail-line">{overall["extra_amount"]} ₽</div>
+
+            {receipt_link}
+
+            <a class="btn btn-secondary" href="/reopen-monthly-submission?fio={escape(fio)}">Редактировать сверку</a>
+        </div>
+        """
+    else:
+        form_block = f"""
+        <form method="post" action="/save-monthly-submission" enctype="multipart/form-data" class="detail-card" style="margin-top:18px;">
+            <input type="hidden" name="fio" value="{escape(fio)}" />
+
+            <label for="comment">Примечание</label>
+            <textarea id="comment" name="comment">{escape(overall["comment"])}</textarea>
+
+            <label for="extra_amount">Возмещение, ₽</label>
+            <input id="extra_amount" name="extra_amount" type="number" min="0" value="{overall["extra_amount"]}" />
+
+            <label for="receipt">Чек</label>
+            <input id="receipt" name="receipt" type="file" accept=".jpg,.jpeg,.png,.pdf,.webp" />
+
+            {receipt_link}
+
+            <button class="btn btn-secondary" type="submit">Сохранить черновик</button>
+        </form>
+
+        <form method="post" action="/submit-monthly-submission" enctype="multipart/form-data">
+            <input type="hidden" name="fio" value="{escape(fio)}" />
+            <button class="btn" type="submit">Отправить сверку за месяц</button>
+        </form>
+        """
+
+    return f"""
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Отправка месячной сверки</title>
+    {base_css()}
+</head>
+<body>
+    <div class="page">
+        <div class="card-wide">
+            <div class="brand">ВкусВилл</div>
+            <h1>Отправить сверку за месяц</h1>
+            <div class="subtitle">{escape(fio)} · {month_title(y, m)}</div>
+
+            {info_box}
+
+            <div class="sum-strip">
+                <div class="sum-card">
+                    <div class="sum-title">Сумма по точкам</div>
+                    <div class="sum-value">{sum(overall["per_point"].values())} ₽</div>
+                </div>
+
+                <div class="sum-card">
+                    <div class="sum-title">Итог за месяц</div>
+                    <div class="sum-value">{overall["total"]} ₽</div>
+                </div>
+            </div>
+
+            <div class="detail-card" style="margin-bottom:16px;">
+                <div class="detail-title">Возмещение за месяц</div>
+                <div class="detail-line">{overall["extra_amount"]} ₽</div>
+            </div>
+
+            {points_html}
+
+            {form_block}
+
+            <a class="back" href="/menu-page?fio={escape(fio)}">← Назад</a>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+
+@app.post("/save-monthly-submission")
+async def save_monthly_submission(
     fio: str = Form(...),
-    point_code: str = Form(...),
     comment: str = Form(""),
     extra_amount: int = Form(0),
     receipt: UploadFile | None = File(None),
@@ -1047,8 +1165,6 @@ async def save_submission(
     merchant = get_merchant_by_fio(db, fio)
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
-
-    point_code = normalize_point_code(point_code)
 
     receipt_path = None
     if receipt and receipt.filename:
@@ -1059,10 +1175,9 @@ async def save_submission(
         filepath.write_bytes(content)
         receipt_path = f"uploads/{filename}"
 
-    upsert_submission_draft(
+    upsert_monthly_submission_draft(
         db=db,
         merchant_id=merchant["id"],
-        point_code=point_code,
         y=period["year"],
         m=period["month"],
         comment=comment or "",
@@ -1071,15 +1186,14 @@ async def save_submission(
     )
 
     return RedirectResponse(
-        url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}&saved=1",
+        url=f"/monthly-submit-page?fio={escape(fio)}&saved=1",
         status_code=303
     )
 
 
-@app.post("/submit-submission")
-async def submit_submission_route(
+@app.post("/submit-monthly-submission")
+async def submit_monthly_submission_route(
     fio: str = Form(...),
-    point_code: str = Form(...),
     comment: str = Form(""),
     extra_amount: int = Form(0),
     receipt: UploadFile | None = File(None),
@@ -1090,10 +1204,8 @@ async def submit_submission_route(
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
 
-    point_code = normalize_point_code(point_code)
     extra_amount = max(0, int(extra_amount or 0))
-
-    existing = get_submission(db, merchant["id"], point_code, period["year"], period["month"])
+    existing = get_monthly_submission(db, merchant["id"], period["year"], period["month"])
 
     receipt_path = None
     if receipt and receipt.filename:
@@ -1107,10 +1219,9 @@ async def submit_submission_route(
     effective_receipt = receipt_path or (existing.get("receipt_path") if existing else None)
 
     if extra_amount > 0 and not effective_receipt:
-        upsert_submission_draft(
+        upsert_monthly_submission_draft(
             db=db,
             merchant_id=merchant["id"],
-            point_code=point_code,
             y=period["year"],
             m=period["month"],
             comment=comment or "",
@@ -1118,14 +1229,13 @@ async def submit_submission_route(
             receipt_path=receipt_path
         )
         return RedirectResponse(
-            url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}&error=receipt_required",
+            url=f"/monthly-submit-page?fio={escape(fio)}&error=receipt_required",
             status_code=303
         )
 
-    upsert_submission_draft(
+    upsert_monthly_submission_draft(
         db=db,
         merchant_id=merchant["id"],
-        point_code=point_code,
         y=period["year"],
         m=period["month"],
         comment=comment or "",
@@ -1133,18 +1243,17 @@ async def submit_submission_route(
         receipt_path=receipt_path
     )
 
-    submit_submission(db, merchant["id"], point_code, period["year"], period["month"])
+    submit_monthly_submission(db, merchant["id"], period["year"], period["month"])
 
     return RedirectResponse(
-        url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}&submitted=1",
+        url=f"/monthly-submit-page?fio={escape(fio)}&submitted=1",
         status_code=303
     )
 
 
-@app.get("/reopen-submission")
-def reopen_submission_route(
+@app.get("/reopen-monthly-submission")
+def reopen_monthly_submission_route(
     fio: str,
-    point_code: str,
     db: Session = Depends(get_db)
 ):
     period = get_active_period()
@@ -1152,11 +1261,10 @@ def reopen_submission_route(
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
 
-    point_code = normalize_point_code(point_code)
-    reopen_submission(db, merchant["id"], point_code, period["year"], period["month"])
+    reopen_monthly_submission(db, merchant["id"], period["year"], period["month"])
 
     return RedirectResponse(
-        url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}&reopened=1",
+        url=f"/monthly-submit-page?fio={escape(fio)}&reopened=1",
         status_code=303
     )
 
@@ -1176,8 +1284,8 @@ def day_action_page(
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
 
-    point_total = compute_point_total(db, merchant["id"], point_code, y, m)
-    if point_total["submission_status"] == "submitted":
+    overall = compute_overall_total(db, merchant["id"], y, m)
+    if overall["submission_status"] == "submitted":
         return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}", status_code=303)
 
     if day < 1 or day > days_in_month(y, m):
@@ -1245,8 +1353,8 @@ def toggle_day(
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
 
-    point_total = compute_point_total(db, merchant["id"], point_code, y, m)
-    if point_total["submission_status"] == "submitted":
+    overall = compute_overall_total(db, merchant["id"], y, m)
+    if overall["submission_status"] == "submitted":
         return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}", status_code=303)
 
     if 1 <= day <= days_in_month(y, m):
@@ -1270,8 +1378,8 @@ def toggle_inventory(
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
 
-    point_total = compute_point_total(db, merchant["id"], point_code, y, m)
-    if point_total["submission_status"] == "submitted":
+    overall = compute_overall_total(db, merchant["id"], y, m)
+    if overall["submission_status"] == "submitted":
         return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}", status_code=303)
 
     if 1 <= day <= days_in_month(y, m):
@@ -1286,7 +1394,7 @@ def toggle_inventory(
 def summary_page(fio: str = "", db: Session = Depends(get_db)):
     period = get_active_period()
     merchant = get_merchant_by_fio(db, fio)
-    overall = {"total": 0, "per_point": {}, "per_point_details": {}}
+    overall = {"total": 0, "per_point": {}, "per_point_details": {}, "extra_amount": 0, "comment": "", "receipt_path": None}
 
     if merchant:
         overall = compute_overall_total(db, merchant["id"], period["year"], period["month"])
@@ -1294,10 +1402,6 @@ def summary_page(fio: str = "", db: Session = Depends(get_db)):
     details_html = ""
     if overall["per_point_details"]:
         for point_code, d in overall["per_point_details"].items():
-            receipt_line = ""
-            if d["receipt_path"]:
-                receipt_line = f"<div>Чек: <a href='/{d['receipt_path']}' target='_blank'>открыть</a></div>"
-
             details_html += f"""
             <details class="point-detail">
                 <summary>{escape(point_code)} — {d["total"]} ₽</summary>
@@ -1306,15 +1410,20 @@ def summary_page(fio: str = "", db: Session = Depends(get_db)):
                     <div>Без поставки: {d["cnt_no_supply"]} × {d["rate_no_supply"]} ₽ = {d["sum_no_supply"]} ₽</div>
                     <div>Полный инвент: {d["cnt_full_inv"]} × {d["rate_inventory"]} ₽ = {d["sum_inventory"]} ₽</div>
                     <div>Кофемашина: {d["coffee_cnt"]} × {d["coffee_rate"]} ₽ = {d["coffee_sum"]} ₽</div>
-                    <div>Возмещение: {d["extra_amount"]} ₽</div>
-                    <div>Примечание: {escape(d["comment"]) if d["comment"] else "—"}</div>
-                    {receipt_line}
-                    <div><strong>Итого: {d["total"]} ₽</strong></div>
+                    <div><strong>Итого по точке: {d["total"]} ₽</strong></div>
                 </div>
             </details>
             """
     else:
         details_html = "<div class='hint' style='margin-top:10px'>Пока нет отмеченных точек за этот месяц.</div>"
+
+    monthly_block = f"""
+    <div class="detail-card" style="margin-top:16px;">
+        <div class="detail-title">Месячная часть сверки</div>
+        <div class="detail-line">Возмещение: {overall["extra_amount"]} ₽</div>
+        <div class="detail-line">Примечание: {escape(overall["comment"]) if overall["comment"] else "—"}</div>
+    </div>
+    """
 
     return f"""
 <!DOCTYPE html>
@@ -1338,6 +1447,7 @@ def summary_page(fio: str = "", db: Session = Depends(get_db)):
             </div>
 
             {details_html}
+            {monthly_block}
 
             <div class="hint">Сейчас открыт период за {month_title(period["year"], period["month"])}.</div>
 
@@ -1443,15 +1553,16 @@ def admin_report(
     rows = get_admin_report_rows(db, year, month, tu_filter, status_filter)
     tu_values = get_all_tu_values(db)
 
-    tu_options = "<option value=''>Все</option>"
+    tu_options = "<option value=''>Все ТУ</option>"
     for item in tu_values:
         selected = "selected" if item == tu else ""
         tu_options += f"<option value='{escape(item)}' {selected}>{escape(item)}</option>"
 
     status_options = f"""
-        <option value='' {'selected' if not status else ''}>Все</option>
-        <option value='draft' {'selected' if status == 'draft' else ''}>draft</option>
-        <option value='submitted' {'selected' if status == 'submitted' else ''}>submitted</option>
+        <option value='' {'selected' if not status else ''}>Все статусы</option>
+        <option value='не отправлено' {'selected' if status == 'не отправлено' else ''}>Не отправлено</option>
+        <option value='draft' {'selected' if status == 'draft' else ''}>Черновик</option>
+        <option value='submitted' {'selected' if status == 'submitted' else ''}>Отправлено</option>
     """
 
     rows_html = ""
@@ -1466,13 +1577,13 @@ def admin_report(
                 <td>{escape(r["fio"])}</td>
                 <td>{escape(r["tu"]) if r["tu"] else "—"}</td>
                 <td>{escape(r["point_code"])}</td>
-                <td>{year:04d}-{month:02d}</td>
+                <td>{month_title(year, month)}</td>
                 <td>{r["cnt_supply"]} / {r["sum_supply"]} ₽</td>
                 <td>{r["cnt_no_supply"]} / {r["sum_no_supply"]} ₽</td>
                 <td>{r["cnt_full_inv"]} / {r["sum_inventory"]} ₽</td>
                 <td>{r["coffee_cnt"]} × {r["coffee_rate"]} = {r["coffee_sum"]} ₽</td>
                 <td>{r["extra_amount"]} ₽</td>
-                <td><strong>{r["total"]} ₽</strong></td>
+                <td><strong>{r["point_total"]} ₽</strong></td>
                 <td>{escape(r["status"])}</td>
                 <td>{receipt_html}</td>
                 <td>{escape(r["comment"]) if r["comment"] else "—"}</td>
@@ -1489,6 +1600,8 @@ def admin_report(
     for m in range(1, 13):
         selected = "selected" if m == month else ""
         month_options += f"<option value='{m}' {selected}>{m:02d}</option>"
+
+    export_query = f"year={year}&month={month}&tu={escape(tu)}&status={escape(status)}"
 
     return f"""
 <!DOCTYPE html>
@@ -1509,7 +1622,7 @@ def admin_report(
                     <div class="subtitle">Админ-панель</div>
                 </div>
                 <div>
-                    <a class="btn btn-secondary" style="margin-top:0; width:auto; padding:12px 18px;" href="/admin-logout">Выйти</a>
+                    <a class="btn btn-secondary btn-inline" href="/admin-logout">Выйти</a>
                 </div>
             </div>
 
@@ -1528,22 +1641,28 @@ def admin_report(
                     </div>
 
                     <div>
-                        <label for="tu">ТУ</label>
+                        <label for="tu">Территориальный управляющий</label>
                         <select id="tu" name="tu">
                             {tu_options}
                         </select>
                     </div>
 
                     <div>
-                        <label for="status">Статус</label>
+                        <label for="status">Статус сверки</label>
                         <select id="status" name="status">
                             {status_options}
                         </select>
                     </div>
                 </div>
 
-                <button class="btn" type="submit">Применить фильтр</button>
+                <button class="btn btn-inline" type="submit">Применить фильтр</button>
             </form>
+
+            <div class="admin-export-buttons">
+                <a class="btn btn-secondary btn-inline" href="/admin-export-check?{export_query}">Выгрузка для проверки</a>
+                <a class="btn btn-secondary btn-inline" href="/admin-export-payroll?{export_query}">Выгрузка в ведомость</a>
+                <a class="btn btn-secondary btn-inline" href="/admin-export-overlaps?{export_query}">Выгрузка пересечений</a>
+            </div>
 
             <div class="hint">
                 Период отчёта: {month_title(year, month)}. Всего строк: {len(rows)}.
@@ -1561,11 +1680,11 @@ def admin_report(
                             <th>Без поставки</th>
                             <th>Инвенты</th>
                             <th>Кофемашина</th>
-                            <th>Возмещение</th>
-                            <th>Итог</th>
+                            <th>Возмещение месяца</th>
+                            <th>Итог по точке</th>
                             <th>Статус</th>
                             <th>Чек</th>
-                            <th>Примечание</th>
+                            <th>Примечание месяца</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -1578,3 +1697,166 @@ def admin_report(
 </body>
 </html>
 """
+
+
+@app.get("/admin-export-check")
+def admin_export_check(
+    year: int,
+    month: int,
+    tu: str = "",
+    status: str = "",
+    admin_auth: str | None = Cookie(default=None),
+    db: Session = Depends(get_db)
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+
+    rows = get_admin_report_rows(
+        db=db,
+        y=year,
+        m=month,
+        tu=tu.strip() or None,
+        status=status.strip() or None
+    )
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Проверка"
+
+    ws.append([
+        "ФИО",
+        "ТУ",
+        "Точка",
+        "Месяц",
+        "Выходы с поставкой (кол-во)",
+        "Выходы с поставкой (сумма)",
+        "Выходы без поставки (кол-во)",
+        "Выходы без поставки (сумма)",
+        "Полные инвенты (кол-во)",
+        "Полные инвенты (сумма)",
+        "Кофемашина (кол-во)",
+        "Кофемашина (сумма)",
+        "Возмещение месяца",
+        "Статус",
+        "Чек",
+        "Примечание месяца",
+        "Итог по точке"
+    ])
+
+    for r in rows:
+        ws.append([
+            r["fio"],
+            r["tu"],
+            r["point_code"],
+            month_title(year, month),
+            r["cnt_supply"],
+            r["sum_supply"],
+            r["cnt_no_supply"],
+            r["sum_no_supply"],
+            r["cnt_full_inv"],
+            r["sum_inventory"],
+            r["coffee_cnt"],
+            r["coffee_sum"],
+            r["extra_amount"],
+            r["status"],
+            r["receipt_path"] or "",
+            r["comment"],
+            r["point_total"]
+        ])
+
+    style_sheet(ws)
+    return build_excel_response(wb, f"proverka_{year}_{month:02d}.xlsx")
+
+
+@app.get("/admin-export-payroll")
+def admin_export_payroll(
+    year: int,
+    month: int,
+    tu: str = "",
+    status: str = "",
+    admin_auth: str | None = Cookie(default=None),
+    db: Session = Depends(get_db)
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+
+    rows = get_admin_payroll_rows(
+        db=db,
+        y=year,
+        m=month,
+        tu=tu.strip() or None,
+        status=status.strip() or None
+    )
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Ведомость"
+
+    ws.append([
+        "ФИО",
+        "ТУ",
+        "Сумма по мерчу",
+        "Сумма в ведомость (/0.87, округление вверх)",
+        "Статус"
+    ])
+
+    for r in rows:
+        ws.append([
+            r["fio"],
+            r["tu"],
+            r["clean_total"],
+            r["payroll_total"],
+            r["status"]
+        ])
+
+    style_sheet(ws)
+    return build_excel_response(wb, f"vedomost_{year}_{month:02d}.xlsx")
+
+
+@app.get("/admin-export-overlaps")
+def admin_export_overlaps(
+    year: int,
+    month: int,
+    tu: str = "",
+    admin_auth: str | None = Cookie(default=None),
+    db: Session = Depends(get_db)
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+
+    rows = get_intersections_rows(
+        db=db,
+        y=year,
+        m=month,
+        tu=tu.strip() or None
+    )
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Пересечения"
+
+    ws.append([
+        "Дата",
+        "Точка",
+        "Мерч 1",
+        "ТУ 1",
+        "Слот 1",
+        "Мерч 2",
+        "ТУ 2",
+        "Слот 2"
+    ])
+
+    for r in rows:
+        ws.append([
+            r["visit_date"],
+            r["point_code"],
+            r["fio1"],
+            r["tu1"],
+            r["slot1"],
+            r["fio2"],
+            r["tu2"],
+            r["slot2"],
+        ])
+
+    style_sheet(ws)
+    return build_excel_response(wb, f"peresecheniya_{year}_{month:02d}.xlsx")
