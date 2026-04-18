@@ -308,6 +308,32 @@ def base_css():
             font-weight: 900;
         }
 
+        .details-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 12px;
+            margin-bottom: 18px;
+        }
+
+        .detail-card {
+            background: #FAFCFA;
+            border: 1px solid #E5E7EB;
+            border-radius: 16px;
+            padding: 14px 16px;
+        }
+
+        .detail-title {
+            color: var(--muted);
+            font-size: 13px;
+            margin-bottom: 8px;
+        }
+
+        .detail-line {
+            font-size: 15px;
+            font-weight: 700;
+            line-height: 1.5;
+        }
+
         .calendar-wrap {
             margin-top: 4px;
         }
@@ -437,7 +463,8 @@ def base_css():
                 padding: 18px 14px 24px;
             }
 
-            .sum-strip {
+            .sum-strip,
+            .details-grid {
                 grid-template-columns: 1fr;
             }
 
@@ -794,6 +821,8 @@ def calendar_page(
     overall = compute_overall_total(db, merchant["id"], y, m)
     calendar_html = build_calendar_html(fio, point_code, y, m, boxes_map, visits)
 
+    coffee_text = "Да" if point_total["coffee_enabled"] else "Нет"
+
     return f"""
 <!DOCTYPE html>
 <html lang="ru">
@@ -815,7 +844,7 @@ def calendar_page(
                 <div class="calendar-meta">
                     <div class="mini-pill">Точка: {point_code}</div>
                     <div class="mini-pill">{fio}</div>
-                    <div class="mini-pill">КМ: {"Да" if point_total["coffee_enabled"] else "Нет"}</div>
+                    <div class="mini-pill">КМ: {coffee_text}</div>
                 </div>
             </div>
 
@@ -828,6 +857,28 @@ def calendar_page(
                 <div class="sum-card">
                     <div class="sum-title">Общая сумма за месяц</div>
                     <div class="sum-value">{overall["total"]} ₽</div>
+                </div>
+            </div>
+
+            <div class="details-grid">
+                <div class="detail-card">
+                    <div class="detail-title">Выходы с поставкой</div>
+                    <div class="detail-line">{point_total["cnt_supply"]} × {point_total["rate_supply"]} ₽ = {point_total["sum_supply"]} ₽</div>
+                </div>
+
+                <div class="detail-card">
+                    <div class="detail-title">Выходы без поставки</div>
+                    <div class="detail-line">{point_total["cnt_no_supply"]} × {point_total["rate_no_supply"]} ₽ = {point_total["sum_no_supply"]} ₽</div>
+                </div>
+
+                <div class="detail-card">
+                    <div class="detail-title">Полные инвенты</div>
+                    <div class="detail-line">{point_total["cnt_full_inv"]} × {point_total["rate_inventory"]} ₽ = {point_total["sum_inventory"]} ₽</div>
+                </div>
+
+                <div class="detail-card">
+                    <div class="detail-title">Кофемашина</div>
+                    <div class="detail-line">{point_total["coffee_cnt"]} × {point_total["coffee_rate"]} ₽ = {point_total["coffee_sum"]} ₽</div>
                 </div>
             </div>
 
