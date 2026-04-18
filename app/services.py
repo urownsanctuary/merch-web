@@ -197,7 +197,7 @@ def get_supply_boxes_map(db: Session, point_code: str, y: int, m: int) -> dict[i
         "end_date": end
     }).mappings().all()
 
-    result: dict[int, int] = {}
+    result = {}
     for row in rows:
         day = row["supply_date"].day
         result[day] = int(row["boxes"] or 0)
@@ -223,7 +223,7 @@ def get_visits_for_month(db: Session, merchant_id: int, point_code: str, y: int,
         "end_date": end
     }).mappings().all()
 
-    result: dict[int, set[str]] = {}
+    result = {}
     for row in rows:
         day = row["visit_date"].day
         result.setdefault(day, set()).add(str(row["slot"]))
@@ -351,10 +351,162 @@ def effective_has_supply(boxes: int, pay_lt5: bool) -> bool:
     return True if pay_lt5 else (boxes >= 5)
 
 
+def ensure_submissions_table(db: Session):
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS point_submissions (
+            id SERIAL PRIMARY KEY,
+            merchant_id INTEGER NOT NULL,
+            point_code TEXT NOT NULL,
+            month_key DATE NOT NULL,
+            comment TEXT,
+            extra_amount INTEGER NOT NULL DEFAULT 0,
+            receipt_path TEXT,
+            status TEXT NOT NULL DEFAULT 'draft',
+            created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+            UNIQUE (merchant_id, point_code, month_key)
+        )
+    """))
+    db.commit()
+
+
+def get_submission(db: Session, merchant_id: int, point_code: str, y: int, m: int):
+    ensure_submissions_table(db)
+    mk = month_start(y, m)
+
+    row = db.execute(text("""
+        SELECT *
+        FROM point_submissions
+        WHERE merchant_id = :merchant_id
+          AND point_code = :point_code
+          AND month_key = :month_key
+        LIMIT 1
+    """), {
+        "merchant_id": merchant_id,
+        "point_code": point_code,
+        "month_key": mk
+    }).mappings().first()
+
+    return dict(row) if row else None
+
+
+def upsert_submission_draft(
+    db: Session,
+    merchant_id: int,
+    point_code: str,
+    y: int,
+    m: int,
+    comment: str,
+    extra_amount: int,
+    receipt_path: str | None,
+):
+    ensure_submissions_table(db)
+    mk = month_start(y, m)
+
+    existing = get_submission(db, merchant_id, point_code, y, m)
+
+    if existing:
+        if receipt_path:
+            db.execute(text("""
+                UPDATE point_submissions
+                SET comment = :comment,
+                    extra_amount = :extra_amount,
+                    receipt_path = :receipt_path,
+                    updated_at = NOW()
+                WHERE merchant_id = :merchant_id
+                  AND point_code = :point_code
+                  AND month_key = :month_key
+            """), {
+                "comment": comment,
+                "extra_amount": extra_amount,
+                "receipt_path": receipt_path,
+                "merchant_id": merchant_id,
+                "point_code": point_code,
+                "month_key": mk
+            })
+        else:
+            db.execute(text("""
+                UPDATE point_submissions
+                SET comment = :comment,
+                    extra_amount = :extra_amount,
+                    updated_at = NOW()
+                WHERE merchant_id = :merchant_id
+                  AND point_code = :point_code
+                  AND month_key = :month_key
+            """), {
+                "comment": comment,
+                "extra_amount": extra_amount,
+                "merchant_id": merchant_id,
+                "point_code": point_code,
+                "month_key": mk
+            })
+    else:
+        db.execute(text("""
+            INSERT INTO point_submissions (
+                merchant_id, point_code, month_key, comment, extra_amount, receipt_path, status
+            )
+            VALUES (
+                :merchant_id, :point_code, :month_key, :comment, :extra_amount, :receipt_path, 'draft'
+            )
+        """), {
+            "merchant_id": merchant_id,
+            "point_code": point_code,
+            "month_key": mk,
+            "comment": comment,
+            "extra_amount": extra_amount,
+            "receipt_path": receipt_path
+        })
+
+    db.commit()
+
+
+def submit_submission(db: Session, merchant_id: int, point_code: str, y: int, m: int):
+    ensure_submissions_table(db)
+    mk = month_start(y, m)
+
+    db.execute(text("""
+        INSERT INTO point_submissions (
+            merchant_id, point_code, month_key, comment, extra_amount, receipt_path, status
+        )
+        VALUES (
+            :merchant_id, :point_code, :month_key, '', 0, NULL, 'submitted'
+        )
+        ON CONFLICT (merchant_id, point_code, month_key)
+        DO UPDATE SET
+            status = 'submitted',
+            updated_at = NOW()
+    """), {
+        "merchant_id": merchant_id,
+        "point_code": point_code,
+        "month_key": mk
+    })
+    db.commit()
+
+
+def reopen_submission(db: Session, merchant_id: int, point_code: str, y: int, m: int):
+    ensure_submissions_table(db)
+    mk = month_start(y, m)
+
+    db.execute(text("""
+        UPDATE point_submissions
+        SET status = 'draft',
+            updated_at = NOW()
+        WHERE merchant_id = :merchant_id
+          AND point_code = :point_code
+          AND month_key = :month_key
+    """), {
+        "merchant_id": merchant_id,
+        "point_code": point_code,
+        "month_key": mk
+    })
+    db.commit()
+
+
 def compute_point_total(db: Session, merchant_id: int, point_code: str, y: int, m: int):
     boxes_map = get_supply_boxes_map(db, point_code, y, m)
     visits = get_visits_for_month(db, merchant_id, point_code, y, m)
     rates = get_point_rates(db, point_code, y, m)
+    submission = get_submission(db, merchant_id, point_code, y, m)
 
     total = 0
     cnt_supply = 0
@@ -391,61 +543,56 @@ def compute_point_total(db: Session, merchant_id: int, point_code: str, y: int, 
         coffee_sum = rates["coffee_rate"] * cnt_day_total
         total += coffee_sum
 
+    extra_amount = 0
+    comment = ""
+    receipt_path = None
+    submission_status = "draft"
+
+    if submission:
+        extra_amount = int(submission.get("extra_amount") or 0)
+        comment = submission.get("comment") or ""
+        receipt_path = submission.get("receipt_path")
+        submission_status = submission.get("status") or "draft"
+        total += extra_amount
+
     return {
         "total": total,
-
         "cnt_supply": cnt_supply,
         "cnt_no_supply": cnt_no_supply,
         "cnt_day_total": cnt_day_total,
         "cnt_full_inv": cnt_full_inv,
-
         "sum_supply": sum_supply,
         "sum_no_supply": sum_no_supply,
         "sum_inventory": sum_inventory,
-
         "coffee_enabled": rates["coffee_enabled"],
         "coffee_rate": rates["coffee_rate"],
         "coffee_sum": coffee_sum,
         "coffee_cnt": coffee_cnt,
-
         "pay_lt5": rates["pay_lt5"],
         "rate_supply": rates["rate_supply"],
         "rate_no_supply": rates["rate_no_supply"],
         "rate_inventory": rates["rate_inventory"],
+        "extra_amount": extra_amount,
+        "comment": comment,
+        "receipt_path": receipt_path,
+        "submission_status": submission_status,
     }
-
-
-def get_points_for_month(db: Session, merchant_id: int, y: int, m: int) -> list[str]:
-    start = month_start(y, m)
-    end = month_end_exclusive(y, m)
-
-    rows = db.execute(text("""
-        SELECT DISTINCT point_code
-        FROM visits
-        WHERE merchant_id = :merchant_id
-          AND visit_date >= :start_date
-          AND visit_date < :end_date
-        ORDER BY point_code
-    """), {
-        "merchant_id": merchant_id,
-        "start_date": start,
-        "end_date": end
-    }).all()
-
-    return [r[0] for r in rows if r and r[0]]
 
 
 def compute_overall_total(db: Session, merchant_id: int, y: int, m: int):
     points = get_points_for_month(db, merchant_id, y, m)
     total = 0
-    per_point: dict[str, int] = {}
+    per_point = {}
+    per_point_details = {}
 
     for point_code in points:
         point_result = compute_point_total(db, merchant_id, point_code, y, m)
         per_point[point_code] = point_result["total"]
+        per_point_details[point_code] = point_result
         total += point_result["total"]
 
     return {
         "total": total,
-        "per_point": per_point
+        "per_point": per_point,
+        "per_point_details": per_point_details
     }
