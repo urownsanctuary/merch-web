@@ -1,3 +1,4 @@
+
 import os
 import uuid
 import hashlib
@@ -389,6 +390,36 @@ def base_css():
             color: var(--muted);
             font-size: 13px;
             margin-bottom: 8px;
+        }
+
+        .point-adjustment-card {
+            padding: 18px 18px 20px;
+        }
+
+        .point-adjustment-card .detail-title {
+            color: var(--text);
+            font-size: 22px;
+            font-weight: 800;
+            margin-bottom: 14px;
+            line-height: 1.2;
+        }
+
+        .point-adjustment-card label {
+            font-size: 18px;
+            font-weight: 800;
+            color: var(--text);
+            margin: 14px 0 8px;
+        }
+
+        .point-adjustment-card input[type="text"],
+        .point-adjustment-card input[type="number"],
+        .point-adjustment-card input[type="file"] {
+            font-size: 18px;
+        }
+
+        .point-adjustment-card .hint {
+            font-size: 15px;
+            line-height: 1.45;
         }
 
         .detail-line {
@@ -963,7 +994,7 @@ def calendar_page(
     point_form = ""
     if not monthly_submitted:
         point_form = f"""
-            <form method="post" action="/save-point-adjustment" enctype="multipart/form-data" class="detail-card" style="margin-top:18px;">
+            <form method="post" action="/save-point-adjustment" enctype="multipart/form-data" class="detail-card point-adjustment-card" style="margin-top:18px;">
                 <input type="hidden" name="fio" value="{escape(fio)}" />
                 <input type="hidden" name="point_code" value="{escape(point_code)}" />
 
@@ -1252,8 +1283,7 @@ def monthly_submit_page(
             </div>
 
             <div class="hint">
-                На этой странице больше нет полей примечания и возмещения за месяц.
-                Они заполняются отдельно внутри каждой точки.
+                Пожалуйста, убедитесь перед отправкой, что данные по всем точкам заполнены корректно.
             </div>
 
             {points_html}
