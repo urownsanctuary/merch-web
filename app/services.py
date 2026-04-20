@@ -727,15 +727,33 @@ def upsert_supply_row(db: Session, point_code: str, supply_date: date, boxes: in
     db.execute(text("DELETE FROM supplies WHERE point_code=:point_code AND supply_date=:supply_date"), {
         "point_code": point_code, "supply_date": supply_date
     })
-    db.execute(text("""
-        INSERT INTO supplies (point_code, supply_date, boxes, has_supply)
-        VALUES (:point_code, :supply_date, :boxes, :has_supply)
-    """), {
-        "point_code": point_code,
-        "supply_date": supply_date,
-        "boxes": boxes,
-        "has_supply": True,
-    })
+
+    columns = [row[0] for row in db.execute(text("""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'supplies'
+        ORDER BY ordinal_position
+    """)).fetchall()]
+
+    if 'has_supply' in columns:
+        db.execute(text("""
+            INSERT INTO supplies (point_code, supply_date, boxes, has_supply)
+            VALUES (:point_code, :supply_date, :boxes, :has_supply)
+        """), {
+            "point_code": point_code,
+            "supply_date": supply_date,
+            "boxes": boxes,
+            "has_supply": True
+        })
+    else:
+        db.execute(text("""
+            INSERT INTO supplies (point_code, supply_date, boxes)
+            VALUES (:point_code, :supply_date, :boxes)
+        """), {
+            "point_code": point_code,
+            "supply_date": supply_date,
+            "boxes": boxes
+        })
 
 
 def import_supplies_xlsx(db: Session, file_obj) -> dict:
@@ -746,35 +764,40 @@ def import_supplies_xlsx(db: Session, file_obj) -> dict:
     loaded_rows = 0
     loaded_points = set()
 
-    period = get_active_period()
-    year = period["year"]
-    month = period["month"]
+    active = get_active_period()
+    report_year = active["year"]
+    report_month = active["month"]
 
     for idx, value in enumerate(headers[1:], start=2):
-        supply_date = None
+        if value is None:
+            continue
 
         if isinstance(value, datetime):
-            supply_date = value.date()
-        elif isinstance(value, date):
-            supply_date = value
-        else:
-            raw = str(value or "").strip()
-            match = re.search(r"(\d{1,2})", raw)
-            if match:
-                day = int(match.group(1))
-                try:
-                    supply_date = date(year, month, day)
-                except ValueError:
-                    supply_date = None
+            date_columns.append((idx, value.date()))
+            continue
+        if isinstance(value, date):
+            date_columns.append((idx, value))
+            continue
 
-        if supply_date:
-            date_columns.append((idx, supply_date))
+        raw = str(value).strip()
+        m = re.match(r"^(\d{1,2})", raw)
+        if not m:
+            continue
+
+        day_num = int(m.group(1))
+        try:
+            supply_date = date(report_year, report_month, day_num)
+        except ValueError:
+            continue
+
+        date_columns.append((idx, supply_date))
 
     for row_idx in range(2, ws.max_row + 1):
         point_code = normalize_point_code(ws.cell(row=row_idx, column=1).value)
         if not point_code:
             continue
         loaded_points.add(point_code)
+
         for col_idx, supply_date in date_columns:
             raw_boxes = ws.cell(row=row_idx, column=col_idx).value
             if raw_boxes in (None, ""):
@@ -783,6 +806,7 @@ def import_supplies_xlsx(db: Session, file_obj) -> dict:
                 boxes = int(float(raw_boxes))
             except Exception:
                 continue
+
             upsert_supply_row(db, point_code, supply_date, boxes)
             loaded_rows += 1
 
