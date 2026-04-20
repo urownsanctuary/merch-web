@@ -1,4 +1,3 @@
-
 import os
 import uuid
 import hashlib
@@ -640,7 +639,7 @@ def login_api(fio: str, last4: str, db: Session = Depends(get_db)):
     user = login_user(db, fio, last4)
 
     if not user:
-        raise HTTPException(status_code=401, detail="ÐÐµÐ²ÐµÑÐ½ÑÐµ Ð´Ð°Ð½Ð½ÑÐµ")
+        raise HTTPException(status_code=401, detail="Неверные данные")
 
     return {"status": "ok", "active_period": get_active_period(), "user": user}
 
@@ -654,29 +653,29 @@ def login_page():
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ÐÐºÑÑÐÐ¸Ð»Ð»</title>
+    <title>ВкусВилл</title>
     {base_css()}
 </head>
 <body>
     <div class="page">
         <div class="card">
-            <div class="brand">ÐÐºÑÑÐÐ¸Ð»Ð»</div>
-            <h1>Ð¡Ð²ÐµÑÐºÐ¸ Ð¼ÐµÑÑÐµÐ½Ð´Ð°Ð¹Ð·ÐµÑÐ¾Ð²</h1>
-            <div class="subtitle">ÐÐ²ÐµÐ´Ð¸ÑÐµ Ð¤ÐÐ Ð¸ Ð¿Ð¾ÑÐ»ÐµÐ´Ð½Ð¸Ðµ 4 ÑÐ¸ÑÑÑ ÑÐµÐ»ÐµÑÐ¾Ð½Ð°</div>
+            <div class="brand">ВкусВилл</div>
+            <h1>Сверки мерчендайзеров</h1>
+            <div class="subtitle">Введите ФИО и последние 4 цифры телефона</div>
 
             <form method="post" action="/login-page">
-                <label for="fio">Ð¤ÐÐ</label>
-                <input id="fio" name="fio" type="text" placeholder="ÐÐ²Ð°Ð½Ð¾Ð² ÐÐ²Ð°Ð½ ÐÐ²Ð°Ð½Ð¾Ð²Ð¸Ñ" required />
+                <label for="fio">ФИО</label>
+                <input id="fio" name="fio" type="text" placeholder="Иванов Иван Иванович" required />
 
-                <label for="last4">ÐÐ¾ÑÐ»ÐµÐ´Ð½Ð¸Ðµ 4 ÑÐ¸ÑÑÑ ÑÐµÐ»ÐµÑÐ¾Ð½Ð°</label>
+                <label for="last4">Последние 4 цифры телефона</label>
                 <input id="last4" name="last4" type="text" inputmode="numeric" maxlength="4" placeholder="1234" required />
 
-                <button class="btn" type="submit">ÐÐ¾Ð¹ÑÐ¸</button>
+                <button class="btn" type="submit">Войти</button>
             </form>
 
-            <div class="hint">Ð¡ÐµÐ¹ÑÐ°Ñ Ð¾ÑÐºÑÑÑ Ð¿ÐµÑÐ¸Ð¾Ð´ Ð·Ð° {month_title(period["year"], period["month"])}.</div>
+            <div class="hint">Сейчас открыт период за {month_title(period["year"], period["month"])}.</div>
 
-            <div class="footer">ÐÐµÐ±-Ð²ÐµÑÑÐ¸Ñ ÑÐ²ÐµÑÐ¾Ðº Ð¼ÐµÑÑÐµÐ½Ð´Ð°Ð¹Ð·ÐµÑÐ¾Ð²</div>
+            <div class="footer">Веб-версия сверок мерчендайзеров</div>
         </div>
     </div>
 </body>
@@ -699,15 +698,15 @@ def login_submit(
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ÐÑÐ¸Ð±ÐºÐ° Ð²ÑÐ¾Ð´Ð°</title>
+    <title>Ошибка входа</title>
     {base_css()}
 </head>
 <body>
     <div class="page">
         <div class="card">
-            <h1>ÐÑÐ¸Ð±ÐºÐ° Ð²ÑÐ¾Ð´Ð°</h1>
-            <div class="error-box">ÐÐµÐ²ÐµÑÐ½ÑÐµ Ð´Ð°Ð½Ð½ÑÐµ. ÐÑÐ¾Ð²ÐµÑÑÑÐµ Ð¤ÐÐ Ð¸ Ð¿Ð¾ÑÐ»ÐµÐ´Ð½Ð¸Ðµ 4 ÑÐ¸ÑÑÑ ÑÐµÐ»ÐµÑÐ¾Ð½Ð°.</div>
-            <a class="back" href="/login-page">â ÐÐ¾Ð¿ÑÐ¾Ð±Ð¾Ð²Ð°ÑÑ ÑÐ½Ð¾Ð²Ð°</a>
+            <h1>Ошибка входа</h1>
+            <div class="error-box">Неверные данные. Проверьте ФИО и последние 4 цифры телефона.</div>
+            <a class="back" href="/login-page">← Попробовать снова</a>
         </div>
     </div>
 </body>
@@ -731,25 +730,25 @@ def menu_page(fio: str = "", db: Session = Depends(get_db)):
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ÐÐ»Ð°Ð²Ð½Ð¾Ðµ Ð¼ÐµÐ½Ñ</title>
+    <title>Главное меню</title>
     {base_css()}
 </head>
 <body>
     <div class="page">
         <div class="card">
-            <div class="brand">ÐÐºÑÑÐÐ¸Ð»Ð»</div>
-            <h1>ÐÐ»Ð°Ð²Ð½Ð¾Ðµ Ð¼ÐµÐ½Ñ</h1>
+            <div class="brand">ВкусВилл</div>
+            <h1>Главное меню</h1>
             <div class="subtitle">{escape(fio)}</div>
-            <div class="hint">Ð¡ÐµÐ¹ÑÐ°Ñ Ð¾ÑÐºÑÑÑ Ð¿ÐµÑÐ¸Ð¾Ð´ Ð·Ð° {month_title(period["year"], period["month"])}.</div>
+            <div class="hint">Сейчас открыт период за {month_title(period["year"], period["month"])}.</div>
 
             <div class="sum-card" style="margin-top: 18px;">
-                <div class="sum-title">ÐÐ±ÑÐ°Ñ ÑÑÐ¼Ð¼Ð° Ð·Ð° Ð¼ÐµÑÑÑ</div>
-                <div class="sum-value">{overall["total"]} â½</div>
+                <div class="sum-title">Общая сумма за месяц</div>
+                <div class="sum-value">{overall["total"]} ₽</div>
             </div>
 
-            <a class="btn" href="/point-page?fio={escape(fio)}">ÐÐ°Ð¿Ð¾Ð»Ð½Ð¸ÑÑ ÑÐ²ÐµÑÐºÑ</a>
-            <a class="btn btn-secondary" href="/summary-page?fio={escape(fio)}">ÐÐ¾Ñ ÑÑÐ¼Ð¼Ð°</a>
-            <a class="btn btn-secondary" href="/monthly-submit-page?fio={escape(fio)}">ÐÑÐ¿ÑÐ°Ð²Ð¸ÑÑ ÑÐ²ÐµÑÐºÑ Ð·Ð° Ð¼ÐµÑÑÑ</a>
+            <a class="btn" href="/point-page?fio={escape(fio)}">Заполнить сверку</a>
+            <a class="btn btn-secondary" href="/summary-page?fio={escape(fio)}">Моя сумма</a>
+            <a class="btn btn-secondary" href="/monthly-submit-page?fio={escape(fio)}">Отправить сверку за месяц</a>
         </div>
     </div>
 </body>
@@ -767,30 +766,30 @@ def point_page(fio: str = ""):
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ÐÑÐ±Ð¾Ñ ÑÐ¾ÑÐºÐ¸</title>
+    <title>Выбор точки</title>
     {base_css()}
 </head>
 <body>
     <div class="page">
         <div class="card">
-            <div class="brand">ÐÐºÑÑÐÐ¸Ð»Ð»</div>
-            <h1>ÐÑÐ±Ð¾Ñ ÑÐ¾ÑÐºÐ¸</h1>
+            <div class="brand">ВкусВилл</div>
+            <h1>Выбор точки</h1>
             <div class="subtitle">{escape(fio)}</div>
 
             <div class="hint" style="margin-top: 0; margin-bottom: 18px;">
-                Ð¡Ð²ÐµÑÐºÐ° Ð·Ð°Ð¿Ð¾Ð»Ð½ÑÐµÑÑÑ Ð·Ð° {month_title(period["year"], period["month"])}.
+                Сверка заполняется за {month_title(period["year"], period["month"])}.
             </div>
 
             <form method="post" action="/point-page">
                 <input type="hidden" name="fio" value="{escape(fio)}" />
 
-                <label for="point_code">ÐÐ¾Ð¼ÐµÑ ÑÐ¾ÑÐºÐ¸</label>
+                <label for="point_code">Номер точки</label>
                 <input id="point_code" name="point_code" type="text" placeholder="2674" required />
 
-                <button class="btn" type="submit">ÐÑÐ¾Ð´Ð¾Ð»Ð¶Ð¸ÑÑ</button>
+                <button class="btn" type="submit">Продолжить</button>
             </form>
 
-            <a class="back" href="/menu-page?fio={escape(fio)}">â ÐÐ°Ð·Ð°Ð´</a>
+            <a class="back" href="/menu-page?fio={escape(fio)}">← Назад</a>
         </div>
     </div>
 </body>
@@ -814,15 +813,15 @@ def point_submit(
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ÐÑÐ¸Ð±ÐºÐ°</title>
+    <title>Ошибка</title>
     {base_css()}
 </head>
 <body>
     <div class="page">
         <div class="card">
-            <h1>ÐÑÐ¸Ð±ÐºÐ°</h1>
-            <div class="error-box">ÐÐ¾Ð¼ÐµÑ ÑÐ¾ÑÐºÐ¸ ÑÐ»Ð¸ÑÐºÐ¾Ð¼ ÐºÐ¾ÑÐ¾ÑÐºÐ¸Ð¹.</div>
-            <a class="back" href="/point-page?fio={escape(fio)}">â ÐÐ°Ð·Ð°Ð´</a>
+            <h1>Ошибка</h1>
+            <div class="error-box">Номер точки слишком короткий.</div>
+            <a class="back" href="/point-page?fio={escape(fio)}">← Назад</a>
         </div>
     </div>
 </body>
@@ -838,19 +837,19 @@ def point_submit(
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Ð¢Ð¾ÑÐºÐ° Ð½Ðµ Ð½Ð°Ð¹Ð´ÐµÐ½Ð°</title>
+    <title>Точка не найдена</title>
     {base_css()}
 </head>
 <body>
     <div class="page">
         <div class="card">
-            <h1>Ð¢Ð¾ÑÐºÐ° Ð½Ðµ Ð½Ð°Ð¹Ð´ÐµÐ½Ð°</h1>
+            <h1>Точка не найдена</h1>
             <div class="error-box">
-                Ð Ð¿ÐµÑÐ¸Ð¾Ð´Ðµ {month_title(period["year"], period["month"])} Ð¿Ð¾ ÑÐ¾ÑÐºÐµ {escape(point_code)} Ð½ÐµÑ Ð¿Ð¾ÑÑÐ°Ð²Ð¾Ðº.
+                В периоде {month_title(period["year"], period["month"])} по точке {escape(point_code)} нет поставок.
                 <br><br>
-                ÐÑÐ¾Ð²ÐµÑÑÑÐµ Ð½Ð¾Ð¼ÐµÑ ÑÐ¾ÑÐºÐ¸ Ð¸Ð»Ð¸ Ð¾Ð±ÑÐ°ÑÐ¸ÑÐµÑÑ Ðº ÑÐ¿ÑÐ°Ð²Ð»ÑÑÑÐµÐ¼Ñ.
+                Проверьте номер точки или обратитесь к управляющему.
             </div>
-            <a class="back" href="/point-page?fio={escape(fio)}">â ÐÐ¾Ð¿ÑÐ¾Ð±Ð¾Ð²Ð°ÑÑ ÑÐ½Ð¾Ð²Ð°</a>
+            <a class="back" href="/point-page?fio={escape(fio)}">← Попробовать снова</a>
         </div>
     </div>
 </body>
@@ -880,7 +879,7 @@ def build_calendar_html(
 ) -> str:
     dim = days_in_month(y, m)
     first_wd = weekday_of(y, m, 1)
-    weekdays = ["ÐÐ½", "ÐÑ", "Ð¡Ñ", "Ð§Ñ", "ÐÑ", "Ð¡Ð±", "ÐÑ"]
+    weekdays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
     html = '<div class="weekdays">'
     for wd in weekdays:
@@ -898,11 +897,11 @@ def build_calendar_html(
 
         badges = ""
         if boxes > 0:
-            badges += '<span class="badge badge-supply">Ð</span>'
+            badges += '<span class="badge badge-supply">П</span>'
         if "DAY" in day_visits:
-            badges += '<span class="badge badge-day">Ð</span>'
+            badges += '<span class="badge badge-day">В</span>'
         if "FULL_INVENT" in day_visits:
-            badges += '<span class="badge badge-inv">Ð</span>'
+            badges += '<span class="badge badge-inv">И</span>'
 
         href = build_day_href(fio, point_code, y, m, day, is_submitted)
         cls = "day day-disabled" if is_submitted else "day"
@@ -955,11 +954,11 @@ def calendar_page(
 
     info_box = ""
     if saved == "1":
-        info_box = "<div class=\"success-box\">ÐÐ°Ð½Ð½ÑÐµ Ð¿Ð¾ ÑÐ¾ÑÐºÐµ ÑÐ¾ÑÑÐ°Ð½ÐµÐ½Ñ.</div>"
+        info_box = "<div class=\"success-box\">Данные по точке сохранены.</div>"
 
     point_receipt_link = ""
     if point_total["reimb_receipt"]:
-        point_receipt_link = f"<div class='hint' style='margin-top:10px'>Ð§ÐµÐº Ð¿Ð¾ ÑÐ¾ÑÐºÐµ: <a href='/{point_total['reimb_receipt']}' target='_blank'>Ð¾ÑÐºÑÑÑÑ ÑÐ°Ð¹Ð»</a></div>"
+        point_receipt_link = f"<div class='hint' style='margin-top:10px'>Чек по точке: <a href='/{point_total['reimb_receipt']}' target='_blank'>открыть файл</a></div>"
 
     point_form = ""
     if not monthly_submitted:
@@ -968,26 +967,26 @@ def calendar_page(
                 <input type="hidden" name="fio" value="{escape(fio)}" />
                 <input type="hidden" name="point_code" value="{escape(point_code)}" />
 
-                <div class="detail-title">ÐÑÐ¸Ð¼ÐµÑÐ°Ð½Ð¸Ðµ Ð¿Ð¾ ÑÐ¾ÑÐºÐµ</div>
-                <label for="note_amount">Ð¡ÑÐ¼Ð¼Ð°, â½</label>
-                <input id="note_amount" name="note_amount" type="number" min="0" value="{point_total['note_amount']}" placeholder="ÐÐ°Ð¿ÑÐ¸Ð¼ÐµÑ: 1500" />
+                <div class="detail-title">Примечание по точке</div>
+                <label for="note_amount">Сумма, ₽</label>
+                <input id="note_amount" name="note_amount" type="number" min="0" value="{point_total['note_amount']}" placeholder="Например: 1500" />
 
-                <label for="note_comment">ÐÐ¾Ð¼Ð¼ÐµÐ½ÑÐ°ÑÐ¸Ð¹</label>
-                <input id="note_comment" name="note_comment" type="text" value="{escape(point_total['note_comment'])}" placeholder="ÐÐ°Ð¿ÑÐ¸Ð¼ÐµÑ: ÐÐ°ÐºÑÑÑÐ¸Ðµ ÑÐ¾ÑÐºÐ¸" />
+                <label for="note_comment">Комментарий</label>
+                <input id="note_comment" name="note_comment" type="text" value="{escape(point_total['note_comment'])}" placeholder="Например: Закрытие точки" />
 
-                <div class="detail-title" style="margin-top:18px;">ÐÐ¾Ð·Ð¼ÐµÑÐµÐ½Ð¸Ðµ Ð¿Ð¾ ÑÐ¾ÑÐºÐµ</div>
-                <label for="reimb_amount">Ð¡ÑÐ¼Ð¼Ð°, â½</label>
-                <input id="reimb_amount" name="reimb_amount" type="number" min="0" value="{point_total['reimb_amount']}" placeholder="ÐÐ°Ð¿ÑÐ¸Ð¼ÐµÑ: 150" />
+                <div class="detail-title" style="margin-top:18px;">Возмещение по точке</div>
+                <label for="reimb_amount">Сумма, ₽</label>
+                <input id="reimb_amount" name="reimb_amount" type="number" min="0" value="{point_total['reimb_amount']}" placeholder="Например: 150" />
 
-                <label for="reimb_comment">ÐÐ¾Ð¼Ð¼ÐµÐ½ÑÐ°ÑÐ¸Ð¹</label>
-                <input id="reimb_comment" name="reimb_comment" type="text" value="{escape(point_total['reimb_comment'])}" placeholder="ÐÐ°Ð¿ÑÐ¸Ð¼ÐµÑ: ÐÐ¾ÐºÑÐ¿ÐºÐ° Ð¿Ð°ÐºÐµÑÐ¾Ð²" />
+                <label for="reimb_comment">Комментарий</label>
+                <input id="reimb_comment" name="reimb_comment" type="text" value="{escape(point_total['reimb_comment'])}" placeholder="Например: Покупка пакетов" />
 
-                <label for="reimb_receipt">Ð§ÐµÐº</label>
+                <label for="reimb_receipt">Чек</label>
                 <input id="reimb_receipt" name="reimb_receipt" type="file" accept=".jpg,.jpeg,.png,.pdf,.webp" />
-                <div class="hint" style="margin-top:10px;">ÐÑÐ»Ð¸ ÑÐºÐ°Ð·Ð°Ð½Ð¾ Ð²Ð¾Ð·Ð¼ÐµÑÐµÐ½Ð¸Ðµ, ÑÐµÐº Ð¾Ð±ÑÐ·Ð°ÑÐµÐ»ÐµÐ½.</div>
+                <div class="hint" style="margin-top:10px;">Если указано возмещение, чек обязателен.</div>
                 {point_receipt_link}
 
-                <button class="btn btn-secondary" type="submit">Ð¡Ð¾ÑÑÐ°Ð½Ð¸ÑÑ Ð´Ð°Ð½Ð½ÑÐµ Ð¿Ð¾ ÑÐ¾ÑÐºÐµ</button>
+                <button class="btn btn-secondary" type="submit">Сохранить данные по точке</button>
             </form>
         """
 
@@ -997,7 +996,7 @@ def calendar_page(
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ÐÐ°Ð»ÐµÐ½Ð´Ð°ÑÑ</title>
+    <title>Календарь</title>
     {base_css()}
     <script>
     document.addEventListener('DOMContentLoaded', function() {{
@@ -1019,15 +1018,15 @@ def calendar_page(
         <div class="card-wide">
             <div class="calendar-head">
                 <div>
-                    <div class="brand">ÐÐºÑÑÐÐ¸Ð»Ð»</div>
+                    <div class="brand">ВкусВилл</div>
                     <div class="calendar-month">{month_title(y, m)}</div>
                 </div>
 
                 <div class="calendar-meta">
-                    <div class="mini-pill">Ð¢Ð¾ÑÐºÐ°: {escape(point_code)}</div>
+                    <div class="mini-pill">Точка: {escape(point_code)}</div>
                     <div class="mini-pill">{escape(fio)}</div>
-                    <div class="mini-pill">ÐÐ: {"ÐÐ°" if point_total["coffee_enabled"] else "ÐÐµÑ"}</div>
-                    <div class="mini-pill">ÐÐµÑÑÑÐ½Ð°Ñ ÑÐ²ÐµÑÐºÐ°: {"ÐÑÐ¿ÑÐ°Ð²Ð»ÐµÐ½Ð°" if monthly_submitted else "Ð§ÐµÑÐ½Ð¾Ð²Ð¸Ðº"}</div>
+                    <div class="mini-pill">КМ: {"Да" if point_total["coffee_enabled"] else "Нет"}</div>
+                    <div class="mini-pill">Месячная сверка: {"Отправлена" if monthly_submitted else "Черновик"}</div>
                 </div>
             </div>
 
@@ -1035,49 +1034,49 @@ def calendar_page(
 
             <div class="sum-strip">
                 <div class="sum-card">
-                    <div class="sum-title">Ð¡ÑÐ¼Ð¼Ð° Ð¿Ð¾ ÑÐ¾ÑÐºÐµ</div>
-                    <div class="sum-value">{point_total["total"]} â½</div>
+                    <div class="sum-title">Сумма по точке</div>
+                    <div class="sum-value">{point_total["total"]} ₽</div>
                 </div>
 
                 <div class="sum-card">
-                    <div class="sum-title">ÐÐ±ÑÐ°Ñ ÑÑÐ¼Ð¼Ð° Ð·Ð° Ð¼ÐµÑÑÑ</div>
-                    <div class="sum-value">{overall["total"]} â½</div>
+                    <div class="sum-title">Общая сумма за месяц</div>
+                    <div class="sum-value">{overall["total"]} ₽</div>
                 </div>
             </div>
 
             <div class="details-grid">
                 <div class="detail-card">
-                    <div class="detail-title">ÐÑÑÐ¾Ð´Ñ Ñ Ð¿Ð¾ÑÑÐ°Ð²ÐºÐ¾Ð¹</div>
-                    <div class="detail-line">{point_total["cnt_supply"]} Ã {point_total["rate_supply"]} â½ = {point_total["sum_supply"]} â½</div>
+                    <div class="detail-title">Выходы с поставкой</div>
+                    <div class="detail-line">{point_total["cnt_supply"]} × {point_total["rate_supply"]} ₽ = {point_total["sum_supply"]} ₽</div>
                 </div>
 
                 <div class="detail-card">
-                    <div class="detail-title">ÐÑÑÐ¾Ð´Ñ Ð±ÐµÐ· Ð¿Ð¾ÑÑÐ°Ð²ÐºÐ¸</div>
-                    <div class="detail-line">{point_total["cnt_no_supply"]} Ã {point_total["rate_no_supply"]} â½ = {point_total["sum_no_supply"]} â½</div>
+                    <div class="detail-title">Выходы без поставки</div>
+                    <div class="detail-line">{point_total["cnt_no_supply"]} × {point_total["rate_no_supply"]} ₽ = {point_total["sum_no_supply"]} ₽</div>
                 </div>
 
                 <div class="detail-card">
-                    <div class="detail-title">ÐÐ¾Ð»Ð½ÑÐµ Ð¸Ð½Ð²ÐµÐ½ÑÑ</div>
-                    <div class="detail-line">{point_total["cnt_full_inv"]} Ã {point_total["rate_inventory"]} â½ = {point_total["sum_inventory"]} â½</div>
+                    <div class="detail-title">Полные инвенты</div>
+                    <div class="detail-line">{point_total["cnt_full_inv"]} × {point_total["rate_inventory"]} ₽ = {point_total["sum_inventory"]} ₽</div>
                 </div>
 
                 <div class="detail-card">
-                    <div class="detail-title">ÐÐ¾ÑÐµÐ¼Ð°ÑÐ¸Ð½Ð°</div>
-                    <div class="detail-line">{point_total["coffee_cnt"]} Ã {point_total["coffee_rate"]} â½ = {point_total["coffee_sum"]} â½</div>
+                    <div class="detail-title">Кофемашина</div>
+                    <div class="detail-line">{point_total["coffee_cnt"]} × {point_total["coffee_rate"]} ₽ = {point_total["coffee_sum"]} ₽</div>
                 </div>
             </div>
 
             <div class="details-grid">
                 <div class="detail-card">
-                    <div class="detail-title">ÐÑÐ¸Ð¼ÐµÑÐ°Ð½Ð¸Ðµ Ð¿Ð¾ ÑÐ¾ÑÐºÐµ</div>
-                    <div class="detail-line">{point_total["note_amount"]} â½</div>
-                    <div class="calendar-note">{escape(point_total["note_comment"]) if point_total["note_comment"] else "â"}</div>
+                    <div class="detail-title">Примечание по точке</div>
+                    <div class="detail-line">{point_total["note_amount"]} ₽</div>
+                    <div class="calendar-note">{escape(point_total["note_comment"]) if point_total["note_comment"] else "—"}</div>
                 </div>
 
                 <div class="detail-card">
-                    <div class="detail-title">ÐÐ¾Ð·Ð¼ÐµÑÐµÐ½Ð¸Ðµ Ð¿Ð¾ ÑÐ¾ÑÐºÐµ</div>
-                    <div class="detail-line">{point_total["reimb_amount"]} â½</div>
-                    <div class="calendar-note">{escape(point_total["reimb_comment"]) if point_total["reimb_comment"] else "â"}</div>
+                    <div class="detail-title">Возмещение по точке</div>
+                    <div class="detail-line">{point_total["reimb_amount"]} ₽</div>
+                    <div class="calendar-note">{escape(point_total["reimb_comment"]) if point_total["reimb_comment"] else "—"}</div>
                 </div>
             </div>
 
@@ -1086,29 +1085,29 @@ def calendar_page(
             </div>
 
             <div class="legend">
-                <div class="legend-item">Ð â Ð±ÑÐ»Ð° Ð¿Ð¾ÑÑÐ°Ð²ÐºÐ°</div>
-                <div class="legend-item">Ð â Ð¾ÑÐ¼ÐµÑÐµÐ½ Ð²ÑÑÐ¾Ð´</div>
-                <div class="legend-item">Ð â Ð¿Ð¾Ð»Ð½ÑÐ¹ Ð¸Ð½Ð²ÐµÐ½Ñ</div>
+                <div class="legend-item">П — была поставка</div>
+                <div class="legend-item">В — отмечен выход</div>
+                <div class="legend-item">И — полный инвент</div>
             </div>
 
             <div class="calendar-note">
-                Ð Ð¾Ð±ÑÑÐ½ÑÐµ Ð´Ð½Ð¸ Ð½Ð°Ð¶Ð°ÑÐ¸Ðµ Ð¿Ð¾ Ð´Ð½Ñ ÑÑÐ°Ð·Ñ ÑÑÐ°Ð²Ð¸Ñ Ð¸Ð»Ð¸ ÑÐ±Ð¸ÑÐ°ÐµÑ Ð²ÑÑÐ¾Ð´.
-                Ð Ð¿ÑÑÐ½Ð¸ÑÑ Ð¸ ÑÑÐ±Ð±Ð¾ÑÑ Ð¾ÑÐºÑÑÐ²Ð°ÐµÑÑÑ Ð²ÑÐ±Ð¾Ñ: Ð²ÑÑÐ¾Ð´ Ð¸Ð»Ð¸ Ð¿Ð¾Ð»Ð½ÑÐ¹ Ð¸Ð½Ð²ÐµÐ½Ñ.
+                В обычные дни нажатие по дню сразу ставит или убирает выход.
+                В пятницу и субботу открывается выбор: выход или полный инвент.
             </div>
 
             <div class="calendar-note">
-                ÐÐ¾ÑÑÐ°Ð²ÐºÐ¸ Ð´Ð¾ 5 ÐºÐ¾ÑÐ¾Ð±Ð¾Ðº Ð½Ðµ Ð¾Ð¿Ð»Ð°ÑÐ¸Ð²Ð°ÑÑÑÑ.
+                Поставки до 5 коробок не оплачиваются.
             </div>
 
             {point_form}
 
             <div class="admin-export-buttons" style="margin-top:18px;">
-                <a class="btn btn-secondary btn-inline" href="/point-page?fio={escape(fio)}">Ð¡Ð»ÐµÐ´ÑÑÑÐ°Ñ ÑÐ¾ÑÐºÐ°</a>
-                <a class="btn btn-secondary btn-inline" href="/summary-page?fio={escape(fio)}">ÐÐ¾Ñ ÑÑÐ¼Ð¼Ð°</a>
-                <a class="btn btn-secondary btn-inline" href="/monthly-submit-page?fio={escape(fio)}">ÐÑÐ¿ÑÐ°Ð²Ð¸ÑÑ ÑÐ²ÐµÑÐºÑ Ð·Ð° Ð¼ÐµÑÑÑ</a>
+                <a class="btn btn-secondary btn-inline" href="/point-page?fio={escape(fio)}">Следующая точка</a>
+                <a class="btn btn-secondary btn-inline" href="/summary-page?fio={escape(fio)}">Моя сумма</a>
+                <a class="btn btn-secondary btn-inline" href="/monthly-submit-page?fio={escape(fio)}">Отправить сверку за месяц</a>
             </div>
 
-            <a class="back" href="/menu-page?fio={escape(fio)}">â ÐÐ° Ð³Ð»Ð°Ð²Ð½ÑÐ¹ ÑÐºÑÐ°Ð½</a>
+            <a class="back" href="/menu-page?fio={escape(fio)}">← На главный экран</a>
         </div>
     </div>
 </body>
@@ -1181,44 +1180,44 @@ def monthly_submit_page(
 
     info_box = ""
     if submitted == "1":
-        info_box += "<div class='success-box'>ÐÐµÑÑÑÐ½Ð°Ñ ÑÐ²ÐµÑÐºÐ° Ð¾ÑÐ¿ÑÐ°Ð²Ð»ÐµÐ½Ð°.</div>"
+        info_box += "<div class='success-box'>Месячная сверка отправлена.</div>"
     if reopened == "1":
-        info_box += "<div class='success-box'>ÐÐµÑÑÑÐ½Ð°Ñ ÑÐ²ÐµÑÐºÐ° ÑÐ°Ð·Ð±Ð»Ð¾ÐºÐ¸ÑÐ¾Ð²Ð°Ð½Ð° Ð´Ð»Ñ ÑÐµÐ´Ð°ÐºÑÐ¸ÑÐ¾Ð²Ð°Ð½Ð¸Ñ.</div>"
+        info_box += "<div class='success-box'>Месячная сверка разблокирована для редактирования.</div>"
 
     points_html = ""
     if overall["per_point_details"]:
         for point_code, d in overall["per_point_details"].items():
             points_html += f"""
             <details class="point-detail">
-                <summary>{escape(point_code)} â {d["total"]} â½</summary>
+                <summary>{escape(point_code)} — {d["total"]} ₽</summary>
                 <div class="summary-content">
-                    <div>Ð¡ Ð¿Ð¾ÑÑÐ°Ð²ÐºÐ¾Ð¹: {d["cnt_supply"]} Ã {d["rate_supply"]} â½ = {d["sum_supply"]} â½</div>
-                    <div>ÐÐµÐ· Ð¿Ð¾ÑÑÐ°Ð²ÐºÐ¸: {d["cnt_no_supply"]} Ã {d["rate_no_supply"]} â½ = {d["sum_no_supply"]} â½</div>
-                    <div>ÐÐ¾Ð»Ð½ÑÐ¹ Ð¸Ð½Ð²ÐµÐ½Ñ: {d["cnt_full_inv"]} Ã {d["rate_inventory"]} â½ = {d["sum_inventory"]} â½</div>
-                    <div>ÐÐ¾ÑÐµÐ¼Ð°ÑÐ¸Ð½Ð°: {d["coffee_cnt"]} Ã {d["coffee_rate"]} â½ = {d["coffee_sum"]} â½</div>
-                    <div>ÐÑÐ¸Ð¼ÐµÑÐ°Ð½Ð¸Ðµ Ð¿Ð¾ ÑÐ¾ÑÐºÐµ: {d["note_amount"]} â½ â {escape(d["note_comment"]) if d["note_comment"] else "â"}</div>
-                    <div>ÐÐ¾Ð·Ð¼ÐµÑÐµÐ½Ð¸Ðµ Ð¿Ð¾ ÑÐ¾ÑÐºÐµ: {d["reimb_amount"]} â½ â {escape(d["reimb_comment"]) if d["reimb_comment"] else "â"}</div>
-                    <div>Ð§ÐµÐº Ð¿Ð¾ Ð²Ð¾Ð·Ð¼ÐµÑÐµÐ½Ð¸Ñ: {f"<a href='/{d['reimb_receipt']}' target='_blank'>Ð¾ÑÐºÑÑÑÑ</a>" if d["reimb_receipt"] else "â"}</div>
+                    <div>С поставкой: {d["cnt_supply"]} × {d["rate_supply"]} ₽ = {d["sum_supply"]} ₽</div>
+                    <div>Без поставки: {d["cnt_no_supply"]} × {d["rate_no_supply"]} ₽ = {d["sum_no_supply"]} ₽</div>
+                    <div>Полный инвент: {d["cnt_full_inv"]} × {d["rate_inventory"]} ₽ = {d["sum_inventory"]} ₽</div>
+                    <div>Кофемашина: {d["coffee_cnt"]} × {d["coffee_rate"]} ₽ = {d["coffee_sum"]} ₽</div>
+                    <div>Примечание по точке: {d["note_amount"]} ₽ — {escape(d["note_comment"]) if d["note_comment"] else "—"}</div>
+                    <div>Возмещение по точке: {d["reimb_amount"]} ₽ — {escape(d["reimb_comment"]) if d["reimb_comment"] else "—"}</div>
+                    <div>Чек по возмещению: {f"<a href='/{d['reimb_receipt']}' target='_blank'>открыть</a>" if d["reimb_receipt"] else "—"}</div>
                 </div>
             </details>
             """
     else:
-        points_html = "<div class='hint'>Ð ÑÑÐ¾Ð¼ Ð¼ÐµÑÑÑÐµ Ð¿Ð¾ÐºÐ° Ð½ÐµÑ Ð¾ÑÐ¼ÐµÑÐµÐ½Ð½ÑÑ ÑÐ¾ÑÐµÐº.</div>"
+        points_html = "<div class='hint'>В этом месяце пока нет отмеченных точек.</div>"
 
     action_block = ""
     if monthly_submitted:
         action_block = f"""
         <div class="detail-card" style="margin-top:18px;">
-            <div class="detail-title">Ð¡ÑÐ°ÑÑÑ</div>
-            <div class="detail-line">Ð¡Ð²ÐµÑÐºÐ° Ð·Ð° Ð¼ÐµÑÑÑ Ð¾ÑÐ¿ÑÐ°Ð²Ð»ÐµÐ½Ð°</div>
-            <a class="btn btn-secondary" href="/reopen-monthly-submission?fio={escape(fio)}">Ð ÐµÐ´Ð°ÐºÑÐ¸ÑÐ¾Ð²Ð°ÑÑ ÑÐ²ÐµÑÐºÑ</a>
+            <div class="detail-title">Статус</div>
+            <div class="detail-line">Сверка за месяц отправлена</div>
+            <a class="btn btn-secondary" href="/reopen-monthly-submission?fio={escape(fio)}">Редактировать сверку</a>
         </div>
         """
     else:
         action_block = f"""
         <form method="post" action="/submit-monthly-submission">
             <input type="hidden" name="fio" value="{escape(fio)}" />
-            <button class="btn" type="submit">ÐÑÐ¿ÑÐ°Ð²Ð¸ÑÑ ÑÐ²ÐµÑÐºÑ Ð·Ð° Ð¼ÐµÑÑÑ</button>
+            <button class="btn" type="submit">Отправить сверку за месяц</button>
         </form>
         """
 
@@ -1228,33 +1227,33 @@ def monthly_submit_page(
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ÐÑÐ¿ÑÐ°Ð²ÐºÐ° Ð¼ÐµÑÑÑÐ½Ð¾Ð¹ ÑÐ²ÐµÑÐºÐ¸</title>
+    <title>Отправка месячной сверки</title>
     {base_css()}
 </head>
 <body>
     <div class="page">
         <div class="card-wide">
-            <div class="brand">ÐÐºÑÑÐÐ¸Ð»Ð»</div>
-            <h1>ÐÑÐ¿ÑÐ°Ð²Ð¸ÑÑ ÑÐ²ÐµÑÐºÑ Ð·Ð° Ð¼ÐµÑÑÑ</h1>
-            <div class="subtitle">{escape(fio)} Â· {month_title(y, m)}</div>
+            <div class="brand">ВкусВилл</div>
+            <h1>Отправить сверку за месяц</h1>
+            <div class="subtitle">{escape(fio)} · {month_title(y, m)}</div>
 
             {info_box}
 
             <div class="sum-strip">
                 <div class="sum-card">
-                    <div class="sum-title">Ð¡ÑÐ¼Ð¼Ð° Ð¿Ð¾ ÑÐ¾ÑÐºÐ°Ð¼</div>
-                    <div class="sum-value">{sum(overall["per_point"].values())} â½</div>
+                    <div class="sum-title">Сумма по точкам</div>
+                    <div class="sum-value">{sum(overall["per_point"].values())} ₽</div>
                 </div>
 
                 <div class="sum-card">
-                    <div class="sum-title">ÐÑÐ¾Ð³ Ð·Ð° Ð¼ÐµÑÑÑ</div>
-                    <div class="sum-value">{overall["total"]} â½</div>
+                    <div class="sum-title">Итог за месяц</div>
+                    <div class="sum-value">{overall["total"]} ₽</div>
                 </div>
             </div>
 
             <div class="hint">
-                ÐÐ° ÑÑÐ¾Ð¹ ÑÑÑÐ°Ð½Ð¸ÑÐµ Ð±Ð¾Ð»ÑÑÐµ Ð½ÐµÑ Ð¿Ð¾Ð»ÐµÐ¹ Ð¿ÑÐ¸Ð¼ÐµÑÐ°Ð½Ð¸Ñ Ð¸ Ð²Ð¾Ð·Ð¼ÐµÑÐµÐ½Ð¸Ñ Ð·Ð° Ð¼ÐµÑÑÑ.
-                ÐÐ½Ð¸ Ð·Ð°Ð¿Ð¾Ð»Ð½ÑÑÑÑÑ Ð¾ÑÐ´ÐµÐ»ÑÐ½Ð¾ Ð²Ð½ÑÑÑÐ¸ ÐºÐ°Ð¶Ð´Ð¾Ð¹ ÑÐ¾ÑÐºÐ¸.
+                На этой странице больше нет полей примечания и возмещения за месяц.
+                Они заполняются отдельно внутри каждой точки.
             </div>
 
             {points_html}
@@ -1262,9 +1261,9 @@ def monthly_submit_page(
             {action_block}
 
             <div class="admin-export-buttons" style="margin-top:18px;">
-                <a class="btn btn-secondary btn-inline" href="/point-page?fio={escape(fio)}">ÐÐµÑÐµÐ¹ÑÐ¸ Ðº Ð´ÑÑÐ³Ð¾Ð¹ ÑÐ¾ÑÐºÐµ</a>
-                <a class="btn btn-secondary btn-inline" href="/summary-page?fio={escape(fio)}">ÐÐ¾Ñ ÑÑÐ¼Ð¼Ð°</a>
-                <a class="btn btn-secondary btn-inline" href="/menu-page?fio={escape(fio)}">ÐÐ»Ð°Ð²Ð½ÑÐ¹ ÑÐºÑÐ°Ð½</a>
+                <a class="btn btn-secondary btn-inline" href="/point-page?fio={escape(fio)}">Перейти к другой точке</a>
+                <a class="btn btn-secondary btn-inline" href="/summary-page?fio={escape(fio)}">Моя сумма</a>
+                <a class="btn btn-secondary btn-inline" href="/menu-page?fio={escape(fio)}">Главный экран</a>
             </div>
         </div>
     </div>
@@ -1336,8 +1335,8 @@ def day_action_page(
     wd = weekday_of(y, m, day)
     is_fri_or_sat = wd in (4, 5)
 
-    day_btn_text = "Ð£Ð±ÑÐ°ÑÑ Ð²ÑÑÐ¾Ð´" if "DAY" in day_visits else "ÐÐ¾Ð±Ð°Ð²Ð¸ÑÑ Ð²ÑÑÐ¾Ð´"
-    inv_btn_text = "Ð£Ð±ÑÐ°ÑÑ Ð¿Ð¾Ð»Ð½ÑÐ¹ Ð¸Ð½Ð²ÐµÐ½Ñ" if "FULL_INVENT" in day_visits else "ÐÐ¾Ð±Ð°Ð²Ð¸ÑÑ Ð¿Ð¾Ð»Ð½ÑÐ¹ Ð¸Ð½Ð²ÐµÐ½Ñ"
+    day_btn_text = "Убрать выход" if "DAY" in day_visits else "Добавить выход"
+    inv_btn_text = "Убрать полный инвент" if "FULL_INVENT" in day_visits else "Добавить полный инвент"
 
     if not is_fri_or_sat:
         return RedirectResponse(url=f"/toggle-day?fio={escape(fio)}&point_code={escape(point_code)}&day={day}", status_code=303)
@@ -1348,17 +1347,17 @@ def day_action_page(
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ÐÐµÐ¹ÑÑÐ²Ð¸Ðµ Ð¿Ð¾ Ð´Ð½Ñ</title>
+    <title>Действие по дню</title>
     {base_css()}
 </head>
 <body>
     <div class="page">
         <div class="card">
-            <div class="brand">ÐÐºÑÑÐÐ¸Ð»Ð»</div>
-            <h1>ÐÑÐ±Ð¾Ñ Ð´ÐµÐ¹ÑÑÐ²Ð¸Ñ</h1>
+            <div class="brand">ВкусВилл</div>
+            <h1>Выбор действия</h1>
             <div class="subtitle">
-                Ð¢Ð¾ÑÐºÐ°: {escape(point_code)}<br>
-                ÐÐ°ÑÐ°: {day:02d}.{m:02d}.{y}
+                Точка: {escape(point_code)}<br>
+                Дата: {day:02d}.{m:02d}.{y}
             </div>
 
             <a class="btn btn-small" href="/toggle-day?fio={escape(fio)}&point_code={escape(point_code)}&day={day}">
@@ -1369,7 +1368,7 @@ def day_action_page(
                 {inv_btn_text}
             </a>
 
-            <a class="back" href="/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}">â ÐÐ°Ð·Ð°Ð´ Ðº ÐºÐ°Ð»ÐµÐ½Ð´Ð°ÑÑ</a>
+            <a class="back" href="/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}">← Назад к календарю</a>
         </div>
     </div>
 </body>
@@ -1443,18 +1442,18 @@ def summary_page(fio: str = "", db: Session = Depends(get_db)):
         for point_code, d in overall["per_point_details"].items():
             details_html += f"""
             <details class="point-detail">
-                <summary>{escape(point_code)} â {d["total"]} â½</summary>
+                <summary>{escape(point_code)} — {d["total"]} ₽</summary>
                 <div class="summary-content">
-                    <div>Ð¡ Ð¿Ð¾ÑÑÐ°Ð²ÐºÐ¾Ð¹: {d["cnt_supply"]} Ã {d["rate_supply"]} â½ = {d["sum_supply"]} â½</div>
-                    <div>ÐÐµÐ· Ð¿Ð¾ÑÑÐ°Ð²ÐºÐ¸: {d["cnt_no_supply"]} Ã {d["rate_no_supply"]} â½ = {d["sum_no_supply"]} â½</div>
-                    <div>ÐÐ¾Ð»Ð½ÑÐ¹ Ð¸Ð½Ð²ÐµÐ½Ñ: {d["cnt_full_inv"]} Ã {d["rate_inventory"]} â½ = {d["sum_inventory"]} â½</div>
-                    <div>ÐÐ¾ÑÐµÐ¼Ð°ÑÐ¸Ð½Ð°: {d["coffee_cnt"]} Ã {d["coffee_rate"]} â½ = {d["coffee_sum"]} â½</div>
-                    <div><strong>ÐÑÐ¾Ð³Ð¾ Ð¿Ð¾ ÑÐ¾ÑÐºÐµ: {d["total"]} â½</strong></div>
+                    <div>С поставкой: {d["cnt_supply"]} × {d["rate_supply"]} ₽ = {d["sum_supply"]} ₽</div>
+                    <div>Без поставки: {d["cnt_no_supply"]} × {d["rate_no_supply"]} ₽ = {d["sum_no_supply"]} ₽</div>
+                    <div>Полный инвент: {d["cnt_full_inv"]} × {d["rate_inventory"]} ₽ = {d["sum_inventory"]} ₽</div>
+                    <div>Кофемашина: {d["coffee_cnt"]} × {d["coffee_rate"]} ₽ = {d["coffee_sum"]} ₽</div>
+                    <div><strong>Итого по точке: {d["total"]} ₽</strong></div>
                 </div>
             </details>
             """
     else:
-        details_html = "<div class='hint' style='margin-top:10px'>ÐÐ¾ÐºÐ° Ð½ÐµÑ Ð¾ÑÐ¼ÐµÑÐµÐ½Ð½ÑÑ ÑÐ¾ÑÐµÐº Ð·Ð° ÑÑÐ¾Ñ Ð¼ÐµÑÑÑ.</div>"
+        details_html = "<div class='hint' style='margin-top:10px'>Пока нет отмеченных точек за этот месяц.</div>"
 
 
     return f"""
@@ -1463,26 +1462,26 @@ def summary_page(fio: str = "", db: Session = Depends(get_db)):
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ÐÐ¾Ñ ÑÑÐ¼Ð¼Ð°</title>
+    <title>Моя сумма</title>
     {base_css()}
 </head>
 <body>
     <div class="page">
         <div class="card">
-            <div class="brand">ÐÐºÑÑÐÐ¸Ð»Ð»</div>
-            <h1>ÐÐ¾Ñ ÑÑÐ¼Ð¼Ð°</h1>
+            <div class="brand">ВкусВилл</div>
+            <h1>Моя сумма</h1>
             <div class="subtitle">{escape(fio)}</div>
 
             <div class="sum-card">
-                <div class="sum-title">ÐÐ±ÑÐ°Ñ ÑÑÐ¼Ð¼Ð° Ð·Ð° Ð¼ÐµÑÑÑ</div>
-                <div class="sum-value">{overall["total"]} â½</div>
+                <div class="sum-title">Общая сумма за месяц</div>
+                <div class="sum-value">{overall["total"]} ₽</div>
             </div>
 
             {details_html}
 
-            <div class="hint">Ð¡ÐµÐ¹ÑÐ°Ñ Ð¾ÑÐºÑÑÑ Ð¿ÐµÑÐ¸Ð¾Ð´ Ð·Ð° {month_title(period["year"], period["month"])}.</div>
+            <div class="hint">Сейчас открыт период за {month_title(period["year"], period["month"])}.</div>
 
-            <a class="back" href="/menu-page?fio={escape(fio)}">â ÐÐ°Ð·Ð°Ð´</a>
+            <a class="back" href="/menu-page?fio={escape(fio)}">← Назад</a>
         </div>
     </div>
 </body>
@@ -1494,11 +1493,11 @@ def summary_page(fio: str = "", db: Session = Depends(get_db)):
 def admin_login_page(error: str = ""):
     error_box = ""
     if error == "1":
-        error_box = "<div class='error-box'>ÐÐµÐ²ÐµÑÐ½ÑÐ¹ Ð»Ð¾Ð³Ð¸Ð½ Ð¸Ð»Ð¸ Ð¿Ð°ÑÐ¾Ð»Ñ.</div>"
+        error_box = "<div class='error-box'>Неверный логин или пароль.</div>"
 
     env_box = ""
     if not ADMIN_LOGIN or not ADMIN_PASSWORD:
-        env_box = "<div class='error-box'>Ð Render Ð½ÑÐ¶Ð½Ð¾ Ð·Ð°Ð´Ð°ÑÑ ADMIN_LOGIN Ð¸ ADMIN_PASSWORD.</div>"
+        env_box = "<div class='error-box'>В Render нужно задать ADMIN_LOGIN и ADMIN_PASSWORD.</div>"
 
     return f"""
 <!DOCTYPE html>
@@ -1506,27 +1505,27 @@ def admin_login_page(error: str = ""):
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ÐÐ´Ð¼Ð¸Ð½-Ð²ÑÐ¾Ð´</title>
+    <title>Админ-вход</title>
     {base_css()}
 </head>
 <body>
     <div class="page">
         <div class="card">
-            <div class="brand">ÐÐºÑÑÐÐ¸Ð»Ð»</div>
-            <h1>ÐÐ´Ð¼Ð¸Ð½ÐºÐ°</h1>
-            <div class="subtitle">ÐÑÐ¾Ð´ Ð² Ð¾ÑÑÑÑ Ð¿Ð¾ ÑÐ²ÐµÑÐºÐ°Ð¼</div>
+            <div class="brand">ВкусВилл</div>
+            <h1>Админка</h1>
+            <div class="subtitle">Вход в отчёт по сверкам</div>
 
             {env_box}
             {error_box}
 
             <form method="post" action="/admin-login">
-                <label for="login">ÐÐ¾Ð³Ð¸Ð½</label>
+                <label for="login">Логин</label>
                 <input id="login" name="login" type="text" required />
 
-                <label for="password">ÐÐ°ÑÐ¾Ð»Ñ</label>
+                <label for="password">Пароль</label>
                 <input id="password" name="password" type="password" required />
 
-                <button class="btn" type="submit">ÐÐ¾Ð¹ÑÐ¸</button>
+                <button class="btn" type="submit">Войти</button>
             </form>
         </div>
     </div>
@@ -1584,47 +1583,47 @@ def admin_report(
     rows = get_admin_report_rows(db, year, month, tu_filter, status_filter)
     tu_values = get_all_tu_values(db)
 
-    tu_options = "<option value=''>ÐÑÐµ Ð¢Ð£</option>"
+    tu_options = "<option value=''>Все ТУ</option>"
     for item in tu_values:
         selected = "selected" if item == tu else ""
         tu_options += f"<option value='{escape(item)}' {selected}>{escape(item)}</option>"
 
     status_options = f"""
-        <option value='' {'selected' if not status else ''}>ÐÑÐµ ÑÑÐ°ÑÑÑÑ</option>
-        <option value='Ð½Ðµ Ð¾ÑÐ¿ÑÐ°Ð²Ð»ÐµÐ½Ð¾' {'selected' if status == 'Ð½Ðµ Ð¾ÑÐ¿ÑÐ°Ð²Ð»ÐµÐ½Ð¾' else ''}>ÐÐµ Ð¾ÑÐ¿ÑÐ°Ð²Ð»ÐµÐ½Ð¾</option>
-        <option value='draft' {'selected' if status == 'draft' else ''}>Ð§ÐµÑÐ½Ð¾Ð²Ð¸Ðº</option>
-        <option value='submitted' {'selected' if status == 'submitted' else ''}>ÐÑÐ¿ÑÐ°Ð²Ð»ÐµÐ½Ð¾</option>
+        <option value='' {'selected' if not status else ''}>Все статусы</option>
+        <option value='не отправлено' {'selected' if status == 'не отправлено' else ''}>Не отправлено</option>
+        <option value='draft' {'selected' if status == 'draft' else ''}>Черновик</option>
+        <option value='submitted' {'selected' if status == 'submitted' else ''}>Отправлено</option>
     """
 
     rows_html = ""
     if rows:
         for r in rows:
-            receipt_html = "â"
+            receipt_html = "—"
             if r["receipt_path"]:
-                receipt_html = f"<a href='/{r['receipt_path']}' target='_blank'>ÐÑÐºÑÑÑÑ</a>"
+                receipt_html = f"<a href='/{r['receipt_path']}' target='_blank'>Открыть</a>"
 
             rows_html += f"""
             <tr>
                 <td>{escape(r["fio"])}</td>
-                <td>{escape(r["tu"]) if r["tu"] else "â"}</td>
+                <td>{escape(r["tu"]) if r["tu"] else "—"}</td>
                 <td>{escape(r["point_code"])}</td>
                 <td>{month_title(year, month)}</td>
-                <td>{r["cnt_supply"]} / {r["sum_supply"]} â½</td>
-                <td>{r["cnt_no_supply"]} / {r["sum_no_supply"]} â½</td>
-                <td>{r["cnt_full_inv"]} / {r["sum_inventory"]} â½</td>
-                <td>{r["coffee_cnt"]} Ã {r["coffee_rate"]} = {r["coffee_sum"]} â½</td>
-                <td>{r["note_amount"]} â½<br>{escape(r["note_comment"]) if r["note_comment"] else "â"}</td>
-                <td>{r["reimb_amount"]} â½<br>{escape(r["reimb_comment"]) if r["reimb_comment"] else "â"}</td>
-                <td><strong>{r["point_total"]} â½</strong></td>
+                <td>{r["cnt_supply"]} / {r["sum_supply"]} ₽</td>
+                <td>{r["cnt_no_supply"]} / {r["sum_no_supply"]} ₽</td>
+                <td>{r["cnt_full_inv"]} / {r["sum_inventory"]} ₽</td>
+                <td>{r["coffee_cnt"]} × {r["coffee_rate"]} = {r["coffee_sum"]} ₽</td>
+                <td>{r["note_amount"]} ₽<br>{escape(r["note_comment"]) if r["note_comment"] else "—"}</td>
+                <td>{r["reimb_amount"]} ₽<br>{escape(r["reimb_comment"]) if r["reimb_comment"] else "—"}</td>
+                <td><strong>{r["point_total"]} ₽</strong></td>
                 <td>{escape(r["status"])}</td>
-                <td>{f"<a href='/{r['reimb_receipt']}' target='_blank'>ÐÑÐºÑÑÑÑ</a>" if r["reimb_receipt"] else "â"}</td>
-                <td>{escape(r["comment"]) if r["comment"] else "â"}</td>
+                <td>{f"<a href='/{r['reimb_receipt']}' target='_blank'>Открыть</a>" if r["reimb_receipt"] else "—"}</td>
+                <td>{escape(r["comment"]) if r["comment"] else "—"}</td>
             </tr>
             """
     else:
         rows_html = """
         <tr>
-            <td colspan="13">ÐÐ¾ Ð²ÑÐ±ÑÐ°Ð½Ð½ÑÐ¼ ÑÐ¸Ð»ÑÑÑÐ°Ð¼ Ð´Ð°Ð½Ð½ÑÑ Ð½ÐµÑ.</td>
+            <td colspan="13">По выбранным фильтрам данных нет.</td>
         </tr>
         """
 
@@ -1641,7 +1640,7 @@ def admin_report(
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ÐÐ´Ð¼Ð¸Ð½-Ð¾ÑÑÑÑ</title>
+    <title>Админ-отчёт</title>
     {base_css()}
 </head>
 <body>
@@ -1649,76 +1648,76 @@ def admin_report(
         <div class="card-wide">
             <div class="admin-actions">
                 <div>
-                    <div class="brand">ÐÐºÑÑÐÐ¸Ð»Ð»</div>
-                    <h1>ÐÑÑÑÑ Ð¿Ð¾ ÑÐ²ÐµÑÐºÐ°Ð¼</h1>
-                    <div class="subtitle">ÐÐ´Ð¼Ð¸Ð½-Ð¿Ð°Ð½ÐµÐ»Ñ</div>
+                    <div class="brand">ВкусВилл</div>
+                    <h1>Отчёт по сверкам</h1>
+                    <div class="subtitle">Админ-панель</div>
                 </div>
                 <div class="admin-export-buttons">
-                    <a class="btn btn-secondary btn-inline" href="/admin-data">Ð£Ð¿ÑÐ°Ð²Ð»ÐµÐ½Ð¸Ðµ Ð´Ð°Ð½Ð½ÑÐ¼Ð¸</a>
-                    <a class="btn btn-secondary btn-inline" href="/admin-logout">ÐÑÐ¹ÑÐ¸</a>
+                    <a class="btn btn-secondary btn-inline" href="/admin-data">Управление данными</a>
+                    <a class="btn btn-secondary btn-inline" href="/admin-logout">Выйти</a>
                 </div>
             </div>
 
             <form method="get" action="/admin-report">
                 <div class="filter-grid">
                     <div>
-                        <label for="year">ÐÐ¾Ð´</label>
+                        <label for="year">Год</label>
                         <input id="year" name="year" type="number" value="{year}" />
                     </div>
 
                     <div>
-                        <label for="month">ÐÐµÑÑÑ</label>
+                        <label for="month">Месяц</label>
                         <select id="month" name="month">
                             {month_options}
                         </select>
                     </div>
 
                     <div>
-                        <label for="tu">Ð¢ÐµÑÑÐ¸ÑÐ¾ÑÐ¸Ð°Ð»ÑÐ½ÑÐ¹ ÑÐ¿ÑÐ°Ð²Ð»ÑÑÑÐ¸Ð¹</label>
+                        <label for="tu">Территориальный управляющий</label>
                         <select id="tu" name="tu">
                             {tu_options}
                         </select>
                     </div>
 
                     <div>
-                        <label for="status">Ð¡ÑÐ°ÑÑÑ ÑÐ²ÐµÑÐºÐ¸</label>
+                        <label for="status">Статус сверки</label>
                         <select id="status" name="status">
                             {status_options}
                         </select>
                     </div>
                 </div>
 
-                <button class="btn btn-inline" type="submit">ÐÑÐ¸Ð¼ÐµÐ½Ð¸ÑÑ ÑÐ¸Ð»ÑÑÑ</button>
+                <button class="btn btn-inline" type="submit">Применить фильтр</button>
             </form>
 
             <div class="admin-export-buttons">
-                <a class="btn btn-secondary btn-inline" href="/admin-export-check?{export_query}">ÐÑÐ³ÑÑÐ·ÐºÐ° Ð´Ð»Ñ Ð¿ÑÐ¾Ð²ÐµÑÐºÐ¸</a>
-                <a class="btn btn-secondary btn-inline" href="/admin-export-payroll?{export_query}">ÐÑÐ³ÑÑÐ·ÐºÐ° Ð² Ð²ÐµÐ´Ð¾Ð¼Ð¾ÑÑÑ</a>
-                <a class="btn btn-secondary btn-inline" href="/admin-export-overlaps?{export_query}">ÐÑÐ³ÑÑÐ·ÐºÐ° Ð¿ÐµÑÐµÑÐµÑÐµÐ½Ð¸Ð¹</a>
+                <a class="btn btn-secondary btn-inline" href="/admin-export-check?{export_query}">Выгрузка для проверки</a>
+                <a class="btn btn-secondary btn-inline" href="/admin-export-payroll?{export_query}">Выгрузка в ведомость</a>
+                <a class="btn btn-secondary btn-inline" href="/admin-export-overlaps?{export_query}">Выгрузка пересечений</a>
             </div>
 
             <div class="hint">
-                ÐÐµÑÐ¸Ð¾Ð´ Ð¾ÑÑÑÑÐ°: {month_title(year, month)}. ÐÑÐµÐ³Ð¾ ÑÑÑÐ¾Ðº: {len(rows)}.
+                Период отчёта: {month_title(year, month)}. Всего строк: {len(rows)}.
             </div>
 
             <div class="table-wrap" style="margin-top:16px;">
                 <table>
                     <thead>
                         <tr>
-                            <th>Ð¤ÐÐ</th>
-                            <th>Ð¢Ð£</th>
-                            <th>Ð¢Ð¾ÑÐºÐ°</th>
-                            <th>ÐÐµÑÑÑ</th>
-                            <th>Ð¡ Ð¿Ð¾ÑÑÐ°Ð²ÐºÐ¾Ð¹</th>
-                            <th>ÐÐµÐ· Ð¿Ð¾ÑÑÐ°Ð²ÐºÐ¸</th>
-                            <th>ÐÐ½Ð²ÐµÐ½ÑÑ</th>
-                            <th>ÐÐ¾ÑÐµÐ¼Ð°ÑÐ¸Ð½Ð°</th>
-                            <th>ÐÑÐ¸Ð¼ÐµÑÐ°Ð½Ð¸Ðµ Ð¿Ð¾ ÑÐ¾ÑÐºÐµ</th>
-                            <th>ÐÐ¾Ð·Ð¼ÐµÑÐµÐ½Ð¸Ðµ Ð¿Ð¾ ÑÐ¾ÑÐºÐµ</th>
-                            <th>ÐÑÐ¾Ð³ Ð¿Ð¾ ÑÐ¾ÑÐºÐµ</th>
-                            <th>Ð¡ÑÐ°ÑÑÑ</th>
-                            <th>Ð§ÐµÐº Ð¿Ð¾ ÑÐ¾ÑÐºÐµ</th>
-                            <th>ÐÐ¾Ð¼Ð¼ÐµÐ½ÑÐ°ÑÐ¸Ð¹ Ð¼ÐµÑÑÑÐ°</th>
+                            <th>ФИО</th>
+                            <th>ТУ</th>
+                            <th>Точка</th>
+                            <th>Месяц</th>
+                            <th>С поставкой</th>
+                            <th>Без поставки</th>
+                            <th>Инвенты</th>
+                            <th>Кофемашина</th>
+                            <th>Примечание по точке</th>
+                            <th>Возмещение по точке</th>
+                            <th>Итог по точке</th>
+                            <th>Статус</th>
+                            <th>Чек по точке</th>
+                            <th>Комментарий месяца</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -1762,7 +1761,7 @@ def admin_data_page(
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Ð£Ð¿ÑÐ°Ð²Ð»ÐµÐ½Ð¸Ðµ Ð´Ð°Ð½Ð½ÑÐ¼Ð¸</title>
+    <title>Управление данными</title>
     {base_css()}
 </head>
 <body>
@@ -1770,13 +1769,13 @@ def admin_data_page(
         <div class="card-wide">
             <div class="admin-actions">
                 <div>
-                    <div class="brand">ÐÐºÑÑÐÐ¸Ð»Ð»</div>
-                    <h1>Ð£Ð¿ÑÐ°Ð²Ð»ÐµÐ½Ð¸Ðµ Ð´Ð°Ð½Ð½ÑÐ¼Ð¸</h1>
-                    <div class="subtitle">ÐÐ°Ð³ÑÑÐ·ÐºÐ° ÑÐ°Ð¹Ð»Ð¾Ð² Ð¸ Ð¾ÑÐ¸ÑÑÐºÐ° Ð¼ÐµÑÑÑÐ°</div>
+                    <div class="brand">ВкусВилл</div>
+                    <h1>Управление данными</h1>
+                    <div class="subtitle">Загрузка файлов и очистка месяца</div>
                 </div>
                 <div class="admin-export-buttons">
-                    <a class="btn btn-secondary btn-inline" href="/admin-report">ÐÐ°Ð·Ð°Ð´ Ðº Ð¾ÑÑÑÑÑ</a>
-                    <a class="btn btn-secondary btn-inline" href="/admin-logout">ÐÑÐ¹ÑÐ¸</a>
+                    <a class="btn btn-secondary btn-inline" href="/admin-report">Назад к отчёту</a>
+                    <a class="btn btn-secondary btn-inline" href="/admin-logout">Выйти</a>
                 </div>
             </div>
 
@@ -1784,65 +1783,65 @@ def admin_data_page(
 
             <div class="data-grid">
                 <div class="detail-card">
-                    <div class="detail-title">ÐÐ°Ð³ÑÑÐ·ÐºÐ° Ð¿Ð¾ÑÑÐ°Ð²Ð¾Ðº</div>
+                    <div class="detail-title">Загрузка поставок</div>
                     <form method="post" action="/admin-upload-supplies" enctype="multipart/form-data">
-                        <label for="supplies_file">Ð¤Ð°Ð¹Ð» Ð¿Ð¾ÑÑÐ°Ð²Ð¾Ðº</label>
+                        <label for="supplies_file">Файл поставок</label>
                         <input id="supplies_file" name="file" type="file" accept=".xlsx" required />
-                        <button class="btn" type="submit">ÐÐ°Ð³ÑÑÐ·Ð¸ÑÑ Ð¿Ð¾ÑÑÐ°Ð²ÐºÐ¸</button>
+                        <button class="btn" type="submit">Загрузить поставки</button>
                     </form>
                 </div>
 
                 <div class="detail-card">
-                    <div class="detail-title">ÐÐ°Ð³ÑÑÐ·ÐºÐ° ÑÑÐ°Ð²Ð¾Ðº</div>
+                    <div class="detail-title">Загрузка ставок</div>
                     <form method="post" action="/admin-upload-rates" enctype="multipart/form-data">
-                        <label for="rates_year">ÐÐ¾Ð´</label>
+                        <label for="rates_year">Год</label>
                         <input id="rates_year" name="year" type="number" value="{period["year"]}" required />
 
-                        <label for="rates_month">ÐÐµÑÑÑ</label>
+                        <label for="rates_month">Месяц</label>
                         <input id="rates_month" name="month" type="number" value="{period["month"]}" min="1" max="12" required />
 
-                        <label for="rates_file">Ð¤Ð°Ð¹Ð» ÑÑÐ°Ð²Ð¾Ðº</label>
+                        <label for="rates_file">Файл ставок</label>
                         <input id="rates_file" name="file" type="file" accept=".xlsx" required />
 
-                        <button class="btn" type="submit">ÐÐ°Ð³ÑÑÐ·Ð¸ÑÑ ÑÑÐ°Ð²ÐºÐ¸</button>
+                        <button class="btn" type="submit">Загрузить ставки</button>
                     </form>
                 </div>
 
                 <div class="detail-card">
-                    <div class="detail-title">ÐÐ°Ð³ÑÑÐ·ÐºÐ° Ð¼ÐµÑÑÐµÐ¹</div>
+                    <div class="detail-title">Загрузка мерчей</div>
                     <form method="post" action="/admin-upload-merchants" enctype="multipart/form-data">
-                        <label for="merchants_tu">Ð¢ÐµÑÑÐ¸ÑÐ¾ÑÐ¸Ð°Ð»ÑÐ½ÑÐ¹ ÑÐ¿ÑÐ°Ð²Ð»ÑÑÑÐ¸Ð¹</label>
-                        <input id="merchants_tu" name="tu" type="text" placeholder="ÐÐ°Ð¿ÑÐ¸Ð¼ÐµÑ: Ð¥ÑÑÐ¿Ð¾Ð²" required />
+                        <label for="merchants_tu">Территориальный управляющий</label>
+                        <input id="merchants_tu" name="tu" type="text" placeholder="Например: Хрупов" required />
 
-                        <label for="merchants_file">Ð¤Ð°Ð¹Ð» Ð¼ÐµÑÑÐµÐ¹</label>
+                        <label for="merchants_file">Файл мерчей</label>
                         <input id="merchants_file" name="file" type="file" accept=".xlsx" required />
 
-                        <button class="btn" type="submit">ÐÐ°Ð³ÑÑÐ·Ð¸ÑÑ Ð¼ÐµÑÑÐµÐ¹</button>
+                        <button class="btn" type="submit">Загрузить мерчей</button>
                     </form>
                 </div>
 
                 <div class="detail-card">
-                    <div class="detail-title">ÐÑÐ¸ÑÑÐºÐ° Ð¼ÐµÑÑÑÐ°</div>
+                    <div class="detail-title">Очистка месяца</div>
                     <form method="post" action="/admin-clear-month">
-                        <label for="clear_year">ÐÐ¾Ð´</label>
+                        <label for="clear_year">Год</label>
                         <input id="clear_year" name="year" type="number" value="{period["year"]}" required />
 
-                        <label for="clear_month">ÐÐµÑÑÑ</label>
+                        <label for="clear_month">Месяц</label>
                         <input id="clear_month" name="month" type="number" value="{period["month"]}" min="1" max="12" required />
 
-                        <button class="btn btn-danger" type="submit">ÐÑÐ¸ÑÑÐ¸ÑÑ Ð´Ð°Ð½Ð½ÑÐµ Ð¼ÐµÑÑÑÐ°</button>
+                        <button class="btn btn-danger" type="submit">Очистить данные месяца</button>
                     </form>
                 </div>
 
                 <div class="detail-card">
-                    <div class="detail-title">ÐÑÐ¸ÑÑÐºÐ° Ð¼ÐµÑÑÐµÐ¹ Ð¿Ð¾ Ð¢Ð£</div>
+                    <div class="detail-title">Очистка мерчей по ТУ</div>
                     <form method="post" action="/admin-clear-merchants">
-                        <label for="clear_tu">Ð¢ÐµÑÑÐ¸ÑÐ¾ÑÐ¸Ð°Ð»ÑÐ½ÑÐ¹ ÑÐ¿ÑÐ°Ð²Ð»ÑÑÑÐ¸Ð¹</label>
+                        <label for="clear_tu">Территориальный управляющий</label>
                         <select id="clear_tu" name="tu" required>
                             {tu_options}
                         </select>
 
-                        <button class="btn btn-danger" type="submit">Ð£Ð´Ð°Ð»Ð¸ÑÑ Ð¼ÐµÑÑÐµÐ¹ ÑÑÐ¾Ð³Ð¾ Ð¢Ð£</button>
+                        <button class="btn btn-danger" type="submit">Удалить мерчей этого ТУ</button>
                     </form>
                 </div>
             </div>
@@ -1864,7 +1863,7 @@ async def admin_upload_supplies(
 
     try:
         result = import_supplies_xlsx(db, file.file)
-        msg = f"ÐÐ¾ÑÑÐ°Ð²ÐºÐ¸ Ð·Ð°Ð³ÑÑÐ¶ÐµÐ½Ñ: ÑÑÑÐ¾Ðº {result['loaded_rows']}, ÑÐ¾ÑÐµÐº {result['loaded_points']}."
+        msg = f"Поставки загружены: строк {result['loaded_rows']}, точек {result['loaded_points']}."
         return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
     except Exception as e:
         return RedirectResponse(url=f"/admin-data?error={str(e)}", status_code=303)
@@ -1883,7 +1882,7 @@ async def admin_upload_rates(
 
     try:
         result = import_rates_xlsx(db, file.file, year, month)
-        msg = f"Ð¡ÑÐ°Ð²ÐºÐ¸ Ð·Ð°Ð³ÑÑÐ¶ÐµÐ½Ñ: ÑÑÑÐ¾Ðº {result['loaded_rows']}."
+        msg = f"Ставки загружены: строк {result['loaded_rows']}."
         return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
     except Exception as e:
         return RedirectResponse(url=f"/admin-data?error={str(e)}", status_code=303)
@@ -1901,7 +1900,7 @@ async def admin_upload_merchants(
 
     try:
         result = import_merchants_xlsx(db, file.file, tu)
-        msg = f"ÐÐµÑÑÐ¸ Ð·Ð°Ð³ÑÑÐ¶ÐµÐ½Ñ: ÑÑÑÐ¾Ðº {result['loaded_rows']}."
+        msg = f"Мерчи загружены: строк {result['loaded_rows']}."
         return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
     except Exception as e:
         return RedirectResponse(url=f"/admin-data?error={str(e)}", status_code=303)
@@ -1919,9 +1918,9 @@ def admin_clear_month(
 
     result = clear_month_data(db, year, month)
     msg = (
-        f"ÐÐµÑÑÑ Ð¾ÑÐ¸ÑÐµÐ½. ÐÐ¸Ð·Ð¸ÑÑ: {result['deleted_visits']}, "
-        f"Ð¿Ð¾ÑÑÐ°Ð²ÐºÐ¸: {result['deleted_supplies']}, ÑÑÐ°Ð²ÐºÐ¸: {result['deleted_rates']}, "
-        f"Ð¼ÐµÑÑÑÐ½ÑÐµ ÑÐ²ÐµÑÐºÐ¸: {result['deleted_monthly']}, ÐºÐ¾ÑÑÐµÐºÑÐ¸ÑÐ¾Ð²ÐºÐ¸ Ð¿Ð¾ ÑÐ¾ÑÐºÐ°Ð¼: {result.get('deleted_point_adjustments', 0)}."
+        f"Месяц очищен. Визиты: {result['deleted_visits']}, "
+        f"поставки: {result['deleted_supplies']}, ставки: {result['deleted_rates']}, "
+        f"месячные сверки: {result['deleted_monthly']}, корректировки по точкам: {result.get('deleted_point_adjustments', 0)}."
     )
     return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
 
@@ -1936,7 +1935,7 @@ def admin_clear_merchants(
         return RedirectResponse(url="/admin-login", status_code=303)
 
     deleted = clear_merchants_by_tu(db, tu)
-    msg = f"Ð£Ð´Ð°Ð»ÐµÐ½Ð¾ Ð¼ÐµÑÑÐµÐ¹ Ð¢Ð£ {tu}: {deleted}."
+    msg = f"Удалено мерчей ТУ {tu}: {deleted}."
     return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
 
 
@@ -1962,29 +1961,29 @@ def admin_export_check(
 
     wb = Workbook()
     ws = wb.active
-    ws.title = "ÐÑÐ¾Ð²ÐµÑÐºÐ°"
+    ws.title = "Проверка"
 
     ws.append([
-        "Ð¤ÐÐ",
-        "Ð¢Ð£",
-        "Ð¢Ð¾ÑÐºÐ°",
-        "ÐÐµÑÑÑ",
-        "ÐÑÑÐ¾Ð´Ñ Ñ Ð¿Ð¾ÑÑÐ°Ð²ÐºÐ¾Ð¹ (ÐºÐ¾Ð»-Ð²Ð¾)",
-        "ÐÑÑÐ¾Ð´Ñ Ñ Ð¿Ð¾ÑÑÐ°Ð²ÐºÐ¾Ð¹ (ÑÑÐ¼Ð¼Ð°)",
-        "ÐÑÑÐ¾Ð´Ñ Ð±ÐµÐ· Ð¿Ð¾ÑÑÐ°Ð²ÐºÐ¸ (ÐºÐ¾Ð»-Ð²Ð¾)",
-        "ÐÑÑÐ¾Ð´Ñ Ð±ÐµÐ· Ð¿Ð¾ÑÑÐ°Ð²ÐºÐ¸ (ÑÑÐ¼Ð¼Ð°)",
-        "ÐÐ¾Ð»Ð½ÑÐµ Ð¸Ð½Ð²ÐµÐ½ÑÑ (ÐºÐ¾Ð»-Ð²Ð¾)",
-        "ÐÐ¾Ð»Ð½ÑÐµ Ð¸Ð½Ð²ÐµÐ½ÑÑ (ÑÑÐ¼Ð¼Ð°)",
-        "ÐÐ¾ÑÐµÐ¼Ð°ÑÐ¸Ð½Ð° (ÐºÐ¾Ð»-Ð²Ð¾)",
-        "ÐÐ¾ÑÐµÐ¼Ð°ÑÐ¸Ð½Ð° (ÑÑÐ¼Ð¼Ð°)",
-        "ÐÑÐ¸Ð¼ÐµÑÐ°Ð½Ð¸Ðµ Ð¿Ð¾ ÑÐ¾ÑÐºÐµ (ÑÑÐ¼Ð¼Ð°)",
-        "ÐÑÐ¸Ð¼ÐµÑÐ°Ð½Ð¸Ðµ Ð¿Ð¾ ÑÐ¾ÑÐºÐµ (ÐºÐ¾Ð¼Ð¼ÐµÐ½ÑÐ°ÑÐ¸Ð¹)",
-        "ÐÐ¾Ð·Ð¼ÐµÑÐµÐ½Ð¸Ðµ Ð¿Ð¾ ÑÐ¾ÑÐºÐµ (ÑÑÐ¼Ð¼Ð°)",
-        "ÐÐ¾Ð·Ð¼ÐµÑÐµÐ½Ð¸Ðµ Ð¿Ð¾ ÑÐ¾ÑÐºÐµ (ÐºÐ¾Ð¼Ð¼ÐµÐ½ÑÐ°ÑÐ¸Ð¹)",
-        "Ð§ÐµÐº Ð¿Ð¾ ÑÐ¾ÑÐºÐµ",
-        "Ð¡ÑÐ°ÑÑÑ",
-        "ÐÐ¾Ð¼Ð¼ÐµÐ½ÑÐ°ÑÐ¸Ð¹ Ð¼ÐµÑÑÑÐ°",
-        "ÐÑÐ¾Ð³ Ð¿Ð¾ ÑÐ¾ÑÐºÐµ"
+        "ФИО",
+        "ТУ",
+        "Точка",
+        "Месяц",
+        "Выходы с поставкой (кол-во)",
+        "Выходы с поставкой (сумма)",
+        "Выходы без поставки (кол-во)",
+        "Выходы без поставки (сумма)",
+        "Полные инвенты (кол-во)",
+        "Полные инвенты (сумма)",
+        "Кофемашина (кол-во)",
+        "Кофемашина (сумма)",
+        "Примечание по точке (сумма)",
+        "Примечание по точке (комментарий)",
+        "Возмещение по точке (сумма)",
+        "Возмещение по точке (комментарий)",
+        "Чек по точке",
+        "Статус",
+        "Комментарий месяца",
+        "Итог по точке"
     ])
 
     for r in rows:
@@ -2037,14 +2036,14 @@ def admin_export_payroll(
 
     wb = Workbook()
     ws = wb.active
-    ws.title = "ÐÐµÐ´Ð¾Ð¼Ð¾ÑÑÑ"
+    ws.title = "Ведомость"
 
     ws.append([
-        "Ð¤ÐÐ",
-        "Ð¢Ð£",
-        "Ð¡ÑÐ¼Ð¼Ð° Ð¿Ð¾ Ð¼ÐµÑÑÑ",
-        "Ð¡ÑÐ¼Ð¼Ð° Ð² Ð²ÐµÐ´Ð¾Ð¼Ð¾ÑÑÑ (/0.87, Ð¾ÐºÑÑÐ³Ð»ÐµÐ½Ð¸Ðµ Ð²Ð²ÐµÑÑ)",
-        "Ð¡ÑÐ°ÑÑÑ"
+        "ФИО",
+        "ТУ",
+        "Сумма по мерчу",
+        "Сумма в ведомость (/0.87, округление вверх)",
+        "Статус"
     ])
 
     for r in rows:
@@ -2080,17 +2079,17 @@ def admin_export_overlaps(
 
     wb = Workbook()
     ws = wb.active
-    ws.title = "ÐÐµÑÐµÑÐµÑÐµÐ½Ð¸Ñ"
+    ws.title = "Пересечения"
 
     ws.append([
-        "ÐÐ°ÑÐ°",
-        "Ð¢Ð¾ÑÐºÐ°",
-        "ÐÐµÑÑ 1",
-        "Ð¢Ð£ 1",
-        "Ð¡Ð»Ð¾Ñ 1",
-        "ÐÐµÑÑ 2",
-        "Ð¢Ð£ 2",
-        "Ð¡Ð»Ð¾Ñ 2"
+        "Дата",
+        "Точка",
+        "Мерч 1",
+        "ТУ 1",
+        "Слот 1",
+        "Мерч 2",
+        "ТУ 2",
+        "Слот 2"
     ])
 
     for r in rows:
@@ -2107,3 +2106,4 @@ def admin_export_overlaps(
 
     style_sheet(ws)
     return build_excel_response(wb, f"peresecheniya_{year}_{month:02d}.xlsx")
+
