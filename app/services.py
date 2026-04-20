@@ -727,8 +727,14 @@ def upsert_supply_row(db: Session, point_code: str, supply_date: date, boxes: in
     db.execute(text("DELETE FROM supplies WHERE point_code=:point_code AND supply_date=:supply_date"), {
         "point_code": point_code, "supply_date": supply_date
     })
-    db.execute(text("INSERT INTO supplies (point_code, supply_date, boxes) VALUES (:point_code, :supply_date, :boxes)"), {
-        "point_code": point_code, "supply_date": supply_date, "boxes": boxes
+    db.execute(text("""
+        INSERT INTO supplies (point_code, supply_date, boxes, has_supply)
+        VALUES (:point_code, :supply_date, :boxes, :has_supply)
+    """), {
+        "point_code": point_code,
+        "supply_date": supply_date,
+        "boxes": boxes,
+        "has_supply": True,
     })
 
 
@@ -740,11 +746,29 @@ def import_supplies_xlsx(db: Session, file_obj) -> dict:
     loaded_rows = 0
     loaded_points = set()
 
+    period = get_active_period()
+    year = period["year"]
+    month = period["month"]
+
     for idx, value in enumerate(headers[1:], start=2):
+        supply_date = None
+
         if isinstance(value, datetime):
-            date_columns.append((idx, value.date()))
+            supply_date = value.date()
         elif isinstance(value, date):
-            date_columns.append((idx, value))
+            supply_date = value
+        else:
+            raw = str(value or "").strip()
+            match = re.search(r"(\d{1,2})", raw)
+            if match:
+                day = int(match.group(1))
+                try:
+                    supply_date = date(year, month, day)
+                except ValueError:
+                    supply_date = None
+
+        if supply_date:
+            date_columns.append((idx, supply_date))
 
     for row_idx in range(2, ws.max_row + 1):
         point_code = normalize_point_code(ws.cell(row=row_idx, column=1).value)
@@ -884,4 +908,3 @@ def clear_merchants_by_tu(db: Session, tu: str) -> int:
     deleted = db.execute(text("DELETE FROM merchants WHERE tu = :tu"), {"tu": tu}).rowcount or 0
     db.commit()
     return deleted
-
