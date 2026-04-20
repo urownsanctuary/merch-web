@@ -483,10 +483,132 @@ def get_points_for_month(db: Session, merchant_id: int, y: int, m: int) -> list[
     return [r[0] for r in rows if r and r[0]]
 
 
+def ensure_point_adjustments_table(db: Session):
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS point_adjustments (
+            id SERIAL PRIMARY KEY,
+            merchant_id INTEGER NOT NULL,
+            point_code TEXT NOT NULL,
+            month_key DATE NOT NULL,
+            note_amount INTEGER NOT NULL DEFAULT 0,
+            note_comment TEXT,
+            reimb_amount INTEGER NOT NULL DEFAULT 0,
+            reimb_comment TEXT,
+            reimb_receipt TEXT,
+            created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+            UNIQUE (merchant_id, point_code, month_key)
+        )
+    """))
+    db.commit()
+
+
+def get_point_adjustment(db: Session, merchant_id: int, point_code: str, y: int, m: int):
+    ensure_point_adjustments_table(db)
+    mk = month_start(y, m)
+    row = db.execute(text("""
+        SELECT *
+        FROM point_adjustments
+        WHERE merchant_id = :merchant_id
+          AND point_code = :point_code
+          AND month_key = :month_key
+        LIMIT 1
+    """), {
+        "merchant_id": merchant_id,
+        "point_code": point_code,
+        "month_key": mk
+    }).mappings().first()
+    return dict(row) if row else None
+
+
+def upsert_point_adjustment(
+    db: Session,
+    merchant_id: int,
+    point_code: str,
+    y: int,
+    m: int,
+    note_amount: int,
+    note_comment: str,
+    reimb_amount: int,
+    reimb_comment: str,
+    reimb_receipt: str | None,
+):
+    ensure_point_adjustments_table(db)
+    mk = month_start(y, m)
+    existing = get_point_adjustment(db, merchant_id, point_code, y, m)
+
+    if existing:
+        if reimb_receipt:
+            db.execute(text("""
+                UPDATE point_adjustments
+                SET note_amount = :note_amount,
+                    note_comment = :note_comment,
+                    reimb_amount = :reimb_amount,
+                    reimb_comment = :reimb_comment,
+                    reimb_receipt = :reimb_receipt,
+                    updated_at = NOW()
+                WHERE merchant_id = :merchant_id
+                  AND point_code = :point_code
+                  AND month_key = :month_key
+            """), {
+                "merchant_id": merchant_id,
+                "point_code": point_code,
+                "month_key": mk,
+                "note_amount": note_amount,
+                "note_comment": note_comment,
+                "reimb_amount": reimb_amount,
+                "reimb_comment": reimb_comment,
+                "reimb_receipt": reimb_receipt,
+            })
+        else:
+            db.execute(text("""
+                UPDATE point_adjustments
+                SET note_amount = :note_amount,
+                    note_comment = :note_comment,
+                    reimb_amount = :reimb_amount,
+                    reimb_comment = :reimb_comment,
+                    updated_at = NOW()
+                WHERE merchant_id = :merchant_id
+                  AND point_code = :point_code
+                  AND month_key = :month_key
+            """), {
+                "merchant_id": merchant_id,
+                "point_code": point_code,
+                "month_key": mk,
+                "note_amount": note_amount,
+                "note_comment": note_comment,
+                "reimb_amount": reimb_amount,
+                "reimb_comment": reimb_comment,
+            })
+    else:
+        db.execute(text("""
+            INSERT INTO point_adjustments (
+                merchant_id, point_code, month_key,
+                note_amount, note_comment, reimb_amount, reimb_comment, reimb_receipt
+            ) VALUES (
+                :merchant_id, :point_code, :month_key,
+                :note_amount, :note_comment, :reimb_amount, :reimb_comment, :reimb_receipt
+            )
+        """), {
+            "merchant_id": merchant_id,
+            "point_code": point_code,
+            "month_key": mk,
+            "note_amount": note_amount,
+            "note_comment": note_comment,
+            "reimb_amount": reimb_amount,
+            "reimb_comment": reimb_comment,
+            "reimb_receipt": reimb_receipt,
+        })
+
+    db.commit()
+
+
 def compute_point_total(db: Session, merchant_id: int, point_code: str, y: int, m: int):
+    ensure_point_adjustments_table(db)
     boxes_map = get_supply_boxes_map(db, point_code, y, m)
     visits = get_visits_for_month(db, merchant_id, point_code, y, m)
     rates = get_point_rates(db, point_code, y, m)
+    point_adj = get_point_adjustment(db, merchant_id, point_code, y, m)
 
     total = 0
     cnt_supply = 0
@@ -522,6 +644,20 @@ def compute_point_total(db: Session, merchant_id: int, point_code: str, y: int, 
         coffee_sum = rates["coffee_rate"] * cnt_day_total
         total += coffee_sum
 
+    note_amount = 0
+    note_comment = ""
+    reimb_amount = 0
+    reimb_comment = ""
+    reimb_receipt = None
+
+    if point_adj:
+        note_amount = int(point_adj.get("note_amount") or 0)
+        note_comment = point_adj.get("note_comment") or ""
+        reimb_amount = int(point_adj.get("reimb_amount") or 0)
+        reimb_comment = point_adj.get("reimb_comment") or ""
+        reimb_receipt = point_adj.get("reimb_receipt")
+        total += note_amount + reimb_amount
+
     return {
         "total": total,
         "cnt_supply": cnt_supply,
@@ -539,6 +675,11 @@ def compute_point_total(db: Session, merchant_id: int, point_code: str, y: int, 
         "rate_supply": rates["rate_supply"],
         "rate_no_supply": rates["rate_no_supply"],
         "rate_inventory": rates["rate_inventory"],
+        "note_amount": note_amount,
+        "note_comment": note_comment,
+        "reimb_amount": reimb_amount,
+        "reimb_comment": reimb_comment,
+        "reimb_receipt": reimb_receipt,
     }
 
 
@@ -611,14 +752,14 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
         detail = compute_point_total(db, row["merchant_id"], row["point_code"], y, m)
         monthly = get_monthly_submission(db, row["merchant_id"], y, m)
         status_value = "не отправлено"
-        comment = ""
-        extra_amount = 0
-        receipt_path = None
+        monthly_comment = ""
+        monthly_extra_amount = 0
+        monthly_receipt_path = None
         if monthly:
             status_value = monthly.get("status") or "draft"
-            comment = monthly.get("comment") or ""
-            extra_amount = int(monthly.get("extra_amount") or 0)
-            receipt_path = monthly.get("receipt_path")
+            monthly_comment = monthly.get("comment") or ""
+            monthly_extra_amount = int(monthly.get("extra_amount") or 0)
+            monthly_receipt_path = monthly.get("receipt_path")
         if status and status_value != status:
             continue
         result.append({
@@ -628,9 +769,14 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
             "point_code": row["point_code"],
             "month_key": str(start),
             "status": status_value,
-            "comment": comment,
-            "extra_amount": extra_amount,
-            "receipt_path": receipt_path,
+            "comment": monthly_comment,
+            "extra_amount": monthly_extra_amount,
+            "receipt_path": monthly_receipt_path,
+            "note_amount": detail["note_amount"],
+            "note_comment": detail["note_comment"],
+            "reimb_amount": detail["reimb_amount"],
+            "reimb_comment": detail["reimb_comment"],
+            "reimb_receipt": detail["reimb_receipt"],
             "cnt_supply": detail["cnt_supply"],
             "cnt_no_supply": detail["cnt_no_supply"],
             "cnt_full_inv": detail["cnt_full_inv"],
@@ -909,6 +1055,8 @@ def import_merchants_xlsx(db: Session, file_obj, tu: str) -> dict:
 
 
 def clear_month_data(db: Session, year: int, month: int) -> dict:
+    ensure_monthly_submissions_table(db)
+    ensure_point_adjustments_table(db)
     start = month_start(year, month)
     end = month_end_exclusive(year, month)
     deleted_visits = db.execute(text("DELETE FROM visits WHERE visit_date >= :start_date AND visit_date < :end_date"), {
@@ -919,12 +1067,14 @@ def clear_month_data(db: Session, year: int, month: int) -> dict:
     }).rowcount or 0
     deleted_rates = db.execute(text("DELETE FROM point_rates WHERE month_key = :month_key"), {"month_key": start}).rowcount or 0
     deleted_monthly = db.execute(text("DELETE FROM monthly_submissions WHERE month_key = :month_key"), {"month_key": start}).rowcount or 0
+    deleted_point_adjustments = db.execute(text("DELETE FROM point_adjustments WHERE month_key = :month_key"), {"month_key": start}).rowcount or 0
     db.commit()
     return {
         "deleted_visits": deleted_visits,
         "deleted_supplies": deleted_supplies,
         "deleted_rates": deleted_rates,
         "deleted_monthly": deleted_monthly,
+        "deleted_point_adjustments": deleted_point_adjustments,
     }
 
 
