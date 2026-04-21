@@ -987,7 +987,8 @@ def calendar_page(
         boxes_map=boxes_map,
         visits=visits,
         is_submitted=monthly_submitted,
-        special_inventory_days=special_inventory_days
+        special_inventory_days = get_special_inventory_days(db)
+        special_inventory_days = {d[0] for d in special_inventory_days}
     )
 
     info_box = ""
