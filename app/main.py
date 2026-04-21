@@ -1,7 +1,7 @@
-
 import os
 import uuid
 import hashlib
+from datetime import date, datetime
 from io import BytesIO
 from html import escape
 from pathlib import Path
@@ -47,6 +47,10 @@ from app.services import (
     clear_merchants_by_tu,
     get_point_adjustment,
     upsert_point_adjustment,
+    add_special_inventory_day,
+    delete_special_inventory_day,
+    get_special_inventory_days,
+    is_inventory_allowed_date,
 )
 
 app = FastAPI()
@@ -890,11 +894,10 @@ def point_submit(
     return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}", status_code=303)
 
 
-def build_day_href(fio: str, point_code: str, y: int, m: int, day: int, is_submitted: bool) -> str:
+def build_day_href(fio: str, point_code: str, y: int, m: int, day: int, is_submitted: bool, inventory_allowed: bool) -> str:
     if is_submitted:
         return "#"
-    wd = weekday_of(y, m, day)
-    if wd in (4, 5):
+    if inventory_allowed:
         return f"/day-action-page?fio={escape(fio)}&point_code={escape(point_code)}&day={day}"
     return f"/toggle-day?fio={escape(fio)}&point_code={escape(point_code)}&day={day}"
 
@@ -906,7 +909,8 @@ def build_calendar_html(
     m: int,
     boxes_map: dict[int, int],
     visits: dict[int, set[str]],
-    is_submitted: bool
+    is_submitted: bool,
+    special_inventory_days: set[date]
 ) -> str:
     dim = days_in_month(y, m)
     first_wd = weekday_of(y, m, 1)
@@ -934,7 +938,9 @@ def build_calendar_html(
         if "FULL_INVENT" in day_visits:
             badges += '<span class="badge badge-inv">И</span>'
 
-        href = build_day_href(fio, point_code, y, m, day, is_submitted)
+        current_date = date(y, m, day)
+        inventory_allowed = current_date.weekday() in (4, 5) or current_date in special_inventory_days
+        href = build_day_href(fio, point_code, y, m, day, is_submitted, inventory_allowed)
         cls = "day day-disabled" if is_submitted else "day"
 
         html += f"""
@@ -980,7 +986,8 @@ def calendar_page(
         m=m,
         boxes_map=boxes_map,
         visits=visits,
-        is_submitted=monthly_submitted
+        is_submitted=monthly_submitted,
+        special_inventory_days=special_inventory_days
     )
 
     info_box = ""
@@ -1362,13 +1369,13 @@ def day_action_page(
     visits = get_visits_for_month(db, merchant["id"], point_code, y, m)
     day_visits = visits.get(day, set())
 
-    wd = weekday_of(y, m, day)
-    is_fri_or_sat = wd in (4, 5)
+    current_date = date(y, m, day)
+    inventory_allowed = is_inventory_allowed_date(db, current_date)
 
     day_btn_text = "Убрать выход" if "DAY" in day_visits else "Добавить выход"
     inv_btn_text = "Убрать полный инвент" if "FULL_INVENT" in day_visits else "Добавить полный инвент"
 
-    if not is_fri_or_sat:
+    if not inventory_allowed:
         return RedirectResponse(url=f"/toggle-day?fio={escape(fio)}&point_code={escape(point_code)}&day={day}", status_code=303)
 
     return f"""
@@ -1451,8 +1458,8 @@ def toggle_inventory(
         return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}", status_code=303)
 
     if 1 <= day <= days_in_month(y, m):
-        wd = weekday_of(y, m, day)
-        if wd in (4, 5):
+        current_date = date(y, m, day)
+        if is_inventory_allowed_date(db, current_date):
             toggle_inventory_visit(db, merchant["id"], point_code, y, m, day)
 
     return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}", status_code=303)
@@ -1785,6 +1792,19 @@ def admin_data_page(
     if error:
         info_box += f"<div class='error-box'>{escape(error)}</div>"
 
+    special_inventory_days = get_special_inventory_days(db)
+    if special_inventory_days:
+        rows = []
+        for inv_day in special_inventory_days:
+            rows.append(f"""<form method='post' action='/admin-delete-special-inventory-day' style='margin-top:10px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;'>
+                <input type='hidden' name='inv_date' value='{inv_day.isoformat()}' />
+                <div class='mini-pill'>{inv_day.strftime('%d.%m.%Y')}</div>
+                <button class='btn btn-danger btn-inline' type='submit'>Удалить</button>
+            </form>""")
+        special_inventory_html = ''.join(rows)
+    else:
+        special_inventory_html = "<div class='hint' style='margin-top:14px;'>Специальные даты пока не добавлены.</div>"
+
     return f"""
 <!DOCTYPE html>
 <html lang="ru">
@@ -1873,6 +1893,19 @@ def admin_data_page(
 
                         <button class="btn btn-danger" type="submit">Удалить мерчей этого ТУ</button>
                     </form>
+                </div>
+
+                <div class="detail-card">
+                    <div class="detail-title">Специальные даты для инвента</div>
+                    <form method="post" action="/admin-add-special-inventory-day">
+                        <label for="special_inventory_date">Дата</label>
+                        <input id="special_inventory_date" name="inv_date" type="date" required />
+                        <button class="btn" type="submit">Добавить дату</button>
+                    </form>
+
+                    <div class="hint" style="margin-top:14px;">Инвент будет доступен в пятницу, субботу и в датах из списка ниже.</div>
+
+                    {special_inventory_html}
                 </div>
             </div>
         </div>
@@ -1967,6 +2000,42 @@ def admin_clear_merchants(
     deleted = clear_merchants_by_tu(db, tu)
     msg = f"Удалено мерчей ТУ {tu}: {deleted}."
     return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
+
+
+@app.post("/admin-add-special-inventory-day")
+def admin_add_special_inventory_day(
+    inv_date: str = Form(...),
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db)
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+
+    try:
+        parsed_date = datetime.strptime(inv_date, "%Y-%m-%d").date()
+        add_special_inventory_day(db, parsed_date)
+        msg = f"Добавлена специальная дата для инвента: {parsed_date.strftime('%d.%m.%Y')}."
+        return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
+    except Exception as e:
+        return RedirectResponse(url=f"/admin-data?error={str(e)}", status_code=303)
+
+
+@app.post("/admin-delete-special-inventory-day")
+def admin_delete_special_inventory_day(
+    inv_date: str = Form(...),
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db)
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+
+    try:
+        parsed_date = datetime.strptime(inv_date, "%Y-%m-%d").date()
+        delete_special_inventory_day(db, parsed_date)
+        msg = f"Удалена специальная дата для инвента: {parsed_date.strftime('%d.%m.%Y')}."
+        return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
+    except Exception as e:
+        return RedirectResponse(url=f"/admin-data?error={str(e)}", status_code=303)
 
 
 @app.get("/admin-export-check")
@@ -2136,4 +2205,3 @@ def admin_export_overlaps(
 
     style_sheet(ws)
     return build_excel_response(wb, f"peresecheniya_{year}_{month:02d}.xlsx")
-
