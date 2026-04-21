@@ -146,6 +146,46 @@ def weekday_of(y: int, m: int, d: int) -> int:
     return date(y, m, d).weekday()
 
 
+def ensure_special_inventory_days_table(db: Session):
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS special_inventory_days (
+            id SERIAL PRIMARY KEY,
+            inv_date DATE UNIQUE NOT NULL
+        )
+    """))
+    db.commit()
+
+
+def add_special_inventory_day(db: Session, inv_date: date):
+    ensure_special_inventory_days_table(db)
+    db.execute(text("""
+        INSERT INTO special_inventory_days (inv_date)
+        VALUES (:inv_date)
+        ON CONFLICT (inv_date) DO NOTHING
+    """), {"inv_date": inv_date})
+    db.commit()
+
+
+def delete_special_inventory_day(db: Session, inv_date: date):
+    ensure_special_inventory_days_table(db)
+    db.execute(text("DELETE FROM special_inventory_days WHERE inv_date = :inv_date"), {"inv_date": inv_date})
+    db.commit()
+
+
+def get_special_inventory_days(db: Session) -> list[date]:
+    ensure_special_inventory_days_table(db)
+    rows = db.execute(text("SELECT inv_date FROM special_inventory_days ORDER BY inv_date")).all()
+    return [r[0] for r in rows if r and r[0]]
+
+
+def get_special_inventory_days_set(db: Session) -> set[date]:
+    return set(get_special_inventory_days(db))
+
+
+def is_inventory_allowed_date(db: Session, current_date: date) -> bool:
+    return current_date.weekday() in (4, 5) or current_date in get_special_inventory_days_set(db)
+
+
 def month_title(y: int, m: int) -> str:
     names = [
         "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
@@ -1082,3 +1122,4 @@ def clear_merchants_by_tu(db: Session, tu: str) -> int:
     deleted = db.execute(text("DELETE FROM merchants WHERE tu = :tu"), {"tu": tu}).rowcount or 0
     db.commit()
     return deleted
+
