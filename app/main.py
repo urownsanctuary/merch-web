@@ -1,3 +1,4 @@
+
 import os
 import uuid
 import hashlib
@@ -978,6 +979,7 @@ def calendar_page(
     visits = get_visits_for_month(db, merchant["id"], point_code, y, m)
     point_total = compute_point_total(db, merchant["id"], point_code, y, m)
     point_adj = get_point_adjustment(db, merchant["id"], point_code, y, m) or {}
+    special_inventory_days = set(get_special_inventory_days(db))
 
     calendar_html = build_calendar_html(
         fio=fio,
@@ -987,8 +989,7 @@ def calendar_page(
         boxes_map=boxes_map,
         visits=visits,
         is_submitted=monthly_submitted,
-        special_inventory_days = get_special_inventory_days(db)
-        special_inventory_days = {d[0] for d in special_inventory_days}
+        special_inventory_days=special_inventory_days
     )
 
     info_box = ""
