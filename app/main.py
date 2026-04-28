@@ -1,4 +1,3 @@
-
 import os
 import uuid
 import hashlib
@@ -1000,6 +999,12 @@ def calendar_page(
     if point_total["reimb_receipt"]:
         point_receipt_link = f"<div class='hint' style='margin-top:10px'>Чек по точке: <a href='/{point_total['reimb_receipt']}' target='_blank'>открыть файл</a></div>"
 
+    coffee_detail_card = ""
+    if point_total["coffee_enabled"]:
+        coffee_detail_card = f"""
+                {coffee_detail_card}
+        """
+
     point_form = ""
     if not monthly_submitted:
         point_form = f"""
@@ -1171,6 +1176,41 @@ async def save_point_adjustment(
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
 
+    point_code_normalized = normalize_point_code(point_code)
+    safe_reimb_amount = max(0, int(reimb_amount or 0))
+    existing_adjustment = get_point_adjustment(
+        db,
+        merchant["id"],
+        point_code_normalized,
+        period["year"],
+        period["month"],
+    ) or {}
+    existing_receipt = existing_adjustment.get("reimb_receipt")
+    new_receipt_attached = bool(reimb_receipt and reimb_receipt.filename)
+
+    if safe_reimb_amount > 0 and not new_receipt_attached and not existing_receipt:
+        return HTMLResponse(f"""
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Нужен чек</title>
+    {base_css()}
+</head>
+<body>
+    <div class="page">
+        <div class="card">
+            <div class="brand">ВкусВилл</div>
+            <h1>Нужен чек</h1>
+            <div class="error-box">При указании возмещения необходимо прикрепить чек.</div>
+            <a class="back" href="/calendar-page?fio={escape(fio)}&point_code={escape(point_code_normalized)}">← Вернуться к точке</a>
+        </div>
+    </div>
+</body>
+</html>
+""", status_code=400)
+
     receipt_path = None
     if reimb_receipt and reimb_receipt.filename:
         ext = Path(reimb_receipt.filename).suffix.lower()
@@ -1183,18 +1223,18 @@ async def save_point_adjustment(
     upsert_point_adjustment(
         db=db,
         merchant_id=merchant["id"],
-        point_code=normalize_point_code(point_code),
+        point_code=point_code_normalized,
         y=period["year"],
         m=period["month"],
         note_amount=max(0, int(note_amount or 0)),
         note_comment=note_comment or "",
-        reimb_amount=max(0, int(reimb_amount or 0)),
+        reimb_amount=safe_reimb_amount,
         reimb_comment=reimb_comment or "",
         reimb_receipt=receipt_path,
     )
 
     return RedirectResponse(
-        url=f"/calendar-page?fio={escape(fio)}&point_code={escape(normalize_point_code(point_code))}&saved=1",
+        url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code_normalized)}&saved=1",
         status_code=303
     )
 
@@ -1227,6 +1267,9 @@ def monthly_submit_page(
     points_html = ""
     if overall["per_point_details"]:
         for point_code, d in overall["per_point_details"].items():
+            coffee_line = ""
+            if d["coffee_enabled"]:
+                coffee_line = f'<div>Кофемашина: {d["coffee_cnt"]} × {d["coffee_rate"]} ₽ = {d["coffee_sum"]} ₽</div>'
             points_html += f"""
             <details class="point-detail">
                 <summary>{escape(point_code)} — {d["total"]} ₽</summary>
@@ -1234,7 +1277,7 @@ def monthly_submit_page(
                     <div>С поставкой: {d["cnt_supply"]} × {d["rate_supply"]} ₽ = {d["sum_supply"]} ₽</div>
                     <div>Без поставки: {d["cnt_no_supply"]} × {d["rate_no_supply"]} ₽ = {d["sum_no_supply"]} ₽</div>
                     <div>Полный инвент: {d["cnt_full_inv"]} × {d["rate_inventory"]} ₽ = {d["sum_inventory"]} ₽</div>
-                    <div>Кофемашина: {d["coffee_cnt"]} × {d["coffee_rate"]} ₽ = {d["coffee_sum"]} ₽</div>
+                    {coffee_line}
                     <div>Примечание по точке: {d["note_amount"]} ₽ — {escape(d["note_comment"]) if d["note_comment"] else "—"}</div>
                     <div>Возмещение по точке: {d["reimb_amount"]} ₽ — {escape(d["reimb_comment"]) if d["reimb_comment"] else "—"}</div>
                     <div>Чек по возмещению: {f"<a href='/{d['reimb_receipt']}' target='_blank'>открыть</a>" if d["reimb_receipt"] else "—"}</div>
@@ -1479,6 +1522,9 @@ def summary_page(fio: str = "", db: Session = Depends(get_db)):
     details_html = ""
     if overall["per_point_details"]:
         for point_code, d in overall["per_point_details"].items():
+            coffee_line = ""
+            if d["coffee_enabled"]:
+                coffee_line = f'<div>Кофемашина: {d["coffee_cnt"]} × {d["coffee_rate"]} ₽ = {d["coffee_sum"]} ₽</div>'
             details_html += f"""
             <details class="point-detail">
                 <summary>{escape(point_code)} — {d["total"]} ₽</summary>
@@ -1486,7 +1532,7 @@ def summary_page(fio: str = "", db: Session = Depends(get_db)):
                     <div>С поставкой: {d["cnt_supply"]} × {d["rate_supply"]} ₽ = {d["sum_supply"]} ₽</div>
                     <div>Без поставки: {d["cnt_no_supply"]} × {d["rate_no_supply"]} ₽ = {d["sum_no_supply"]} ₽</div>
                     <div>Полный инвент: {d["cnt_full_inv"]} × {d["rate_inventory"]} ₽ = {d["sum_inventory"]} ₽</div>
-                    <div>Кофемашина: {d["coffee_cnt"]} × {d["coffee_rate"]} ₽ = {d["coffee_sum"]} ₽</div>
+                    {coffee_line}
                     <div><strong>Итого по точке: {d["total"]} ₽</strong></div>
                 </div>
             </details>
@@ -2105,7 +2151,7 @@ def admin_export_check(
             r["note_comment"],
             r["reimb_amount"],
             r["reimb_comment"],
-            r["reimb_receipt"] or "",
+            f"/{r['reimb_receipt']}" if r["reimb_receipt"] else "",
             r["status"],
             r["comment"],
             r["point_total"]
@@ -2207,3 +2253,4 @@ def admin_export_overlaps(
 
     style_sheet(ws)
     return build_excel_response(wb, f"peresecheniya_{year}_{month:02d}.xlsx")
+
