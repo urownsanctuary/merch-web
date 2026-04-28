@@ -682,12 +682,6 @@ def login_api(fio: str, last4: str, db: Session = Depends(get_db)):
 @app.get("/login-page", response_class=HTMLResponse)
 def login_page():
     period = get_active_period()
-    coffee_card = ""
-    if point_total["coffee_enabled"]:
-        coffee_card = f"""
-                {coffee_card}
-        """
-
     return f"""
 <!DOCTYPE html>
 <html lang="ru">
@@ -1005,10 +999,15 @@ def calendar_page(
     if point_total["reimb_receipt"]:
         point_receipt_link = f"<div class='hint' style='margin-top:10px'>Чек по точке: <a href='/{point_total['reimb_receipt']}' target='_blank'>открыть файл</a></div>"
 
+    coffee_pill = ""
     coffee_detail_card = ""
     if point_total["coffee_enabled"]:
+        coffee_pill = '<div class="mini-pill">КМ: Да</div>'
         coffee_detail_card = f"""
-                {coffee_detail_card}
+                <div class="detail-card">
+                    <div class="detail-title">Кофемашина</div>
+                    <div class="detail-line">{point_total["coffee_cnt"]} × {point_total["coffee_rate"]} ₽ = {point_total["coffee_sum"]} ₽</div>
+                </div>
         """
 
     point_form = ""
@@ -1076,7 +1075,7 @@ def calendar_page(
                 <div class="calendar-meta">
                     <div class="mini-pill">Точка: {escape(point_code)}</div>
                     <div class="mini-pill">{escape(fio)}</div>
-                    <div class="mini-pill">КМ: {"Да" if point_total["coffee_enabled"] else "Нет"}</div>
+                    {coffee_pill}
                     <div class="mini-pill">Месячная сверка: {"Отправлена" if monthly_submitted else "Черновик"}</div>
                 </div>
             </div>
@@ -1111,10 +1110,7 @@ def calendar_page(
                     <div class="detail-line">{point_total["cnt_full_inv"]} × {point_total["rate_inventory"]} ₽ = {point_total["sum_inventory"]} ₽</div>
                 </div>
 
-                <div class="detail-card">
-                    <div class="detail-title">Кофемашина</div>
-                    <div class="detail-line">{point_total["coffee_cnt"]} × {point_total["coffee_rate"]} ₽ = {point_total["coffee_sum"]} ₽</div>
-                </div>
+                {coffee_detail_card}
             </div>
 
             <div class="details-grid">
@@ -1182,40 +1178,33 @@ async def save_point_adjustment(
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
 
-    point_code_normalized = normalize_point_code(point_code)
-    safe_reimb_amount = max(0, int(reimb_amount or 0))
-    existing_adjustment = get_point_adjustment(
-        db,
-        merchant["id"],
-        point_code_normalized,
-        period["year"],
-        period["month"],
-    ) or {}
-    existing_receipt = existing_adjustment.get("reimb_receipt")
-    new_receipt_attached = bool(reimb_receipt and reimb_receipt.filename)
+    point_code_clean = normalize_point_code(point_code)
+    reimb_amount_value = max(0, int(reimb_amount or 0))
+    existing_adjustment = get_point_adjustment(db, merchant["id"], point_code_clean, period["year"], period["month"]) or {}
+    has_existing_receipt = bool(existing_adjustment.get("reimb_receipt"))
+    has_new_receipt = bool(reimb_receipt and reimb_receipt.filename)
 
-    if safe_reimb_amount > 0 and not new_receipt_attached and not existing_receipt:
+    if reimb_amount_value > 0 and not has_existing_receipt and not has_new_receipt:
         return HTMLResponse(f"""
 <!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Нужен чек</title>
+    <title>Ошибка</title>
     {base_css()}
 </head>
 <body>
     <div class="page">
         <div class="card">
-            <div class="brand">ВкусВилл</div>
-            <h1>Нужен чек</h1>
+            <h1>Ошибка</h1>
             <div class="error-box">При указании возмещения необходимо прикрепить чек.</div>
-            <a class="back" href="/calendar-page?fio={escape(fio)}&point_code={escape(point_code_normalized)}">← Вернуться к точке</a>
+            <a class="back" href="/calendar-page?fio={escape(fio)}&point_code={escape(point_code_clean)}">← Вернуться к точке</a>
         </div>
     </div>
 </body>
 </html>
-""", status_code=400)
+        """, status_code=400)
 
     receipt_path = None
     if reimb_receipt and reimb_receipt.filename:
@@ -1229,18 +1218,18 @@ async def save_point_adjustment(
     upsert_point_adjustment(
         db=db,
         merchant_id=merchant["id"],
-        point_code=point_code_normalized,
+        point_code=point_code_clean,
         y=period["year"],
         m=period["month"],
         note_amount=max(0, int(note_amount or 0)),
         note_comment=note_comment or "",
-        reimb_amount=safe_reimb_amount,
+        reimb_amount=reimb_amount_value,
         reimb_comment=reimb_comment or "",
         reimb_receipt=receipt_path,
     )
 
     return RedirectResponse(
-        url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code_normalized)}&saved=1",
+        url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code_clean)}&saved=1",
         status_code=303
     )
 
@@ -1273,9 +1262,6 @@ def monthly_submit_page(
     points_html = ""
     if overall["per_point_details"]:
         for point_code, d in overall["per_point_details"].items():
-            coffee_line = ""
-            if d["coffee_enabled"]:
-                coffee_line = f'<div>Кофемашина: {d["coffee_cnt"]} × {d["coffee_rate"]} ₽ = {d["coffee_sum"]} ₽</div>'
             points_html += f"""
             <details class="point-detail">
                 <summary>{escape(point_code)} — {d["total"]} ₽</summary>
@@ -1283,7 +1269,7 @@ def monthly_submit_page(
                     <div>С поставкой: {d["cnt_supply"]} × {d["rate_supply"]} ₽ = {d["sum_supply"]} ₽</div>
                     <div>Без поставки: {d["cnt_no_supply"]} × {d["rate_no_supply"]} ₽ = {d["sum_no_supply"]} ₽</div>
                     <div>Полный инвент: {d["cnt_full_inv"]} × {d["rate_inventory"]} ₽ = {d["sum_inventory"]} ₽</div>
-                    {coffee_line}
+                    {f'<div>Кофемашина: {d["coffee_cnt"]} × {d["coffee_rate"]} ₽ = {d["coffee_sum"]} ₽</div>' if d["coffee_enabled"] else ''}
                     <div>Примечание по точке: {d["note_amount"]} ₽ — {escape(d["note_comment"]) if d["note_comment"] else "—"}</div>
                     <div>Возмещение по точке: {d["reimb_amount"]} ₽ — {escape(d["reimb_comment"]) if d["reimb_comment"] else "—"}</div>
                     <div>Чек по возмещению: {f"<a href='/{d['reimb_receipt']}' target='_blank'>открыть</a>" if d["reimb_receipt"] else "—"}</div>
@@ -1528,9 +1514,6 @@ def summary_page(fio: str = "", db: Session = Depends(get_db)):
     details_html = ""
     if overall["per_point_details"]:
         for point_code, d in overall["per_point_details"].items():
-            coffee_line = ""
-            if d["coffee_enabled"]:
-                coffee_line = f'<div>Кофемашина: {d["coffee_cnt"]} × {d["coffee_rate"]} ₽ = {d["coffee_sum"]} ₽</div>'
             details_html += f"""
             <details class="point-detail">
                 <summary>{escape(point_code)} — {d["total"]} ₽</summary>
@@ -1538,7 +1521,7 @@ def summary_page(fio: str = "", db: Session = Depends(get_db)):
                     <div>С поставкой: {d["cnt_supply"]} × {d["rate_supply"]} ₽ = {d["sum_supply"]} ₽</div>
                     <div>Без поставки: {d["cnt_no_supply"]} × {d["rate_no_supply"]} ₽ = {d["sum_no_supply"]} ₽</div>
                     <div>Полный инвент: {d["cnt_full_inv"]} × {d["rate_inventory"]} ₽ = {d["sum_inventory"]} ₽</div>
-                    {coffee_line}
+                    {f'<div>Кофемашина: {d["coffee_cnt"]} × {d["coffee_rate"]} ₽ = {d["coffee_sum"]} ₽</div>' if d["coffee_enabled"] else ''}
                     <div><strong>Итого по точке: {d["total"]} ₽</strong></div>
                 </div>
             </details>
@@ -2157,7 +2140,7 @@ def admin_export_check(
             r["note_comment"],
             r["reimb_amount"],
             r["reimb_comment"],
-            f"/{r['reimb_receipt']}" if r["reimb_receipt"] else "",
+            r["reimb_receipt"] or "",
             r["status"],
             r["comment"],
             r["point_total"]
