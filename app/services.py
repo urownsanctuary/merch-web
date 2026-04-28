@@ -621,7 +621,6 @@ def upsert_point_adjustment(
 
     db.commit()
 
-
 def compute_point_total(db: Session, merchant_id: int, point_code: str, y: int, m: int):
     ensure_point_adjustments_table(db)
     boxes_map = get_supply_boxes_map(db, point_code, y, m)
