@@ -1,3 +1,4 @@
+
 import os
 import uuid
 import hashlib
@@ -2108,6 +2109,7 @@ def admin_export_check(
         "Выходы с поставкой (сумма)",
         "Выходы без поставки (кол-во)",
         "Выходы без поставки (сумма)",
+        "Выходов всего",
         "Полные инвенты (кол-во)",
         "Полные инвенты (сумма)",
         "Кофемашина (кол-во)",
@@ -2132,6 +2134,7 @@ def admin_export_check(
             r["sum_supply"],
             r["cnt_no_supply"],
             r["sum_no_supply"],
+            r["cnt_supply"] + r["cnt_no_supply"],
             r["cnt_full_inv"],
             r["sum_inventory"],
             r["coffee_cnt"],
