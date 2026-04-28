@@ -682,6 +682,12 @@ def login_api(fio: str, last4: str, db: Session = Depends(get_db)):
 @app.get("/login-page", response_class=HTMLResponse)
 def login_page():
     period = get_active_period()
+    coffee_card = ""
+    if point_total["coffee_enabled"]:
+        coffee_card = f"""
+                {coffee_card}
+        """
+
     return f"""
 <!DOCTYPE html>
 <html lang="ru">
