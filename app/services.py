@@ -578,48 +578,27 @@ def upsert_point_adjustment(
     existing = get_point_adjustment(db, merchant_id, point_code, y, m)
 
     if existing:
-        if reimb_receipt:
-            db.execute(text("""
-                UPDATE point_adjustments
-                SET note_amount = :note_amount,
-                    note_comment = :note_comment,
-                    reimb_amount = :reimb_amount,
-                    reimb_comment = :reimb_comment,
-                    reimb_receipt = :reimb_receipt,
-                    updated_at = NOW()
-                WHERE merchant_id = :merchant_id
-                  AND point_code = :point_code
-                  AND month_key = :month_key
-            """), {
-                "merchant_id": merchant_id,
-                "point_code": point_code,
-                "month_key": mk,
-                "note_amount": note_amount,
-                "note_comment": note_comment,
-                "reimb_amount": reimb_amount,
-                "reimb_comment": reimb_comment,
-                "reimb_receipt": reimb_receipt,
-            })
-        else:
-            db.execute(text("""
-                UPDATE point_adjustments
-                SET note_amount = :note_amount,
-                    note_comment = :note_comment,
-                    reimb_amount = :reimb_amount,
-                    reimb_comment = :reimb_comment,
-                    updated_at = NOW()
-                WHERE merchant_id = :merchant_id
-                  AND point_code = :point_code
-                  AND month_key = :month_key
-            """), {
-                "merchant_id": merchant_id,
-                "point_code": point_code,
-                "month_key": mk,
-                "note_amount": note_amount,
-                "note_comment": note_comment,
-                "reimb_amount": reimb_amount,
-                "reimb_comment": reimb_comment,
-            })
+        db.execute(text("""
+            UPDATE point_adjustments
+            SET note_amount = :note_amount,
+                note_comment = :note_comment,
+                reimb_amount = :reimb_amount,
+                reimb_comment = :reimb_comment,
+                reimb_receipt = COALESCE(:reimb_receipt, reimb_receipt),
+                updated_at = NOW()
+            WHERE merchant_id = :merchant_id
+              AND point_code = :point_code
+              AND month_key = :month_key
+        """), {
+            "merchant_id": merchant_id,
+            "point_code": point_code,
+            "month_key": mk,
+            "note_amount": note_amount,
+            "note_comment": note_comment,
+            "reimb_amount": reimb_amount,
+            "reimb_comment": reimb_comment,
+            "reimb_receipt": reimb_receipt,
+        })
     else:
         db.execute(text("""
             INSERT INTO point_adjustments (
@@ -1122,4 +1101,5 @@ def clear_merchants_by_tu(db: Session, tu: str) -> int:
     deleted = db.execute(text("DELETE FROM merchants WHERE tu = :tu"), {"tu": tu}).rowcount or 0
     db.commit()
     return deleted
+
 
