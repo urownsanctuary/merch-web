@@ -578,27 +578,48 @@ def upsert_point_adjustment(
     existing = get_point_adjustment(db, merchant_id, point_code, y, m)
 
     if existing:
-        db.execute(text("""
-            UPDATE point_adjustments
-            SET note_amount = :note_amount,
-                note_comment = :note_comment,
-                reimb_amount = :reimb_amount,
-                reimb_comment = :reimb_comment,
-                reimb_receipt = COALESCE(:reimb_receipt, reimb_receipt),
-                updated_at = NOW()
-            WHERE merchant_id = :merchant_id
-              AND point_code = :point_code
-              AND month_key = :month_key
-        """), {
-            "merchant_id": merchant_id,
-            "point_code": point_code,
-            "month_key": mk,
-            "note_amount": note_amount,
-            "note_comment": note_comment,
-            "reimb_amount": reimb_amount,
-            "reimb_comment": reimb_comment,
-            "reimb_receipt": reimb_receipt,
-        })
+        if reimb_receipt:
+            db.execute(text("""
+                UPDATE point_adjustments
+                SET note_amount = :note_amount,
+                    note_comment = :note_comment,
+                    reimb_amount = :reimb_amount,
+                    reimb_comment = :reimb_comment,
+                    reimb_receipt = :reimb_receipt,
+                    updated_at = NOW()
+                WHERE merchant_id = :merchant_id
+                  AND point_code = :point_code
+                  AND month_key = :month_key
+            """), {
+                "merchant_id": merchant_id,
+                "point_code": point_code,
+                "month_key": mk,
+                "note_amount": note_amount,
+                "note_comment": note_comment,
+                "reimb_amount": reimb_amount,
+                "reimb_comment": reimb_comment,
+                "reimb_receipt": reimb_receipt,
+            })
+        else:
+            db.execute(text("""
+                UPDATE point_adjustments
+                SET note_amount = :note_amount,
+                    note_comment = :note_comment,
+                    reimb_amount = :reimb_amount,
+                    reimb_comment = :reimb_comment,
+                    updated_at = NOW()
+                WHERE merchant_id = :merchant_id
+                  AND point_code = :point_code
+                  AND month_key = :month_key
+            """), {
+                "merchant_id": merchant_id,
+                "point_code": point_code,
+                "month_key": mk,
+                "note_amount": note_amount,
+                "note_comment": note_comment,
+                "reimb_amount": reimb_amount,
+                "reimb_comment": reimb_comment,
+            })
     else:
         db.execute(text("""
             INSERT INTO point_adjustments (
@@ -620,6 +641,7 @@ def upsert_point_adjustment(
         })
 
     db.commit()
+
 
 def compute_point_total(db: Session, merchant_id: int, point_code: str, y: int, m: int):
     ensure_point_adjustments_table(db)
@@ -921,24 +943,41 @@ def upsert_supply_row(db: Session, point_code: str, supply_date: date, boxes: in
 
 
 def import_supplies_xlsx(db: Session, file_obj) -> dict:
-    wb = load_workbook(file_obj, data_only=True)
-    ws = wb[wb.sheetnames[0]]
-    headers = [cell.value for cell in ws[1]]
-    date_columns = []
-    loaded_rows = 0
-    loaded_points = set()
+    """
+    Быстрый импорт поставок.
 
+    Поддерживает файл, где:
+    - колонка A — код точки
+    - первая строка — даты или дни месяца вида 01.а / 02.а / 30.а
+    - в ячейках — количество коробок
+
+    Важно: здесь нет DELETE/INSERT по каждой ячейке.
+    Сначала файл читается в память, затем старые поставки за нужные точки/даты удаляются пачкой,
+    после этого новые поставки вставляются пачкой. Это сильно ускоряет загрузку и снижает риск таймаута.
+    """
     active = get_active_period()
     report_year = active["year"]
     report_month = active["month"]
 
-    for idx, value in enumerate(headers[1:], start=2):
+    wb = load_workbook(file_obj, data_only=True, read_only=True)
+    ws = wb[wb.sheetnames[0]]
+
+    rows_iter = ws.iter_rows(values_only=True)
+    try:
+        headers = next(rows_iter)
+    except StopIteration:
+        return {"loaded_rows": 0, "loaded_points": 0}
+
+    date_columns: list[tuple[int, date]] = []
+
+    for idx, value in enumerate(headers[1:], start=1):
         if value is None:
             continue
 
         if isinstance(value, datetime):
             date_columns.append((idx, value.date()))
             continue
+
         if isinstance(value, date):
             date_columns.append((idx, value))
             continue
@@ -956,26 +995,90 @@ def import_supplies_xlsx(db: Session, file_obj) -> dict:
 
         date_columns.append((idx, supply_date))
 
-    for row_idx in range(2, ws.max_row + 1):
-        point_code = normalize_point_code(ws.cell(row=row_idx, column=1).value)
+    if not date_columns:
+        return {"loaded_rows": 0, "loaded_points": 0}
+
+    insert_rows = []
+    loaded_points = set()
+    upload_dates = {d for _, d in date_columns}
+
+    for row in rows_iter:
+        if not row:
+            continue
+
+        point_code = normalize_point_code(row[0] if len(row) > 0 else None)
         if not point_code:
             continue
-        loaded_points.add(point_code)
+
+        point_has_values = False
 
         for col_idx, supply_date in date_columns:
-            raw_boxes = ws.cell(row=row_idx, column=col_idx).value
+            raw_boxes = row[col_idx] if col_idx < len(row) else None
             if raw_boxes in (None, ""):
                 continue
+
             try:
                 boxes = int(float(raw_boxes))
             except Exception:
                 continue
 
-            upsert_supply_row(db, point_code, supply_date, boxes)
-            loaded_rows += 1
+            insert_rows.append({
+                "point_code": point_code,
+                "supply_date": supply_date,
+                "boxes": boxes,
+                "has_supply": True,
+            })
+            point_has_values = True
+
+        if point_has_values:
+            loaded_points.add(point_code)
+
+    if not insert_rows:
+        db.commit()
+        return {"loaded_rows": 0, "loaded_points": 0}
+
+    columns = [row[0] for row in db.execute(text("""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'supplies'
+        ORDER BY ordinal_position
+    """)).fetchall()]
+    has_supply_column = "has_supply" in columns
+
+    # Удаляем старые поставки только по тем точкам и датам, которые есть в загружаемом файле.
+    # Удаление идет по точкам, чтобы не упереться в ограничения большого IN-списка.
+    for point_code in loaded_points:
+        db.execute(text("""
+            DELETE FROM supplies
+            WHERE point_code = :point_code
+              AND supply_date >= :start_date
+              AND supply_date <= :end_date
+        """), {
+            "point_code": point_code,
+            "start_date": min(upload_dates),
+            "end_date": max(upload_dates),
+        })
+
+    if has_supply_column:
+        db.execute(text("""
+            INSERT INTO supplies (point_code, supply_date, boxes, has_supply)
+            VALUES (:point_code, :supply_date, :boxes, :has_supply)
+        """), insert_rows)
+    else:
+        db.execute(text("""
+            INSERT INTO supplies (point_code, supply_date, boxes)
+            VALUES (:point_code, :supply_date, :boxes)
+        """), [
+            {
+                "point_code": row["point_code"],
+                "supply_date": row["supply_date"],
+                "boxes": row["boxes"],
+            }
+            for row in insert_rows
+        ])
 
     db.commit()
-    return {"loaded_rows": loaded_rows, "loaded_points": len(loaded_points)}
+    return {"loaded_rows": len(insert_rows), "loaded_points": len(loaded_points)}
 
 
 def upsert_rate_row(db: Session, point_code: str, month_key: date, rate_supply: int, rate_no_supply: int, rate_inventory: int, coffee_enabled: bool, coffee_rate: int, pay_lt5: bool):
