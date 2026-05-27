@@ -1216,4 +1216,3 @@ def clear_merchants_by_tu(db: Session, tu: str) -> int:
     deleted = db.execute(text("DELETE FROM merchants WHERE tu = :tu"), {"tu": tu}).rowcount or 0
     db.commit()
     return deleted
-
