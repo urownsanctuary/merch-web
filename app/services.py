@@ -241,6 +241,32 @@ def get_supply_boxes_map(db: Session, point_code: str, y: int, m: int) -> dict[i
     return result
 
 
+
+def get_supply_days_for_point(db: Session, point_code: str, y: int, m: int) -> list[date]:
+    start = month_start(y, m)
+    end = month_end_exclusive(y, m)
+    rows = db.execute(text("""
+        SELECT supply_date
+        FROM supplies
+        WHERE point_code = :point_code
+          AND supply_date >= :start_date
+          AND supply_date < :end_date
+          AND COALESCE(boxes, 0) > 0
+        ORDER BY supply_date
+    """), {
+        "point_code": point_code,
+        "start_date": start,
+        "end_date": end,
+    }).all()
+    return [r[0] for r in rows if r and r[0]]
+
+
+def get_supply_adjustment_amount(db: Session, point_code: str, y: int, m: int) -> int:
+    rates = get_point_rates(db, point_code, y, m)
+    diff = int(rates["rate_supply"] or 0) - int(rates["rate_no_supply"] or 0)
+    return -max(0, diff)
+
+
 def get_visits_for_month(db: Session, merchant_id: int, point_code: str, y: int, m: int) -> dict[int, set[str]]:
     start = month_start(y, m)
     end = month_end_exclusive(y, m)
@@ -578,48 +604,27 @@ def upsert_point_adjustment(
     existing = get_point_adjustment(db, merchant_id, point_code, y, m)
 
     if existing:
-        if reimb_receipt:
-            db.execute(text("""
-                UPDATE point_adjustments
-                SET note_amount = :note_amount,
-                    note_comment = :note_comment,
-                    reimb_amount = :reimb_amount,
-                    reimb_comment = :reimb_comment,
-                    reimb_receipt = :reimb_receipt,
-                    updated_at = NOW()
-                WHERE merchant_id = :merchant_id
-                  AND point_code = :point_code
-                  AND month_key = :month_key
-            """), {
-                "merchant_id": merchant_id,
-                "point_code": point_code,
-                "month_key": mk,
-                "note_amount": note_amount,
-                "note_comment": note_comment,
-                "reimb_amount": reimb_amount,
-                "reimb_comment": reimb_comment,
-                "reimb_receipt": reimb_receipt,
-            })
-        else:
-            db.execute(text("""
-                UPDATE point_adjustments
-                SET note_amount = :note_amount,
-                    note_comment = :note_comment,
-                    reimb_amount = :reimb_amount,
-                    reimb_comment = :reimb_comment,
-                    updated_at = NOW()
-                WHERE merchant_id = :merchant_id
-                  AND point_code = :point_code
-                  AND month_key = :month_key
-            """), {
-                "merchant_id": merchant_id,
-                "point_code": point_code,
-                "month_key": mk,
-                "note_amount": note_amount,
-                "note_comment": note_comment,
-                "reimb_amount": reimb_amount,
-                "reimb_comment": reimb_comment,
-            })
+        db.execute(text("""
+            UPDATE point_adjustments
+            SET note_amount = :note_amount,
+                note_comment = :note_comment,
+                reimb_amount = :reimb_amount,
+                reimb_comment = :reimb_comment,
+                reimb_receipt = COALESCE(:reimb_receipt, reimb_receipt),
+                updated_at = NOW()
+            WHERE merchant_id = :merchant_id
+              AND point_code = :point_code
+              AND month_key = :month_key
+        """), {
+            "merchant_id": merchant_id,
+            "point_code": point_code,
+            "month_key": mk,
+            "note_amount": note_amount,
+            "note_comment": note_comment,
+            "reimb_amount": reimb_amount,
+            "reimb_comment": reimb_comment,
+            "reimb_receipt": reimb_receipt,
+        })
     else:
         db.execute(text("""
             INSERT INTO point_adjustments (
@@ -641,7 +646,6 @@ def upsert_point_adjustment(
         })
 
     db.commit()
-
 
 def compute_point_total(db: Session, merchant_id: int, point_code: str, y: int, m: int):
     ensure_point_adjustments_table(db)
@@ -770,38 +774,138 @@ def get_all_tu_values(db: Session) -> list[str]:
 
 
 def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, status: str | None = None):
+    """Fast admin report builder: one grouped SQL query instead of per-row recalculation."""
     ensure_monthly_submissions_table(db)
+    ensure_point_adjustments_table(db)
     start = month_start(y, m)
     end = month_end_exclusive(y, m)
-    sql = """
-        SELECT DISTINCT v.merchant_id, v.point_code, m.fio, m.tu
+
+    params = {
+        "start_date": start,
+        "end_date": end,
+        "month_key": start,
+        "slot_day": SLOT_DAY,
+        "slot_full_invent": SLOT_FULL_INVENT,
+        "default_rate_supply": DEFAULT_RATE_SUPPLY,
+        "default_rate_no_supply": DEFAULT_RATE_NO_SUPPLY,
+        "default_rate_inventory": DEFAULT_RATE_INVENTORY,
+        "default_rate_coffee": DEFAULT_RATE_COFFEE,
+    }
+
+    tu_sql = ""
+    if tu:
+        tu_sql = " AND m.tu = :tu"
+        params["tu"] = tu
+
+    sql = f"""
+        WITH overlap_rows AS (
+            SELECT DISTINCT v1.merchant_id, v1.point_code
+            FROM visits v1
+            JOIN visits v2
+              ON v1.visit_date = v2.visit_date
+             AND v1.point_code = v2.point_code
+             AND v1.slot = v2.slot
+             AND v1.merchant_id <> v2.merchant_id
+            WHERE v1.visit_date >= :start_date
+              AND v1.visit_date < :end_date
+        )
+        SELECT
+            v.merchant_id,
+            v.point_code,
+            m.fio,
+            COALESCE(m.tu, '') AS tu,
+            COALESCE(ms.status, 'не отправлено') AS status,
+            COALESCE(ms.comment, '') AS monthly_comment,
+            COALESCE(ms.extra_amount, 0) AS monthly_extra_amount,
+            ms.receipt_path AS monthly_receipt_path,
+
+            COALESCE(pr.rate_supply, :default_rate_supply) AS rate_supply,
+            COALESCE(pr.rate_no_supply, :default_rate_no_supply) AS rate_no_supply,
+            COALESCE(pr.rate_inventory, :default_rate_inventory) AS rate_inventory,
+            COALESCE(pr.coffee_enabled, FALSE) AS coffee_enabled,
+            COALESCE(pr.coffee_rate, :default_rate_coffee) AS coffee_rate,
+            COALESCE(pr.pay_lt5, FALSE) AS pay_lt5,
+
+            COALESCE(pa.note_amount, 0) AS note_amount,
+            COALESCE(pa.note_comment, '') AS note_comment,
+            COALESCE(pa.reimb_amount, 0) AS reimb_amount,
+            COALESCE(pa.reimb_comment, '') AS reimb_comment,
+            pa.reimb_receipt AS reimb_receipt,
+            CASE WHEN ov.merchant_id IS NULL THEN FALSE ELSE TRUE END AS has_overlap,
+
+            SUM(CASE
+                WHEN v.slot = :slot_day
+                 AND COALESCE(s.boxes, 0) > 0
+                 AND (COALESCE(pr.pay_lt5, FALSE) = TRUE OR COALESCE(s.boxes, 0) >= 5)
+                THEN 1 ELSE 0 END) AS cnt_supply,
+
+            SUM(CASE
+                WHEN v.slot = :slot_day
+                 AND NOT (
+                    COALESCE(s.boxes, 0) > 0
+                    AND (COALESCE(pr.pay_lt5, FALSE) = TRUE OR COALESCE(s.boxes, 0) >= 5)
+                 )
+                THEN 1 ELSE 0 END) AS cnt_no_supply,
+
+            SUM(CASE WHEN v.slot = :slot_full_invent THEN 1 ELSE 0 END) AS cnt_full_inv,
+            SUM(CASE WHEN v.slot = :slot_day THEN 1 ELSE 0 END) AS cnt_day_total
         FROM visits v
         JOIN merchants m ON m.id = v.merchant_id
+        LEFT JOIN supplies s
+          ON s.point_code = v.point_code
+         AND s.supply_date = v.visit_date
+        LEFT JOIN point_rates pr
+          ON pr.point_code = v.point_code
+         AND pr.month_key = :month_key
+        LEFT JOIN point_adjustments pa
+          ON pa.merchant_id = v.merchant_id
+         AND pa.point_code = v.point_code
+         AND pa.month_key = :month_key
+        LEFT JOIN monthly_submissions ms
+          ON ms.merchant_id = v.merchant_id
+         AND ms.month_key = :month_key
+        LEFT JOIN overlap_rows ov
+          ON ov.merchant_id = v.merchant_id
+         AND ov.point_code = v.point_code
         WHERE v.visit_date >= :start_date
           AND v.visit_date < :end_date
+          {tu_sql}
+        GROUP BY
+            v.merchant_id, v.point_code, m.fio, m.tu,
+            ms.status, ms.comment, ms.extra_amount, ms.receipt_path,
+            pr.rate_supply, pr.rate_no_supply, pr.rate_inventory,
+            pr.coffee_enabled, pr.coffee_rate, pr.pay_lt5,
+            pa.note_amount, pa.note_comment, pa.reimb_amount, pa.reimb_comment, pa.reimb_receipt,
+            ov.merchant_id
+        ORDER BY m.tu NULLS LAST, m.fio, v.point_code
     """
-    params = {"start_date": start, "end_date": end}
-    if tu:
-        sql += " AND m.tu = :tu"
-        params["tu"] = tu
-    sql += " ORDER BY m.tu NULLS LAST, m.fio, v.point_code"
-    rows = db.execute(text(sql), params).mappings().all()
 
+    rows = db.execute(text(sql), params).mappings().all()
     result = []
     for row in rows:
-        detail = compute_point_total(db, row["merchant_id"], row["point_code"], y, m)
-        monthly = get_monthly_submission(db, row["merchant_id"], y, m)
-        status_value = "не отправлено"
-        monthly_comment = ""
-        monthly_extra_amount = 0
-        monthly_receipt_path = None
-        if monthly:
-            status_value = monthly.get("status") or "draft"
-            monthly_comment = monthly.get("comment") or ""
-            monthly_extra_amount = int(monthly.get("extra_amount") or 0)
-            monthly_receipt_path = monthly.get("receipt_path")
+        status_value = row["status"] or "не отправлено"
         if status and status_value != status:
             continue
+
+        cnt_supply = int(row["cnt_supply"] or 0)
+        cnt_no_supply = int(row["cnt_no_supply"] or 0)
+        cnt_full_inv = int(row["cnt_full_inv"] or 0)
+        cnt_day_total = int(row["cnt_day_total"] or 0)
+        rate_supply = int(row["rate_supply"] or DEFAULT_RATE_SUPPLY)
+        rate_no_supply = int(row["rate_no_supply"] or DEFAULT_RATE_NO_SUPPLY)
+        rate_inventory = int(row["rate_inventory"] or DEFAULT_RATE_INVENTORY)
+        coffee_rate = int(row["coffee_rate"] or DEFAULT_RATE_COFFEE)
+        coffee_enabled = bool(row["coffee_enabled"])
+        note_amount = int(row["note_amount"] or 0)
+        reimb_amount = int(row["reimb_amount"] or 0)
+
+        sum_supply = cnt_supply * rate_supply
+        sum_no_supply = cnt_no_supply * rate_no_supply
+        sum_inventory = cnt_full_inv * rate_inventory
+        coffee_cnt = cnt_day_total if coffee_enabled else 0
+        coffee_sum = coffee_cnt * coffee_rate if coffee_enabled else 0
+        point_total = sum_supply + sum_no_supply + sum_inventory + coffee_sum + note_amount + reimb_amount
+
         result.append({
             "merchant_id": row["merchant_id"],
             "fio": row["fio"],
@@ -809,65 +913,54 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
             "point_code": row["point_code"],
             "month_key": str(start),
             "status": status_value,
-            "comment": monthly_comment,
-            "extra_amount": monthly_extra_amount,
-            "receipt_path": monthly_receipt_path,
-            "note_amount": detail["note_amount"],
-            "note_comment": detail["note_comment"],
-            "reimb_amount": detail["reimb_amount"],
-            "reimb_comment": detail["reimb_comment"],
-            "reimb_receipt": detail["reimb_receipt"],
-            "cnt_supply": detail["cnt_supply"],
-            "cnt_no_supply": detail["cnt_no_supply"],
-            "cnt_full_inv": detail["cnt_full_inv"],
-            "sum_supply": detail["sum_supply"],
-            "sum_no_supply": detail["sum_no_supply"],
-            "sum_inventory": detail["sum_inventory"],
-            "coffee_cnt": detail["coffee_cnt"],
-            "coffee_rate": detail["coffee_rate"],
-            "coffee_sum": detail["coffee_sum"],
-            "point_total": detail["total"],
+            "comment": row["monthly_comment"] or "",
+            "extra_amount": int(row["monthly_extra_amount"] or 0),
+            "receipt_path": row["monthly_receipt_path"],
+            "note_amount": note_amount,
+            "note_comment": row["note_comment"] or "",
+            "reimb_amount": reimb_amount,
+            "reimb_comment": row["reimb_comment"] or "",
+            "reimb_receipt": row["reimb_receipt"],
+            "cnt_supply": cnt_supply,
+            "cnt_no_supply": cnt_no_supply,
+            "cnt_total_exits": cnt_supply + cnt_no_supply,
+            "cnt_full_inv": cnt_full_inv,
+            "sum_supply": sum_supply,
+            "sum_no_supply": sum_no_supply,
+            "sum_inventory": sum_inventory,
+            "coffee_enabled": coffee_enabled,
+            "coffee_cnt": coffee_cnt,
+            "coffee_rate": coffee_rate,
+            "coffee_sum": coffee_sum,
+            "has_overlap": bool(row["has_overlap"]),
+            "point_total": point_total,
         })
     return result
 
 
 def get_admin_payroll_rows(db: Session, y: int, m: int, tu: str | None = None, status: str | None = None):
-    ensure_monthly_submissions_table(db)
-    start = month_start(y, m)
-    end = month_end_exclusive(y, m)
-    sql = """
-        SELECT DISTINCT v.merchant_id, m.fio, m.tu
-        FROM visits v
-        JOIN merchants m ON m.id = v.merchant_id
-        WHERE v.visit_date >= :start_date
-          AND v.visit_date < :end_date
-    """
-    params = {"start_date": start, "end_date": end}
-    if tu:
-        sql += " AND m.tu = :tu"
-        params["tu"] = tu
-    sql += " ORDER BY m.tu NULLS LAST, m.fio"
-    rows = db.execute(text(sql), params).mappings().all()
+    rows = get_admin_report_rows(db, y, m, tu, status)
+    grouped: dict[int, dict] = {}
+    for r in rows:
+        mid = r["merchant_id"]
+        if mid not in grouped:
+            grouped[mid] = {
+                "merchant_id": mid,
+                "fio": r["fio"],
+                "tu": r["tu"] or "",
+                "clean_total": 0,
+                "status": r["status"],
+            }
+        grouped[mid]["clean_total"] += int(r["point_total"] or 0)
+        if grouped[mid]["status"] != "submitted" and r["status"] == "submitted":
+            grouped[mid]["status"] = "submitted"
 
     result = []
-    for row in rows:
-        overall = compute_overall_total(db, row["merchant_id"], y, m)
-        monthly = get_monthly_submission(db, row["merchant_id"], y, m)
-        status_value = "не отправлено"
-        if monthly:
-            status_value = monthly.get("status") or "draft"
-        if status and status_value != status:
-            continue
-        clean_total = overall["total"]
-        payroll_total = math.ceil(clean_total / 0.87) if clean_total > 0 else 0
-        result.append({
-            "merchant_id": row["merchant_id"],
-            "fio": row["fio"],
-            "tu": row["tu"] or "",
-            "clean_total": clean_total,
-            "payroll_total": payroll_total,
-            "status": status_value,
-        })
+    for row in grouped.values():
+        clean_total = int(row["clean_total"] or 0)
+        row["payroll_total"] = math.ceil(clean_total / 0.87) if clean_total > 0 else 0
+        result.append(row)
+    result.sort(key=lambda x: (x.get("tu") or "", x.get("fio") or ""))
     return result
 
 
@@ -883,6 +976,7 @@ def get_intersections_rows(db: Session, y: int, m: int, tu: str | None = None):
         JOIN visits v2
           ON v1.visit_date = v2.visit_date
          AND v1.point_code = v2.point_code
+         AND v1.slot = v2.slot
          AND v1.merchant_id < v2.merchant_id
         JOIN merchants m1 ON m1.id = v1.merchant_id
         JOIN merchants m2 ON m2.id = v2.merchant_id
@@ -893,7 +987,7 @@ def get_intersections_rows(db: Session, y: int, m: int, tu: str | None = None):
     if tu:
         sql += " AND (m1.tu = :tu OR m2.tu = :tu)"
         params["tu"] = tu
-    sql += " ORDER BY v1.visit_date, v1.point_code, m1.fio, m2.fio"
+    sql += " ORDER BY v1.visit_date, v1.point_code, v1.slot, m1.fio, m2.fio"
     rows = db.execute(text(sql), params).mappings().all()
     return [{
         "visit_date": str(r["visit_date"]),
@@ -943,41 +1037,24 @@ def upsert_supply_row(db: Session, point_code: str, supply_date: date, boxes: in
 
 
 def import_supplies_xlsx(db: Session, file_obj) -> dict:
-    """
-    Быстрый импорт поставок.
+    wb = load_workbook(file_obj, data_only=True)
+    ws = wb[wb.sheetnames[0]]
+    headers = [cell.value for cell in ws[1]]
+    date_columns = []
+    loaded_rows = 0
+    loaded_points = set()
 
-    Поддерживает файл, где:
-    - колонка A — код точки
-    - первая строка — даты или дни месяца вида 01.а / 02.а / 30.а
-    - в ячейках — количество коробок
-
-    Важно: здесь нет DELETE/INSERT по каждой ячейке.
-    Сначала файл читается в память, затем старые поставки за нужные точки/даты удаляются пачкой,
-    после этого новые поставки вставляются пачкой. Это сильно ускоряет загрузку и снижает риск таймаута.
-    """
     active = get_active_period()
     report_year = active["year"]
     report_month = active["month"]
 
-    wb = load_workbook(file_obj, data_only=True, read_only=True)
-    ws = wb[wb.sheetnames[0]]
-
-    rows_iter = ws.iter_rows(values_only=True)
-    try:
-        headers = next(rows_iter)
-    except StopIteration:
-        return {"loaded_rows": 0, "loaded_points": 0}
-
-    date_columns: list[tuple[int, date]] = []
-
-    for idx, value in enumerate(headers[1:], start=1):
+    for idx, value in enumerate(headers[1:], start=2):
         if value is None:
             continue
 
         if isinstance(value, datetime):
             date_columns.append((idx, value.date()))
             continue
-
         if isinstance(value, date):
             date_columns.append((idx, value))
             continue
@@ -995,90 +1072,26 @@ def import_supplies_xlsx(db: Session, file_obj) -> dict:
 
         date_columns.append((idx, supply_date))
 
-    if not date_columns:
-        return {"loaded_rows": 0, "loaded_points": 0}
-
-    insert_rows = []
-    loaded_points = set()
-    upload_dates = {d for _, d in date_columns}
-
-    for row in rows_iter:
-        if not row:
-            continue
-
-        point_code = normalize_point_code(row[0] if len(row) > 0 else None)
+    for row_idx in range(2, ws.max_row + 1):
+        point_code = normalize_point_code(ws.cell(row=row_idx, column=1).value)
         if not point_code:
             continue
-
-        point_has_values = False
+        loaded_points.add(point_code)
 
         for col_idx, supply_date in date_columns:
-            raw_boxes = row[col_idx] if col_idx < len(row) else None
+            raw_boxes = ws.cell(row=row_idx, column=col_idx).value
             if raw_boxes in (None, ""):
                 continue
-
             try:
                 boxes = int(float(raw_boxes))
             except Exception:
                 continue
 
-            insert_rows.append({
-                "point_code": point_code,
-                "supply_date": supply_date,
-                "boxes": boxes,
-                "has_supply": True,
-            })
-            point_has_values = True
-
-        if point_has_values:
-            loaded_points.add(point_code)
-
-    if not insert_rows:
-        db.commit()
-        return {"loaded_rows": 0, "loaded_points": 0}
-
-    columns = [row[0] for row in db.execute(text("""
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_name = 'supplies'
-        ORDER BY ordinal_position
-    """)).fetchall()]
-    has_supply_column = "has_supply" in columns
-
-    # Удаляем старые поставки только по тем точкам и датам, которые есть в загружаемом файле.
-    # Удаление идет по точкам, чтобы не упереться в ограничения большого IN-списка.
-    for point_code in loaded_points:
-        db.execute(text("""
-            DELETE FROM supplies
-            WHERE point_code = :point_code
-              AND supply_date >= :start_date
-              AND supply_date <= :end_date
-        """), {
-            "point_code": point_code,
-            "start_date": min(upload_dates),
-            "end_date": max(upload_dates),
-        })
-
-    if has_supply_column:
-        db.execute(text("""
-            INSERT INTO supplies (point_code, supply_date, boxes, has_supply)
-            VALUES (:point_code, :supply_date, :boxes, :has_supply)
-        """), insert_rows)
-    else:
-        db.execute(text("""
-            INSERT INTO supplies (point_code, supply_date, boxes)
-            VALUES (:point_code, :supply_date, :boxes)
-        """), [
-            {
-                "point_code": row["point_code"],
-                "supply_date": row["supply_date"],
-                "boxes": row["boxes"],
-            }
-            for row in insert_rows
-        ])
+            upsert_supply_row(db, point_code, supply_date, boxes)
+            loaded_rows += 1
 
     db.commit()
-    return {"loaded_rows": len(insert_rows), "loaded_points": len(loaded_points)}
+    return {"loaded_rows": loaded_rows, "loaded_points": len(loaded_points)}
 
 
 def upsert_rate_row(db: Session, point_code: str, month_key: date, rate_supply: int, rate_no_supply: int, rate_inventory: int, coffee_enabled: bool, coffee_rate: int, pay_lt5: bool):
@@ -1203,5 +1216,4 @@ def clear_merchants_by_tu(db: Session, tu: str) -> int:
     deleted = db.execute(text("DELETE FROM merchants WHERE tu = :tu"), {"tu": tu}).rowcount or 0
     db.commit()
     return deleted
-
 
