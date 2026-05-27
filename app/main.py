@@ -141,6 +141,20 @@ def render_receipt_links(value: str | None, text: str = "Открыть") -> str
     return "<br>".join(links)
 
 
+def render_multiline(value: str | None) -> str:
+    if not value:
+        return "—"
+    return "<br>".join(escape(line) for line in str(value).splitlines() if line.strip()) or "—"
+
+
+def append_line(existing: str | None, line: str) -> str:
+    existing = (existing or "").strip()
+    line = (line or "").strip()
+    if not existing:
+        return line
+    return existing + "\n" + line
+
+
 def base_css():
     return """
     <style>
@@ -1007,17 +1021,6 @@ def calendar_page(
     point_adj = get_point_adjustment(db, merchant["id"], point_code, y, m) or {}
     special_inventory_days = set(get_special_inventory_days(db))
 
-    coffee_pill = ""
-    coffee_detail_card = ""
-    if point_total["coffee_enabled"]:
-        coffee_pill = '<div class="mini-pill">КМ: Да</div>'
-        coffee_detail_card = f"""
-                <div class="detail-card">
-                    <div class="detail-title">Кофемашина</div>
-                    <div class="detail-line">{point_total["coffee_cnt"]} × {point_total["coffee_rate"]} ₽ = {point_total["coffee_sum"]} ₽</div>
-                </div>
-        """
-
     calendar_html = build_calendar_html(
         fio=fio,
         point_code=point_code,
@@ -1045,14 +1048,14 @@ def calendar_page(
                 <div class="detail-card point-adjustment-card">
                     <div class="detail-title">Примечание по точке</div>
                     <div class="detail-line">{point_total['note_amount']} ₽</div>
-                    <div class="calendar-note">{escape(point_total['note_comment']) if point_total['note_comment'] else '—'}</div>
+                    <div class="calendar-note">{render_multiline(point_total['note_comment'])}</div>
                     <a class="btn btn-secondary" href="/point-note-page?fio={escape(fio)}&point_code={escape(point_code)}">Добавить примечание</a>
                 </div>
 
                 <div class="detail-card point-adjustment-card">
                     <div class="detail-title">Возмещение по точке</div>
                     <div class="detail-line">{point_total['reimb_amount']} ₽</div>
-                    <div class="calendar-note">{escape(point_total['reimb_comment']) if point_total['reimb_comment'] else '—'}</div>
+                    <div class="calendar-note">{render_multiline(point_total['reimb_comment'])}</div>
                     {point_receipt_link}
                     <a class="btn btn-secondary" href="/point-reimbursement-page?fio={escape(fio)}&point_code={escape(point_code)}">Добавить возмещение</a>
                 </div>
@@ -1168,32 +1171,6 @@ def calendar_page(
 """
 
 
-
-
-def render_form_error(title: str, message: str, back_url: str) -> HTMLResponse:
-    return HTMLResponse(f"""
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>{escape(title)}</title>
-    {base_css()}
-</head>
-<body>
-    <div class="page">
-        <div class="card">
-            <div class="brand">ВкусВилл</div>
-            <h1>{escape(title)}</h1>
-            <div class="error-box">{escape(message)}</div>
-            <a class="back" href="{back_url}">← Вернуться</a>
-        </div>
-    </div>
-</body>
-</html>
-    """, status_code=400)
-
-
 @app.get("/point-note-page", response_class=HTMLResponse)
 def point_note_page(
     fio: str,
@@ -1265,10 +1242,10 @@ def point_note_page(
                 <input type="hidden" name="point_code" value="{escape(point_code_clean)}" />
 
                 <label for="note_amount">Сумма, ₽</label>
-                <input id="note_amount" name="note_amount" type="number" min="1" value="{max(0, int(point_total['note_amount'] or 0))}" placeholder="Например: 1500" required />
+                <input id="note_amount" name="note_amount" type="number" min="1" value="" placeholder="Например: 1500" required />
 
                 <label for="note_comment">Комментарий</label>
-                <input id="note_comment" name="note_comment" type="text" value="{escape(point_total['note_comment'])}" placeholder="Например: Закрытие точки" required />
+                <input id="note_comment" name="note_comment" type="text" value="" placeholder="Например: Закрытие точки" required />
 
                 <button class="btn" type="submit">Сохранить примечание</button>
             </form>
@@ -1349,17 +1326,36 @@ def save_point_note_normal(
         return RedirectResponse(url="/login-page", status_code=303)
 
     point_code_clean = normalize_point_code(point_code)
-    note_amount_value = int(note_amount or 0)
-    note_comment_value = (note_comment or "").strip()
+    amount = int(note_amount or 0)
+    comment = (note_comment or "").strip()
 
-    if note_amount_value <= 0 or not note_comment_value:
-        return render_form_error(
-            "Ошибка",
-            "Для обычного примечания необходимо заполнить сумму и комментарий.",
-            f"/point-note-page?fio={escape(fio)}&point_code={escape(point_code_clean)}&mode=normal"
-        )
+    if amount <= 0 or not comment:
+        return HTMLResponse(f"""
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ошибка</title>
+    {base_css()}
+</head>
+<body>
+    <div class="page">
+        <div class="card">
+            <h1>Ошибка</h1>
+            <div class="error-box">Для примечания необходимо заполнить сумму больше 0 ₽ и комментарий.</div>
+            <a class="back" href="/point-note-page?fio={escape(fio)}&point_code={escape(point_code_clean)}&mode=normal">← Вернуться к примечанию</a>
+        </div>
+    </div>
+</body>
+</html>
+        """, status_code=400)
 
     existing = get_point_adjustment(db, merchant["id"], point_code_clean, period["year"], period["month"]) or {}
+    existing_amount = int(existing.get("note_amount") or 0)
+    existing_comment = existing.get("note_comment") or ""
+
+    new_line = f"{amount} ₽ — {comment}"
 
     upsert_point_adjustment(
         db=db,
@@ -1367,8 +1363,8 @@ def save_point_note_normal(
         point_code=point_code_clean,
         y=period["year"],
         m=period["month"],
-        note_amount=note_amount_value,
-        note_comment=note_comment_value,
+        note_amount=existing_amount + amount,
+        note_comment=append_line(existing_comment, new_line),
         reimb_amount=int(existing.get("reimb_amount") or 0),
         reimb_comment=existing.get("reimb_comment") or "",
         reimb_receipt=existing.get("reimb_receipt"),
@@ -1394,8 +1390,13 @@ def save_point_note_no_supply(
     adjustment = get_supply_adjustment_amount(db, point_code_clean, period["year"], period["month"])
     supply_date = date(period["year"], period["month"], int(supply_day))
     base_comment = f"Не принимал поставку {supply_date.strftime('%d.%m')}"
-    note_comment = base_comment if not comment else f"{base_comment}. {comment}"
+    extra_comment = (comment or "").strip()
+    note_comment = base_comment if not extra_comment else f"{base_comment}. {extra_comment}"
     existing = get_point_adjustment(db, merchant["id"], point_code_clean, period["year"], period["month"]) or {}
+    existing_amount = int(existing.get("note_amount") or 0)
+    existing_comment = existing.get("note_comment") or ""
+
+    new_line = f"{adjustment} ₽ — {note_comment}"
 
     upsert_point_adjustment(
         db=db,
@@ -1403,8 +1404,8 @@ def save_point_note_no_supply(
         point_code=point_code_clean,
         y=period["year"],
         m=period["month"],
-        note_amount=adjustment,
-        note_comment=note_comment,
+        note_amount=existing_amount + adjustment,
+        note_comment=append_line(existing_comment, new_line),
         reimb_amount=int(existing.get("reimb_amount") or 0),
         reimb_comment=existing.get("reimb_comment") or "",
         reimb_receipt=existing.get("reimb_receipt"),
@@ -1449,10 +1450,10 @@ def point_reimbursement_page(
                 <input type="hidden" name="point_code" value="{escape(point_code_clean)}" />
 
                 <label for="reimb_amount">Сумма, ₽</label>
-                <input id="reimb_amount" name="reimb_amount" type="number" min="1" value="{point_total['reimb_amount']}" placeholder="Например: 150" required />
+                <input id="reimb_amount" name="reimb_amount" type="number" min="1" value="" placeholder="Например: 150" required />
 
                 <label for="reimb_comment">Комментарий</label>
-                <input id="reimb_comment" name="reimb_comment" type="text" value="{escape(point_total['reimb_comment'])}" placeholder="Например: Покупка пакетов" required />
+                <input id="reimb_comment" name="reimb_comment" type="text" value="" placeholder="Например: Покупка пакетов" required />
 
                 <label for="reimb_receipts">Чеки</label>
                 <input id="reimb_receipts" name="reimb_receipts" type="file" accept=".jpg,.jpeg,.png,.pdf,.webp" multiple />
@@ -1475,8 +1476,8 @@ def point_reimbursement_page(
 async def save_point_reimbursement(
     fio: str = Form(...),
     point_code: str = Form(...),
-    reimb_amount: int = Form(0),
-    reimb_comment: str = Form(""),
+    reimb_amount: int = Form(...),
+    reimb_comment: str = Form(...),
     reimb_receipts: List[UploadFile] = File(default=[]),
     db: Session = Depends(get_db)
 ):
@@ -1486,16 +1487,8 @@ async def save_point_reimbursement(
         return RedirectResponse(url="/login-page", status_code=303)
 
     point_code_clean = normalize_point_code(point_code)
-    reimb_amount_value = max(0, int(reimb_amount or 0))
+    reimb_amount_value = int(reimb_amount or 0)
     reimb_comment_value = (reimb_comment or "").strip()
-
-    if reimb_amount_value <= 0 or not reimb_comment_value:
-        return render_form_error(
-            "Ошибка",
-            "Для возмещения необходимо заполнить сумму и комментарий.",
-            f"/point-reimbursement-page?fio={escape(fio)}&point_code={escape(point_code_clean)}"
-        )
-
     existing = get_point_adjustment(db, merchant["id"], point_code_clean, period["year"], period["month"]) or {}
 
     new_paths = []
@@ -1509,7 +1502,8 @@ async def save_point_reimbursement(
             new_paths.append(f"uploads/{filename}")
 
     combined_receipts = append_receipt_paths(existing.get("reimb_receipt"), new_paths)
-    if reimb_amount_value > 0 and not combined_receipts:
+
+    if reimb_amount_value <= 0 or not reimb_comment_value or not new_paths:
         return HTMLResponse(f"""
 <!DOCTYPE html>
 <html lang="ru">
@@ -1523,13 +1517,17 @@ async def save_point_reimbursement(
     <div class="page">
         <div class="card">
             <h1>Ошибка</h1>
-            <div class="error-box">При указании возмещения необходимо прикрепить чек.</div>
+            <div class="error-box">Для возмещения необходимо заполнить сумму больше 0 ₽, комментарий и приложить минимум один чек.</div>
             <a class="back" href="/point-reimbursement-page?fio={escape(fio)}&point_code={escape(point_code_clean)}">← Вернуться к возмещению</a>
         </div>
     </div>
 </body>
 </html>
         """, status_code=400)
+
+    existing_reimb_amount = int(existing.get("reimb_amount") or 0)
+    existing_reimb_comment = existing.get("reimb_comment") or ""
+    new_line = f"{reimb_amount_value} ₽ — {reimb_comment_value}"
 
     upsert_point_adjustment(
         db=db,
@@ -1539,8 +1537,8 @@ async def save_point_reimbursement(
         m=period["month"],
         note_amount=int(existing.get("note_amount") or 0),
         note_comment=existing.get("note_comment") or "",
-        reimb_amount=reimb_amount_value,
-        reimb_comment=reimb_comment_value,
+        reimb_amount=existing_reimb_amount + reimb_amount_value,
+        reimb_comment=append_line(existing_reimb_comment, new_line),
         reimb_receipt=combined_receipts,
     )
 
@@ -1573,14 +1571,7 @@ async def save_point_adjustment(
         content = await reimb_receipt.read()
         filepath.write_bytes(content)
         receipt_path = append_receipt_paths(receipt_path, [f"uploads/{filename}"])
-    note_amount_value = int(note_amount or 0)
-    note_comment_value = (note_comment or "").strip()
-    reimb_amount_value = int(reimb_amount or 0)
-    reimb_comment_value = (reimb_comment or "").strip()
-
-    if (note_amount_value > 0 or note_comment_value) and (note_amount_value <= 0 or not note_comment_value):
-        return RedirectResponse(url=f"/point-note-page?fio={escape(fio)}&point_code={escape(point_code_clean)}&mode=normal", status_code=303)
-    if (reimb_amount_value > 0 or reimb_comment_value) and (reimb_amount_value <= 0 or not reimb_comment_value or not receipt_path):
+    if int(reimb_amount or 0) > 0 and not receipt_path:
         return RedirectResponse(url=f"/point-reimbursement-page?fio={escape(fio)}&point_code={escape(point_code_clean)}", status_code=303)
     upsert_point_adjustment(
         db=db,
@@ -1588,10 +1579,10 @@ async def save_point_adjustment(
         point_code=point_code_clean,
         y=period["year"],
         m=period["month"],
-        note_amount=note_amount_value,
-        note_comment=note_comment_value,
-        reimb_amount=reimb_amount_value,
-        reimb_comment=reimb_comment_value,
+        note_amount=int(note_amount or 0),
+        note_comment=note_comment or "",
+        reimb_amount=int(reimb_amount or 0),
+        reimb_comment=reimb_comment or "",
         reimb_receipt=receipt_path,
     )
     return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code_clean)}&saved=1", status_code=303)
@@ -1632,8 +1623,8 @@ def monthly_submit_page(
                     <div>Без поставки: {d["cnt_no_supply"]} × {d["rate_no_supply"]} ₽ = {d["sum_no_supply"]} ₽</div>
                     <div>Полный инвент: {d["cnt_full_inv"]} × {d["rate_inventory"]} ₽ = {d["sum_inventory"]} ₽</div>
                     {f'<div>Кофемашина: {d["coffee_cnt"]} × {d["coffee_rate"]} ₽ = {d["coffee_sum"]} ₽</div>' if d["coffee_enabled"] else ''}
-                    <div>Примечание по точке: {d["note_amount"]} ₽ — {escape(d["note_comment"]) if d["note_comment"] else "—"}</div>
-                    <div>Возмещение по точке: {d["reimb_amount"]} ₽ — {escape(d["reimb_comment"]) if d["reimb_comment"] else "—"}</div>
+                    <div>Примечание по точке: {d["note_amount"]} ₽ — {render_multiline(d["note_comment"])}</div>
+                    <div>Возмещение по точке: {d["reimb_amount"]} ₽ — {render_multiline(d["reimb_comment"])}</div>
                     <div>Чек по возмещению: {render_receipt_links(d["reimb_receipt"], "открыть")}</div>
                 </div>
             </details>
@@ -2049,8 +2040,8 @@ def admin_report(
                 <td><strong>{r.get("cnt_total_exits", r["cnt_supply"] + r["cnt_no_supply"])}</strong></td>
                 <td>{r["cnt_full_inv"]} / {r["sum_inventory"]} ₽</td>
                 <td>{r["coffee_cnt"]} × {r["coffee_rate"]} = {r["coffee_sum"]} ₽</td>
-                <td>{r["note_amount"]} ₽<br>{escape(r["note_comment"]) if r["note_comment"] else "—"}</td>
-                <td>{r["reimb_amount"]} ₽<br>{escape(r["reimb_comment"]) if r["reimb_comment"] else "—"}</td>
+                <td>{r["note_amount"]} ₽<br>{render_multiline(r["note_comment"])}</td>
+                <td>{r["reimb_amount"]} ₽<br>{render_multiline(r["reimb_comment"])}</td>
                 <td><strong>{r["point_total"]} ₽</strong></td>
                 <td>{escape(r["status"])}</td>
                 <td>{render_receipt_links(r["reimb_receipt"], "Открыть")}</td>
