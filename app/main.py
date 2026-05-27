@@ -1,4 +1,3 @@
-
 import os
 import uuid
 import hashlib
@@ -1031,6 +1030,15 @@ def calendar_page(
         is_submitted=monthly_submitted,
         special_inventory_days=special_inventory_days
     )
+
+    coffee_detail_card = ""
+    if point_total.get("coffee_enabled"):
+        coffee_detail_card = f"""
+                <div class="detail-card">
+                    <div class="detail-title">Кофемашина</div>
+                    <div class="detail-line">{point_total["coffee_cnt"]} × {point_total["coffee_rate"]} ₽ = {point_total["coffee_sum"]} ₽</div>
+                </div>
+        """
 
     info_box = ""
     if saved == "1":
