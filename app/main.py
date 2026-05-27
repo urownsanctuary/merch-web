@@ -1097,7 +1097,6 @@ def calendar_page(
                 <div class="calendar-meta">
                     <div class="mini-pill">Точка: {escape(point_code)}</div>
                     <div class="mini-pill">{escape(fio)}</div>
-                    {coffee_pill}
                     <div class="mini-pill">Месячная сверка: {"Отправлена" if monthly_submitted else "Черновик"}</div>
                 </div>
             </div>
