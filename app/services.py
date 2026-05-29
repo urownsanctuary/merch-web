@@ -4,7 +4,7 @@ import math
 import hashlib
 from datetime import date, datetime, timedelta
 from sqlalchemy.orm import Session
-from sqlalchemy import text
+from sqlalchemy import text, bindparam
 from openpyxl import load_workbook
 
 SECRET_SALT = os.getenv("SECRET_SALT")
@@ -1037,34 +1037,53 @@ def upsert_supply_row(db: Session, point_code: str, supply_date: date, boxes: in
 
 
 def import_supplies_xlsx(db: Session, file_obj) -> dict:
-    wb = load_workbook(file_obj, data_only=True)
+    """
+    Быстрая загрузка поставок.
+
+    Что изменено:
+    - Excel читается один раз;
+    - старые поставки по загружаемым точкам/датам удаляются одним SQL-запросом;
+    - новые поставки вставляются пачкой через executemany;
+    - commit выполняется один раз в конце.
+
+    Формат файла прежний:
+    - 1-я колонка: код точки;
+    - 1-я строка: даты или номера дней месяца;
+    - значения в ячейках: количество коробок;
+    - пустые ячейки пропускаются.
+    """
+    wb = load_workbook(file_obj, data_only=True, read_only=True)
     ws = wb[wb.sheetnames[0]]
-    headers = [cell.value for cell in ws[1]]
-    date_columns = []
-    loaded_rows = 0
-    loaded_points = set()
+
+    rows_iter = ws.iter_rows(values_only=True)
+    try:
+        headers = next(rows_iter)
+    except StopIteration:
+        return {"loaded_rows": 0, "loaded_points": 0}
 
     active = get_active_period()
     report_year = active["year"]
     report_month = active["month"]
 
-    for idx, value in enumerate(headers[1:], start=2):
+    date_columns: list[tuple[int, date]] = []
+    for idx, value in enumerate(headers[1:], start=1):
         if value is None:
             continue
 
         if isinstance(value, datetime):
             date_columns.append((idx, value.date()))
             continue
+
         if isinstance(value, date):
             date_columns.append((idx, value))
             continue
 
         raw = str(value).strip()
-        m = re.match(r"^(\d{1,2})", raw)
-        if not m:
+        match = re.match(r"^(\d{1,2})", raw)
+        if not match:
             continue
 
-        day_num = int(m.group(1))
+        day_num = int(match.group(1))
         try:
             supply_date = date(report_year, report_month, day_num)
         except ValueError:
@@ -1072,26 +1091,93 @@ def import_supplies_xlsx(db: Session, file_obj) -> dict:
 
         date_columns.append((idx, supply_date))
 
-    for row_idx in range(2, ws.max_row + 1):
-        point_code = normalize_point_code(ws.cell(row=row_idx, column=1).value)
+    if not date_columns:
+        return {"loaded_rows": 0, "loaded_points": 0}
+
+    supply_rows = []
+    loaded_points = set()
+    loaded_dates = set()
+
+    for row in rows_iter:
+        if not row:
+            continue
+
+        point_code = normalize_point_code(row[0] if len(row) > 0 else None)
         if not point_code:
             continue
-        loaded_points.add(point_code)
+
+        row_has_any_supply = False
 
         for col_idx, supply_date in date_columns:
-            raw_boxes = ws.cell(row=row_idx, column=col_idx).value
+            raw_boxes = row[col_idx] if col_idx < len(row) else None
             if raw_boxes in (None, ""):
                 continue
+
             try:
                 boxes = int(float(raw_boxes))
             except Exception:
                 continue
 
-            upsert_supply_row(db, point_code, supply_date, boxes)
-            loaded_rows += 1
+            supply_rows.append({
+                "point_code": point_code,
+                "supply_date": supply_date,
+                "boxes": boxes,
+                "has_supply": True,
+            })
+            loaded_dates.add(supply_date)
+            row_has_any_supply = True
+
+        if row_has_any_supply:
+            loaded_points.add(point_code)
+
+    if not supply_rows:
+        db.commit()
+        return {"loaded_rows": 0, "loaded_points": 0}
+
+    columns = [row[0] for row in db.execute(text("""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'supplies'
+        ORDER BY ordinal_position
+    """)).fetchall()]
+    has_supply_column = "has_supply" in columns
+
+    delete_stmt = text("""
+        DELETE FROM supplies
+        WHERE point_code IN :point_codes
+          AND supply_date IN :supply_dates
+    """).bindparams(
+        bindparam("point_codes", expanding=True),
+        bindparam("supply_dates", expanding=True),
+    )
+
+    db.execute(delete_stmt, {
+        "point_codes": list(loaded_points),
+        "supply_dates": list(loaded_dates),
+    })
+
+    if has_supply_column:
+        insert_stmt = text("""
+            INSERT INTO supplies (point_code, supply_date, boxes, has_supply)
+            VALUES (:point_code, :supply_date, :boxes, :has_supply)
+        """)
+        db.execute(insert_stmt, supply_rows)
+    else:
+        insert_stmt = text("""
+            INSERT INTO supplies (point_code, supply_date, boxes)
+            VALUES (:point_code, :supply_date, :boxes)
+        """)
+        db.execute(insert_stmt, [
+            {
+                "point_code": row["point_code"],
+                "supply_date": row["supply_date"],
+                "boxes": row["boxes"],
+            }
+            for row in supply_rows
+        ])
 
     db.commit()
-    return {"loaded_rows": loaded_rows, "loaded_points": len(loaded_points)}
+    return {"loaded_rows": len(supply_rows), "loaded_points": len(loaded_points)}
 
 
 def upsert_rate_row(db: Session, point_code: str, month_key: date, rate_supply: int, rate_no_supply: int, rate_inventory: int, coffee_enabled: bool, coffee_rate: int, pay_lt5: bool):
@@ -1216,3 +1302,4 @@ def clear_merchants_by_tu(db: Session, tu: str) -> int:
     deleted = db.execute(text("DELETE FROM merchants WHERE tu = :tu"), {"tu": tu}).rowcount or 0
     db.commit()
     return deleted
+
