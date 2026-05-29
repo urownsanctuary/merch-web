@@ -55,6 +55,8 @@ from app.services import (
     is_inventory_allowed_date,
     get_supply_days_for_point,
     get_supply_adjustment_amount,
+    get_point_rates,
+    effective_has_supply,
 )
 
 app = FastAPI()
@@ -152,6 +154,59 @@ def append_multiline_comment(existing: str | None, amount: int, comment: str) ->
     line = f"{amount} ₽ — {comment.strip()}"
     existing_clean = (existing or "").strip()
     return line if not existing_clean else existing_clean + "\n" + line
+
+
+
+def split_adjustment_lines(value: str | None) -> list[str]:
+    """Возвращает непустые строки примечаний/возмещений."""
+    if not value:
+        return []
+    return [line.strip() for line in str(value).splitlines() if line and line.strip()]
+
+
+def parse_amount_from_adjustment_line(line: str) -> int:
+    """Достаёт сумму из строки формата '1500 ₽ — комментарий' или '-400 ₽ — комментарий'."""
+    match = __import__("re").match(r"^\s*([+-]?\d+)", str(line or "").strip())
+    if not match:
+        return 0
+    try:
+        return int(match.group(1))
+    except Exception:
+        return 0
+
+
+def sum_adjustment_lines(lines: list[str]) -> int:
+    return sum(parse_amount_from_adjustment_line(line) for line in lines)
+
+
+def render_adjustment_items(
+    value: str | None,
+    delete_url: str,
+    fio: str,
+    point_code: str,
+    empty_text: str = "—",
+) -> str:
+    lines = split_adjustment_lines(value)
+    if not lines:
+        return empty_text
+
+    html = "<div style='display:flex; flex-direction:column; gap:10px; margin-top:10px;'>"
+    for idx, line in enumerate(lines):
+        html += f"""
+        <div style="border:1px solid #E5E7EB; border-radius:12px; padding:10px 12px; background:#FFFFFF;">
+            <div style="font-size:15px; line-height:1.35;">{escape(line)}</div>
+            <form method="post" action="{delete_url}" style="margin-top:8px;">
+                <input type="hidden" name="fio" value="{escape(fio)}" />
+                <input type="hidden" name="point_code" value="{escape(point_code)}" />
+                <input type="hidden" name="item_index" value="{idx}" />
+                <button class="btn btn-danger btn-small" type="submit" style="width:auto; padding:8px 12px; font-size:13px; margin-top:0;">
+                    Удалить
+                </button>
+            </form>
+        </div>
+        """
+    html += "</div>"
+    return html
 
 
 
@@ -951,7 +1006,8 @@ def build_calendar_html(
     boxes_map: dict[int, int],
     visits: dict[int, set[str]],
     is_submitted: bool,
-    special_inventory_days: set[date]
+    special_inventory_days: set[date],
+    pay_lt5: bool = False
 ) -> str:
     dim = days_in_month(y, m)
     first_wd = weekday_of(y, m, 1)
@@ -972,7 +1028,7 @@ def build_calendar_html(
         day_visits = visits.get(day, set())
 
         badges = ""
-        if boxes > 0:
+        if effective_has_supply(boxes, pay_lt5):
             badges += '<span class="badge badge-supply">П</span>'
         if "DAY" in day_visits:
             badges += '<span class="badge badge-day">В</span>'
@@ -1029,7 +1085,8 @@ def calendar_page(
         boxes_map=boxes_map,
         visits=visits,
         is_submitted=monthly_submitted,
-        special_inventory_days=special_inventory_days
+        special_inventory_days=special_inventory_days,
+        pay_lt5=bool(point_total.get("pay_lt5"))
     )
 
     info_box = ""
@@ -1059,14 +1116,14 @@ def calendar_page(
                 <div class="detail-card point-adjustment-card">
                     <div class="detail-title">Примечание по точке</div>
                     <div class="detail-line">{point_total['note_amount']} ₽</div>
-                    <div class="calendar-note">{render_multiline_text(point_total['note_comment'])}</div>
+                    <div class="calendar-note">{render_adjustment_items(point_total['note_comment'], '/delete-point-note', fio, point_code)}</div>
                     <a class="btn btn-secondary" href="/point-note-page?fio={escape(fio)}&point_code={escape(point_code)}">Добавить примечание</a>
                 </div>
 
                 <div class="detail-card point-adjustment-card">
                     <div class="detail-title">Возмещение по точке</div>
                     <div class="detail-line">{point_total['reimb_amount']} ₽</div>
-                    <div class="calendar-note">{render_multiline_text(point_total['reimb_comment'])}</div>
+                    <div class="calendar-note">{render_adjustment_items(point_total['reimb_comment'], '/delete-point-reimbursement', fio, point_code)}</div>
                     {point_receipt_link}
                     <a class="btn btn-secondary" href="/point-reimbursement-page?fio={escape(fio)}&point_code={escape(point_code)}">Добавить возмещение</a>
                 </div>
@@ -1152,7 +1209,7 @@ def calendar_page(
             </div>
 
             <div class="legend">
-                <div class="legend-item">П — была поставка</div>
+                <div class="legend-item">П — оплачиваемая поставка</div>
                 <div class="legend-item">В — отмечен выход</div>
                 <div class="legend-item">И — полный инвент</div>
             </div>
@@ -1621,6 +1678,92 @@ async def save_point_adjustment(
         reimb_comment=final_reimb_comment,
         reimb_receipt=receipt_path,
     )
+    return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code_clean)}&saved=1", status_code=303)
+
+
+
+
+@app.post("/delete-point-note")
+def delete_point_note(
+    fio: str = Form(...),
+    point_code: str = Form(...),
+    item_index: int = Form(...),
+    db: Session = Depends(get_db)
+):
+    period = get_active_period()
+    merchant = get_merchant_by_fio(db, fio)
+    if not merchant:
+        return RedirectResponse(url="/login-page", status_code=303)
+
+    point_code_clean = normalize_point_code(point_code)
+    overall = compute_overall_total(db, merchant["id"], period["year"], period["month"])
+    if overall["submission_status"] == "submitted":
+        return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code_clean)}", status_code=303)
+
+    existing = get_point_adjustment(db, merchant["id"], point_code_clean, period["year"], period["month"]) or {}
+    note_lines = split_adjustment_lines(existing.get("note_comment"))
+
+    if 0 <= int(item_index) < len(note_lines):
+        note_lines.pop(int(item_index))
+
+    new_note_comment = "\n".join(note_lines)
+    new_note_amount = sum_adjustment_lines(note_lines)
+
+    upsert_point_adjustment(
+        db=db,
+        merchant_id=merchant["id"],
+        point_code=point_code_clean,
+        y=period["year"],
+        m=period["month"],
+        note_amount=new_note_amount,
+        note_comment=new_note_comment,
+        reimb_amount=int(existing.get("reimb_amount") or 0),
+        reimb_comment=existing.get("reimb_comment") or "",
+        reimb_receipt=existing.get("reimb_receipt"),
+    )
+
+    return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code_clean)}&saved=1", status_code=303)
+
+
+@app.post("/delete-point-reimbursement")
+def delete_point_reimbursement(
+    fio: str = Form(...),
+    point_code: str = Form(...),
+    item_index: int = Form(...),
+    db: Session = Depends(get_db)
+):
+    period = get_active_period()
+    merchant = get_merchant_by_fio(db, fio)
+    if not merchant:
+        return RedirectResponse(url="/login-page", status_code=303)
+
+    point_code_clean = normalize_point_code(point_code)
+    overall = compute_overall_total(db, merchant["id"], period["year"], period["month"])
+    if overall["submission_status"] == "submitted":
+        return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code_clean)}", status_code=303)
+
+    existing = get_point_adjustment(db, merchant["id"], point_code_clean, period["year"], period["month"]) or {}
+    reimb_lines = split_adjustment_lines(existing.get("reimb_comment"))
+
+    if 0 <= int(item_index) < len(reimb_lines):
+        reimb_lines.pop(int(item_index))
+
+    new_reimb_comment = "\n".join(reimb_lines)
+    new_reimb_amount = sum_adjustment_lines(reimb_lines)
+
+    upsert_point_adjustment(
+        db=db,
+        merchant_id=merchant["id"],
+        point_code=point_code_clean,
+        y=period["year"],
+        m=period["month"],
+        note_amount=int(existing.get("note_amount") or 0),
+        note_comment=existing.get("note_comment") or "",
+        reimb_amount=new_reimb_amount,
+        reimb_comment=new_reimb_comment,
+        reimb_receipt=existing.get("reimb_receipt"),
+    )
+
     return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code_clean)}&saved=1", status_code=303)
 
 
