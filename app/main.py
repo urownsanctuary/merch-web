@@ -1028,6 +1028,17 @@ def calendar_page(
     if point_receipt_links != "—":
         point_receipt_link = f"<div class='hint' style='margin-top:10px'>Чеки по возмещению:<br>{point_receipt_links}</div>"
 
+    coffee_pill = ""
+    coffee_detail_card = ""
+    if point_total.get("coffee_enabled"):
+        coffee_pill = '<div class="mini-pill">КМ: Да</div>'
+        coffee_detail_card = (
+            '<div class="detail-card">'
+            '<div class="detail-title">Кофемашина</div>'
+            f'<div class="detail-line">{point_total["coffee_cnt"]} × {point_total["coffee_rate"]} ₽ = {point_total["coffee_sum"]} ₽</div>'
+            '</div>'
+        )
+
     point_form = ""
     if not monthly_submitted:
         point_form = f"""
