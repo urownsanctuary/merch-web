@@ -536,16 +536,44 @@ def reopen_monthly_submission(db: Session, merchant_id: int, y: int, m: int):
 
 
 def get_points_for_month(db: Session, merchant_id: int, y: int, m: int) -> list[str]:
+    """Return all points that should be included in the monthly total.
+
+    Important: a point must be included even if there are no visits,
+    but the merch added a point note or reimbursement.
+    """
+    ensure_point_adjustments_table(db)
     start = month_start(y, m)
     end = month_end_exclusive(y, m)
     rows = db.execute(text("""
         SELECT DISTINCT point_code
-        FROM visits
-        WHERE merchant_id=:merchant_id
-          AND visit_date >= :start_date
-          AND visit_date < :end_date
+        FROM (
+            SELECT point_code
+            FROM visits
+            WHERE merchant_id=:merchant_id
+              AND visit_date >= :start_date
+              AND visit_date < :end_date
+
+            UNION
+
+            SELECT point_code
+            FROM point_adjustments
+            WHERE merchant_id=:merchant_id
+              AND month_key=:month_key
+              AND (
+                    COALESCE(note_amount, 0) <> 0
+                 OR COALESCE(reimb_amount, 0) <> 0
+                 OR COALESCE(TRIM(note_comment), '') <> ''
+                 OR COALESCE(TRIM(reimb_comment), '') <> ''
+                 OR COALESCE(TRIM(reimb_receipt), '') <> ''
+              )
+        ) points
         ORDER BY point_code
-    """), {"merchant_id": merchant_id, "start_date": start, "end_date": end}).all()
+    """), {
+        "merchant_id": merchant_id,
+        "start_date": start,
+        "end_date": end,
+        "month_key": start,
+    }).all()
     return [r[0] for r in rows if r and r[0]]
 
 
@@ -798,7 +826,26 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
         params["tu"] = tu
 
     sql = f"""
-        WITH overlap_rows AS (
+        WITH base_points AS (
+            SELECT DISTINCT v.merchant_id, v.point_code
+            FROM visits v
+            WHERE v.visit_date >= :start_date
+              AND v.visit_date < :end_date
+
+            UNION
+
+            SELECT DISTINCT pa.merchant_id, pa.point_code
+            FROM point_adjustments pa
+            WHERE pa.month_key = :month_key
+              AND (
+                    COALESCE(pa.note_amount, 0) <> 0
+                 OR COALESCE(pa.reimb_amount, 0) <> 0
+                 OR COALESCE(TRIM(pa.note_comment), '') <> ''
+                 OR COALESCE(TRIM(pa.reimb_comment), '') <> ''
+                 OR COALESCE(TRIM(pa.reimb_receipt), '') <> ''
+              )
+        ),
+        overlap_rows AS (
             SELECT DISTINCT v1.merchant_id, v1.point_code
             FROM visits v1
             JOIN visits v2
@@ -810,8 +857,8 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
               AND v1.visit_date < :end_date
         )
         SELECT
-            v.merchant_id,
-            v.point_code,
+            bp.merchant_id,
+            bp.point_code,
             m.fio,
             COALESCE(m.tu, '') AS tu,
             COALESCE(ms.status, 'не отправлено') AS status,
@@ -849,35 +896,39 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
 
             SUM(CASE WHEN v.slot = :slot_full_invent THEN 1 ELSE 0 END) AS cnt_full_inv,
             SUM(CASE WHEN v.slot = :slot_day THEN 1 ELSE 0 END) AS cnt_day_total
-        FROM visits v
-        JOIN merchants m ON m.id = v.merchant_id
+        FROM base_points bp
+        JOIN merchants m ON m.id = bp.merchant_id
+        LEFT JOIN visits v
+          ON v.merchant_id = bp.merchant_id
+         AND v.point_code = bp.point_code
+         AND v.visit_date >= :start_date
+         AND v.visit_date < :end_date
         LEFT JOIN supplies s
-          ON s.point_code = v.point_code
+          ON s.point_code = bp.point_code
          AND s.supply_date = v.visit_date
         LEFT JOIN point_rates pr
-          ON pr.point_code = v.point_code
+          ON pr.point_code = bp.point_code
          AND pr.month_key = :month_key
         LEFT JOIN point_adjustments pa
-          ON pa.merchant_id = v.merchant_id
-         AND pa.point_code = v.point_code
+          ON pa.merchant_id = bp.merchant_id
+         AND pa.point_code = bp.point_code
          AND pa.month_key = :month_key
         LEFT JOIN monthly_submissions ms
-          ON ms.merchant_id = v.merchant_id
+          ON ms.merchant_id = bp.merchant_id
          AND ms.month_key = :month_key
         LEFT JOIN overlap_rows ov
-          ON ov.merchant_id = v.merchant_id
-         AND ov.point_code = v.point_code
-        WHERE v.visit_date >= :start_date
-          AND v.visit_date < :end_date
+          ON ov.merchant_id = bp.merchant_id
+         AND ov.point_code = bp.point_code
+        WHERE 1=1
           {tu_sql}
         GROUP BY
-            v.merchant_id, v.point_code, m.fio, m.tu,
+            bp.merchant_id, bp.point_code, m.fio, m.tu,
             ms.status, ms.comment, ms.extra_amount, ms.receipt_path,
             pr.rate_supply, pr.rate_no_supply, pr.rate_inventory,
             pr.coffee_enabled, pr.coffee_rate, pr.pay_lt5,
             pa.note_amount, pa.note_comment, pa.reimb_amount, pa.reimb_comment, pa.reimb_receipt,
             ov.merchant_id
-        ORDER BY m.tu NULLS LAST, m.fio, v.point_code
+        ORDER BY m.tu NULLS LAST, m.fio, bp.point_code
     """
 
     rows = db.execute(text(sql), params).mappings().all()
