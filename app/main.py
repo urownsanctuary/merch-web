@@ -133,6 +133,44 @@ def append_receipt_paths(existing: str | None, new_paths: list[str]) -> str | No
     return "|".join(paths) if paths else None
 
 
+def safe_receipt_filename(filename: str | None) -> str:
+    raw = (filename or "receipt").strip() or "receipt"
+    ext = Path(raw).suffix.lower()
+    if ext not in {".jpg", ".jpeg", ".png", ".pdf", ".webp"}:
+        ext = ".bin"
+    return f"receipt{ext}"
+
+
+def ensure_receipt_files_table(db: Session):
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS receipt_files (
+            file_id TEXT PRIMARY KEY,
+            original_filename TEXT,
+            content_type TEXT,
+            data BYTEA NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        )
+    """))
+    db.commit()
+
+
+def save_receipt_file_to_db(db: Session, original_filename: str | None, content_type: str | None, content: bytes) -> str:
+    ensure_receipt_files_table(db)
+    file_id = uuid.uuid4().hex
+    display_filename = safe_receipt_filename(original_filename)
+    db.execute(text("""
+        INSERT INTO receipt_files (file_id, original_filename, content_type, data)
+        VALUES (:file_id, :original_filename, :content_type, :data)
+    """), {
+        "file_id": file_id,
+        "original_filename": original_filename or display_filename,
+        "content_type": content_type or "application/octet-stream",
+        "data": content,
+    })
+    db.commit()
+    return f"receipts/{file_id}/{display_filename}"
+
+
 def render_receipt_links(value: str | None, text: str = "Открыть") -> str:
     paths = split_receipt_paths(value)
     if not paths:
@@ -568,6 +606,15 @@ def base_css():
             box-shadow: 0 0 0 2px rgba(46, 125, 50, 0.06);
         }
 
+        .day-red {
+            background: #FFF5F5;
+            border-color: #FECACA;
+        }
+
+        .day-red .day-number {
+            color: #B91C1C;
+        }
+
         .day-empty { background: transparent; }
 
         .day-disabled {
@@ -752,6 +799,24 @@ def db_check():
     with engine.connect() as conn:
         conn.execute(text("SELECT 1"))
     return {"status": "ok", "db": "connected"}
+
+
+@app.get("/receipts/{file_id}/{filename}")
+def receipt_file(file_id: str, filename: str, db: Session = Depends(get_db)):
+    ensure_receipt_files_table(db)
+    row = db.execute(text("""
+        SELECT original_filename, content_type, data
+        FROM receipt_files
+        WHERE file_id = :file_id
+        LIMIT 1
+    """), {"file_id": file_id}).mappings().first()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    content = bytes(row["data"])
+    media_type = row.get("content_type") or "application/octet-stream"
+    return StreamingResponse(BytesIO(content), media_type=media_type)
 
 
 @app.get("/active-period")
@@ -998,6 +1063,42 @@ def build_day_href(fio: str, point_code: str, y: int, m: int, day: int, is_submi
     return f"/toggle-day?fio={escape(fio)}&point_code={escape(point_code)}&day={day}"
 
 
+def russian_non_working_dates(year: int) -> set[date]:
+    """Основные нерабочие праздничные дни РФ + перенос на понедельник, если праздник выпал на выходной.
+
+    Это нужно только для визуальной подсветки календаря. Расчёт оплаты не меняет.
+    """
+    fixed_ranges = []
+    # Новогодние каникулы и Рождество
+    for d in range(1, 9):
+        fixed_ranges.append(date(year, 1, d))
+
+    fixed_days = [
+        date(year, 2, 23),
+        date(year, 3, 8),
+        date(year, 5, 1),
+        date(year, 5, 9),
+        date(year, 6, 12),
+        date(year, 11, 4),
+    ]
+
+    result = set(fixed_ranges + fixed_days)
+
+    # Базовый перенос: если праздник попал на субботу/воскресенье, подсвечиваем ближайший понедельник.
+    # Для точных ежегодных переносов можно позже добавить отдельную админ-таблицу производственного календаря.
+    for d in fixed_days:
+        if d.weekday() == 5:
+            result.add(d + __import__("datetime").timedelta(days=2))
+        elif d.weekday() == 6:
+            result.add(d + __import__("datetime").timedelta(days=1))
+
+    return result
+
+
+def is_calendar_red_day(current_date: date) -> bool:
+    return current_date.weekday() >= 5 or current_date in russian_non_working_dates(current_date.year)
+
+
 def build_calendar_html(
     fio: str,
     point_code: str,
@@ -1038,7 +1139,12 @@ def build_calendar_html(
         current_date = date(y, m, day)
         inventory_allowed = current_date.weekday() in (4, 5) or current_date in special_inventory_days
         href = build_day_href(fio, point_code, y, m, day, is_submitted, inventory_allowed)
-        cls = "day day-disabled" if is_submitted else "day"
+        cls_parts = ["day"]
+        if is_calendar_red_day(current_date):
+            cls_parts.append("day-red")
+        if is_submitted:
+            cls_parts.append("day-disabled")
+        cls = " ".join(cls_parts)
 
         html += f"""
         <a class="{cls}" href="{href}">
@@ -1559,12 +1665,9 @@ async def save_point_reimbursement(
     new_paths = []
     for receipt in reimb_receipts or []:
         if receipt and receipt.filename:
-            ext = Path(receipt.filename).suffix.lower()
-            filename = f"{uuid.uuid4().hex}{ext}"
-            filepath = UPLOAD_DIR / filename
             content = await receipt.read()
-            filepath.write_bytes(content)
-            new_paths.append(f"uploads/{filename}")
+            if content:
+                new_paths.append(save_receipt_file_to_db(db, receipt.filename, receipt.content_type, content))
 
     if reimb_amount_value <= 0 or not reimb_comment_value or not new_paths:
         return HTMLResponse(f"""
@@ -1632,13 +1735,10 @@ async def save_point_adjustment(
     receipt_path = existing.get("reimb_receipt")
     new_receipt_paths = []
     if reimb_receipt and reimb_receipt.filename:
-        ext = Path(reimb_receipt.filename).suffix.lower()
-        filename = f"{uuid.uuid4().hex}{ext}"
-        filepath = UPLOAD_DIR / filename
         content = await reimb_receipt.read()
-        filepath.write_bytes(content)
-        new_receipt_paths.append(f"uploads/{filename}")
-        receipt_path = append_receipt_paths(receipt_path, new_receipt_paths)
+        if content:
+            new_receipt_paths.append(save_receipt_file_to_db(db, reimb_receipt.filename, reimb_receipt.content_type, content))
+            receipt_path = append_receipt_paths(receipt_path, new_receipt_paths)
 
     add_note_amount = int(note_amount or 0)
     add_note_comment = (note_comment or "").strip()
