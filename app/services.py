@@ -243,10 +243,17 @@ def get_supply_boxes_map(db: Session, point_code: str, y: int, m: int) -> dict[i
 
 
 def get_supply_days_for_point(db: Session, point_code: str, y: int, m: int) -> list[date]:
+    """Return only paid supply days for the point.
+
+    Days with fewer than 5 boxes are not treated as a paid supply unless
+    the point has pay_lt5 enabled. This keeps the "Не принимал поставку"
+    dropdown consistent with the calendar badge and payment calculation.
+    """
     start = month_start(y, m)
     end = month_end_exclusive(y, m)
+    rates = get_point_rates(db, point_code, y, m)
     rows = db.execute(text("""
-        SELECT supply_date
+        SELECT supply_date, boxes
         FROM supplies
         WHERE point_code = :point_code
           AND supply_date >= :start_date
@@ -257,8 +264,14 @@ def get_supply_days_for_point(db: Session, point_code: str, y: int, m: int) -> l
         "point_code": point_code,
         "start_date": start,
         "end_date": end,
-    }).all()
-    return [r[0] for r in rows if r and r[0]]
+    }).mappings().all()
+
+    result = []
+    for row in rows:
+        boxes = int(row["boxes"] or 0)
+        if effective_has_supply(boxes, bool(rates.get("pay_lt5"))):
+            result.append(row["supply_date"])
+    return result
 
 
 def get_supply_adjustment_amount(db: Session, point_code: str, y: int, m: int) -> int:
@@ -802,16 +815,21 @@ def get_all_tu_values(db: Session) -> list[str]:
 
 
 def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, status: str | None = None):
-    """Fast admin report builder: one grouped SQL query instead of per-row recalculation."""
+    """Fast admin report builder.
+
+    Важно: отчёт должен включать точки, где нет выходов, но есть примечание/возмещение.
+    Поэтому базовый список точек берём из visits UNION point_adjustments.
+    Пересечение считается только при полном совпадении: дата + точка + слот.
+    """
     ensure_monthly_submissions_table(db)
     ensure_point_adjustments_table(db)
-    start = month_start(y, m)
-    end = month_end_exclusive(y, m)
+    start_date = month_start(y, m)
+    end_date = month_end_exclusive(y, m)
 
     params = {
-        "start_date": start,
-        "end_date": end,
-        "month_key": start,
+        "start_date": start_date,
+        "end_date": end_date,
+        "month_key": start_date,
         "slot_day": SLOT_DAY,
         "slot_full_invent": SLOT_FULL_INVENT,
         "default_rate_supply": DEFAULT_RATE_SUPPLY,
@@ -827,23 +845,54 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
 
     sql = f"""
         WITH base_points AS (
-            SELECT DISTINCT v.merchant_id, v.point_code
-            FROM visits v
-            WHERE v.visit_date >= :start_date
-              AND v.visit_date < :end_date
+            SELECT DISTINCT merchant_id, point_code
+            FROM visits
+            WHERE visit_date >= :start_date
+              AND visit_date < :end_date
 
             UNION
 
-            SELECT DISTINCT pa.merchant_id, pa.point_code
-            FROM point_adjustments pa
-            WHERE pa.month_key = :month_key
+            SELECT DISTINCT merchant_id, point_code
+            FROM point_adjustments
+            WHERE month_key = :month_key
               AND (
-                    COALESCE(pa.note_amount, 0) <> 0
-                 OR COALESCE(pa.reimb_amount, 0) <> 0
-                 OR COALESCE(TRIM(pa.note_comment), '') <> ''
-                 OR COALESCE(TRIM(pa.reimb_comment), '') <> ''
-                 OR COALESCE(TRIM(pa.reimb_receipt), '') <> ''
+                    COALESCE(note_amount, 0) <> 0
+                 OR COALESCE(reimb_amount, 0) <> 0
+                 OR COALESCE(TRIM(note_comment), '') <> ''
+                 OR COALESCE(TRIM(reimb_comment), '') <> ''
+                 OR COALESCE(TRIM(reimb_receipt), '') <> ''
               )
+        ),
+        visit_agg AS (
+            SELECT
+                v.merchant_id,
+                v.point_code,
+                SUM(CASE
+                    WHEN v.slot = :slot_day
+                     AND COALESCE(s.boxes, 0) > 0
+                     AND (COALESCE(pr.pay_lt5, FALSE) = TRUE OR COALESCE(s.boxes, 0) >= 5)
+                    THEN 1 ELSE 0 END) AS cnt_supply,
+
+                SUM(CASE
+                    WHEN v.slot = :slot_day
+                     AND NOT (
+                        COALESCE(s.boxes, 0) > 0
+                        AND (COALESCE(pr.pay_lt5, FALSE) = TRUE OR COALESCE(s.boxes, 0) >= 5)
+                     )
+                    THEN 1 ELSE 0 END) AS cnt_no_supply,
+
+                SUM(CASE WHEN v.slot = :slot_full_invent THEN 1 ELSE 0 END) AS cnt_full_inv,
+                SUM(CASE WHEN v.slot = :slot_day THEN 1 ELSE 0 END) AS cnt_day_total
+            FROM visits v
+            LEFT JOIN supplies s
+              ON s.point_code = v.point_code
+             AND s.supply_date = v.visit_date
+            LEFT JOIN point_rates pr
+              ON pr.point_code = v.point_code
+             AND pr.month_key = :month_key
+            WHERE v.visit_date >= :start_date
+              AND v.visit_date < :end_date
+            GROUP BY v.merchant_id, v.point_code
         ),
         overlap_rows AS (
             SELECT DISTINCT v1.merchant_id, v1.point_code
@@ -880,32 +929,15 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
             pa.reimb_receipt AS reimb_receipt,
             CASE WHEN ov.merchant_id IS NULL THEN FALSE ELSE TRUE END AS has_overlap,
 
-            SUM(CASE
-                WHEN v.slot = :slot_day
-                 AND COALESCE(s.boxes, 0) > 0
-                 AND (COALESCE(pr.pay_lt5, FALSE) = TRUE OR COALESCE(s.boxes, 0) >= 5)
-                THEN 1 ELSE 0 END) AS cnt_supply,
-
-            SUM(CASE
-                WHEN v.slot = :slot_day
-                 AND NOT (
-                    COALESCE(s.boxes, 0) > 0
-                    AND (COALESCE(pr.pay_lt5, FALSE) = TRUE OR COALESCE(s.boxes, 0) >= 5)
-                 )
-                THEN 1 ELSE 0 END) AS cnt_no_supply,
-
-            SUM(CASE WHEN v.slot = :slot_full_invent THEN 1 ELSE 0 END) AS cnt_full_inv,
-            SUM(CASE WHEN v.slot = :slot_day THEN 1 ELSE 0 END) AS cnt_day_total
+            COALESCE(va.cnt_supply, 0) AS cnt_supply,
+            COALESCE(va.cnt_no_supply, 0) AS cnt_no_supply,
+            COALESCE(va.cnt_full_inv, 0) AS cnt_full_inv,
+            COALESCE(va.cnt_day_total, 0) AS cnt_day_total
         FROM base_points bp
         JOIN merchants m ON m.id = bp.merchant_id
-        LEFT JOIN visits v
-          ON v.merchant_id = bp.merchant_id
-         AND v.point_code = bp.point_code
-         AND v.visit_date >= :start_date
-         AND v.visit_date < :end_date
-        LEFT JOIN supplies s
-          ON s.point_code = bp.point_code
-         AND s.supply_date = v.visit_date
+        LEFT JOIN visit_agg va
+          ON va.merchant_id = bp.merchant_id
+         AND va.point_code = bp.point_code
         LEFT JOIN point_rates pr
           ON pr.point_code = bp.point_code
          AND pr.month_key = :month_key
@@ -921,13 +953,6 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
          AND ov.point_code = bp.point_code
         WHERE 1=1
           {tu_sql}
-        GROUP BY
-            bp.merchant_id, bp.point_code, m.fio, m.tu,
-            ms.status, ms.comment, ms.extra_amount, ms.receipt_path,
-            pr.rate_supply, pr.rate_no_supply, pr.rate_inventory,
-            pr.coffee_enabled, pr.coffee_rate, pr.pay_lt5,
-            pa.note_amount, pa.note_comment, pa.reimb_amount, pa.reimb_comment, pa.reimb_receipt,
-            ov.merchant_id
         ORDER BY m.tu NULLS LAST, m.fio, bp.point_code
     """
 
@@ -962,7 +987,7 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
             "fio": row["fio"],
             "tu": row["tu"] or "",
             "point_code": row["point_code"],
-            "month_key": str(start),
+            "month_key": str(start_date),
             "status": status_value,
             "comment": row["monthly_comment"] or "",
             "extra_amount": int(row["monthly_extra_amount"] or 0),
@@ -987,7 +1012,6 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
             "point_total": point_total,
         })
     return result
-
 
 def get_admin_payroll_rows(db: Session, y: int, m: int, tu: str | None = None, status: str | None = None):
     rows = get_admin_report_rows(db, y, m, tu, status)
