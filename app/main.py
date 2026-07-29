@@ -1,28 +1,10 @@
-import hmac
-import os
-
-from fastapi import FastAPI, Depends, HTTPException, Form, Request, Response
+from fastapi import FastAPI, Depends, HTTPException, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 from app.db import SessionLocal, engine
-from app.admin import router as admin_router
-from app.records import router as records_router
-from app.migrations import migrate
-from app.security import (
-    ADMIN_COOKIE,
-    SESSION_COOKIE,
-    cookie_secure,
-    make_session,
-    read_session,
-    require_admin,
-    require_merchant,
-    safe,
-    url,
-    verify_csrf,
-)
 from app.services import (
     get_active_period,
     login_user,
@@ -32,7 +14,6 @@ from app.services import (
     get_supply_boxes_map,
     get_visits_for_month,
     get_merchant_by_fio,
-    get_merchant_by_id,
     toggle_day_visit,
     toggle_inventory_visit,
     compute_point_total,
@@ -40,34 +21,11 @@ from app.services import (
     days_in_month,
     weekday_of,
     month_title,
-    inventory_allowed,
-    is_submitted,
-    effective_has_supply,
 )
 
 app = FastAPI()
-app.include_router(admin_router)
-app.include_router(records_router)
 
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
-
-
-@app.on_event("startup")
-def run_additive_migrations():
-    migrate(engine)
-
-
-@app.middleware("http")
-async def security_headers(request: Request, call_next):
-    response = await call_next(request)
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "same-origin"
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data:; form-action 'self'; frame-ancestors 'none'"
-    )
-    return response
 
 
 def get_db():
@@ -96,32 +54,19 @@ def active_period():
 
 
 @app.get("/debug/merchants-columns")
-def merchants_columns(request: Request, db: Session = Depends(get_db)):
-    require_admin(request)
+def merchants_columns(db: Session = Depends(get_db)):
     cols = get_merchants_columns(db)
     return {"table": "merchants", "columns": cols}
 
 
 @app.post("/login")
-def login_api(response: Response, fio: str, last4: str, db: Session = Depends(get_db)):
+def login_api(fio: str, last4: str, db: Session = Depends(get_db)):
     user = login_user(db, fio, last4)
 
     if not user:
         raise HTTPException(status_code=401, detail="Неверные данные")
 
-    response.set_cookie(
-        SESSION_COOKIE, make_session(str(user["id"]), "merchant"), httponly=True,
-        secure=cookie_secure(), samesite="lax", max_age=12 * 60 * 60,
-    )
-    return {"status": "ok", "active_period": get_active_period(), "user": {"fio": user["fio"], "tu": user["tu"]}}
-
-
-def current_merchant(request: Request, db: Session) -> tuple[dict, dict]:
-    session = require_merchant(request)
-    merchant = get_merchant_by_id(db, int(session["sub"]))
-    if not merchant:
-        raise HTTPException(status_code=401, detail="Merchant no longer exists")
-    return merchant, session
+    return {"status": "ok", "active_period": get_active_period(), "user": user}
 
 
 def base_css():
@@ -609,24 +554,20 @@ def login_submit(
 </html>
 """
 
-    response = RedirectResponse(url="/menu-page", status_code=303)
-    response.set_cookie(
-        SESSION_COOKIE,
-        make_session(str(user["id"]), "merchant"),
-        httponly=True,
-        secure=cookie_secure(),
-        samesite="lax",
-        max_age=12 * 60 * 60,
+    fio_safe = user["fio"]
+    return RedirectResponse(
+        url=f"/menu-page?fio={fio_safe}",
+        status_code=303
     )
-    return response
 
 
 @app.get("/menu-page", response_class=HTMLResponse)
-def menu_page(request: Request, db: Session = Depends(get_db)):
+def menu_page(fio: str = "", db: Session = Depends(get_db)):
     period = get_active_period()
-    merchant, session = current_merchant(request, db)
-    fio = safe(merchant["fio"])
-    overall = compute_overall_total(db, merchant["id"], period["year"], period["month"])
+    merchant = get_merchant_by_fio(db, fio)
+    overall = {"total": 0}
+    if merchant:
+        overall = compute_overall_total(db, merchant["id"], period["year"], period["month"])
 
     return f"""
 <!DOCTYPE html>
@@ -652,8 +593,8 @@ def menu_page(request: Request, db: Session = Depends(get_db)):
                 <div class="sum-value">{overall["total"]} ₽</div>
             </div>
 
-            <a class="btn" href="/point-page">Заполнить сверку</a>
-            <a class="btn btn-secondary" href="/summary-page">Моя сумма</a>
+            <a class="btn" href="/point-page?fio={fio}">Заполнить сверку</a>
+            <a class="btn btn-secondary" href="/summary-page?fio={fio}">Моя сумма</a>
         </div>
     </div>
 </body>
@@ -662,10 +603,8 @@ def menu_page(request: Request, db: Session = Depends(get_db)):
 
 
 @app.get("/point-page", response_class=HTMLResponse)
-def point_page(request: Request, db: Session = Depends(get_db)):
+def point_page(fio: str = ""):
     period = get_active_period()
-    merchant, session = current_merchant(request, db)
-    fio = safe(merchant["fio"])
 
     return f"""
 <!DOCTYPE html>
@@ -688,7 +627,7 @@ def point_page(request: Request, db: Session = Depends(get_db)):
             </div>
 
             <form method="post" action="/point-page">
-                <input type="hidden" name="csrf_token" value="{safe(session["csrf"])}" />
+                <input type="hidden" name="fio" value="{fio}" />
 
                 <label for="point_code">Номер точки</label>
                 <input id="point_code" name="point_code" type="text" placeholder="2674" required />
@@ -696,7 +635,7 @@ def point_page(request: Request, db: Session = Depends(get_db)):
                 <button class="btn" type="submit">Продолжить</button>
             </form>
 
-            <a class="back" href="/menu-page">← Назад</a>
+            <a class="back" href="/menu-page?fio={fio}">← Назад</a>
         </div>
     </div>
 </body>
@@ -706,15 +645,11 @@ def point_page(request: Request, db: Session = Depends(get_db)):
 
 @app.post("/point-page", response_class=HTMLResponse)
 def point_submit(
-    request: Request,
+    fio: str = Form(...),
     point_code: str = Form(...),
-    csrf_token: str = Form(...),
     db: Session = Depends(get_db)
 ):
     period = get_active_period()
-    merchant, session = current_merchant(request, db)
-    verify_csrf(session, csrf_token)
-    fio = safe(merchant["fio"])
     point_code = normalize_point_code(point_code)
 
     if not point_code or len(point_code) < 3:
@@ -732,7 +667,7 @@ def point_submit(
         <div class="card">
             <h1>Ошибка</h1>
             <div class="error-box">Номер точки слишком короткий.</div>
-            <a class="back" href="/point-page">← Назад</a>
+            <a class="back" href="/point-page?fio={fio}">← Назад</a>
         </div>
     </div>
 </body>
@@ -765,7 +700,7 @@ def point_submit(
                 <br><br>
                 Проверьте номер точки или обратитесь к управляющему.
             </div>
-            <a class="back" href="/point-page">← Попробовать снова</a>
+            <a class="back" href="/point-page?fio={fio}">← Попробовать снова</a>
         </div>
     </div>
 </body>
@@ -773,12 +708,12 @@ def point_submit(
 """
 
     return RedirectResponse(
-        url=url("/calendar-page", point_code=point_code),
+        url=f"/calendar-page?fio={fio}&point_code={point_code}",
         status_code=303
     )
 
 
-def build_calendar_html(point_code: str, y: int, m: int, boxes_map: dict[int, int], visits: dict[int, set[str]], pay_lt5: bool) -> str:
+def build_calendar_html(fio: str, point_code: str, y: int, m: int, boxes_map: dict[int, int], visits: dict[int, set[str]]) -> str:
     dim = days_in_month(y, m)
     first_wd = weekday_of(y, m, 1)
 
@@ -800,7 +735,7 @@ def build_calendar_html(point_code: str, y: int, m: int, boxes_map: dict[int, in
 
         badges = ""
 
-        if effective_has_supply(boxes, pay_lt5):
+        if boxes > 0:
             badges += '<span class="badge badge-supply">П</span>'
 
         if "DAY" in day_visits:
@@ -810,7 +745,7 @@ def build_calendar_html(point_code: str, y: int, m: int, boxes_map: dict[int, in
             badges += '<span class="badge badge-inv">И</span>'
 
         html += f"""
-        <a class="day" href="{safe(url("/day-action-page", point_code=point_code, day=day))}">
+        <a class="day" href="/day-action-page?fio={fio}&point_code={point_code}&day={day}">
             <div class="day-number">{day}</div>
             <div class="day-badges">{badges}</div>
         </a>
@@ -820,66 +755,9 @@ def build_calendar_html(point_code: str, y: int, m: int, boxes_map: dict[int, in
     return html
 
 
-def build_records_html(db: Session, merchant_id: int, point_code: str, y: int, m: int, csrf: str, locked: bool) -> str:
-    notes = db.execute(text("""
-        SELECT id, amount, comment, kind, adjustment_date FROM point_notes
-        WHERE merchant_id=:merchant_id AND point_code=:point_code AND year=:year AND month=:month
-        ORDER BY created_at, id
-    """), {"merchant_id": merchant_id, "point_code": point_code, "year": y, "month": m}).mappings().all()
-    reimbursements = db.execute(text("""
-        SELECT r.id, r.amount, r.comment, rr.id AS receipt_id, rr.original_name
-        FROM point_reimbursements r
-        LEFT JOIN reimbursement_receipts rr ON rr.reimbursement_id=r.id
-        WHERE r.merchant_id=:merchant_id AND r.point_code=:point_code AND r.year=:year AND r.month=:month
-        ORDER BY r.created_at, r.id, rr.id
-    """), {"merchant_id": merchant_id, "point_code": point_code, "year": y, "month": m}).mappings().all()
-    note_rows = "".join(f"""
-        <div class="hint">{safe(row["amount"])} ₽ — {safe(row["comment"])}
-        <form method="post" action="/notes/{row["id"]}/delete">
-          <input type="hidden" name="csrf_token" value="{safe(csrf)}">
-          <button class="btn btn-secondary btn-small" {'disabled' if locked else ''}>Удалить</button>
-        </form></div>""" for row in notes)
-    grouped: dict[int, dict] = {}
-    for row in reimbursements:
-        grouped.setdefault(row["id"], {"amount": row["amount"], "comment": row["comment"], "receipts": []})
-        if row["receipt_id"]:
-            grouped[row["id"]]["receipts"].append(
-                f'<a href="/receipts/{row["receipt_id"]}">{safe(row["original_name"])}</a>'
-            )
-    reimbursement_rows = "".join(f"""
-        <div class="hint">{safe(item["amount"])} ₽ — {safe(item["comment"])}<br>{"; ".join(item["receipts"])}
-        <form method="post" action="/reimbursements/{record_id}/delete">
-          <input type="hidden" name="csrf_token" value="{safe(csrf)}">
-          <button class="btn btn-secondary btn-small" {'disabled' if locked else ''}>Удалить</button>
-        </form></div>""" for record_id, item in grouped.items())
-    disabled = "disabled" if locked else ""
-    return f"""
-      <h2>Примечания</h2>
-      {note_rows or '<div class="hint">Примечаний пока нет.</div>'}
-      <form method="post" action="/notes">
-        <input type="hidden" name="csrf_token" value="{safe(csrf)}">
-        <input type="hidden" name="point_code" value="{safe(point_code)}">
-        <label>Сумма (может быть отрицательной)</label><input name="amount" required {disabled}>
-        <label>Комментарий</label><input name="comment" required {disabled}>
-        <button class="btn btn-small" {disabled}>Добавить примечание</button>
-      </form>
-      <h2>Возмещения</h2>
-      {reimbursement_rows or '<div class="hint">Возмещений пока нет.</div>'}
-      <form method="post" action="/reimbursements" enctype="multipart/form-data">
-        <input type="hidden" name="csrf_token" value="{safe(csrf)}">
-        <input type="hidden" name="point_code" value="{safe(point_code)}">
-        <label>Сумма</label><input name="amount" required {disabled}>
-        <label>Комментарий</label><input name="comment" required {disabled}>
-        <label>Чеки (PDF, PNG или JPEG, можно несколько)</label>
-        <input name="receipts" type="file" accept=".pdf,.png,.jpg,.jpeg" multiple required {disabled}>
-        <button class="btn btn-small" {disabled}>Добавить возмещение</button>
-      </form>
-    """
-
-
 @app.get("/calendar-page", response_class=HTMLResponse)
 def calendar_page(
-    request: Request,
+    fio: str,
     point_code: str,
     db: Session = Depends(get_db)
 ):
@@ -887,29 +765,18 @@ def calendar_page(
     y = period["year"]
     m = period["month"]
 
-    merchant, session = current_merchant(request, db)
-    fio = safe(merchant["fio"])
-    point_code = normalize_point_code(point_code)
+    merchant = get_merchant_by_fio(db, fio)
+    if not merchant:
+        return RedirectResponse(url="/login-page", status_code=303)
 
     boxes_map = get_supply_boxes_map(db, point_code, y, m)
     visits = get_visits_for_month(db, merchant["id"], point_code, y, m)
     point_total = compute_point_total(db, merchant["id"], point_code, y, m)
     overall = compute_overall_total(db, merchant["id"], y, m)
-    calendar_html = build_calendar_html(point_code, y, m, boxes_map, visits, point_total["pay_lt5"])
-    locked = is_submitted(db, merchant["id"], y, m)
-    records_html = build_records_html(db, merchant["id"], point_code, y, m, session["csrf"], locked)
+    calendar_html = build_calendar_html(fio, point_code, y, m, boxes_map, visits)
 
-    coffee_html = ""
-    if point_total["coffee_enabled"]:
-        coffee_html = f"""
-                <div class="info-box">
-                    <div class="info-label">Кофемашина</div>
-                    <div class="info-value">Да, {point_total["coffee_rate"]} ₽</div>
-                </div>
-        """
-    rates_warning = "" if point_total["rates_configured"] else (
-        '<div class="error-box">Для точки не настроены ставки. Итог временно рассчитан с нулевыми ставками.</div>'
-    )
+    coffee_text = "Да" if point_total["coffee_enabled"] else "Нет"
+    coffee_rate_text = f'{point_total["coffee_rate"]} ₽' if point_total["coffee_enabled"] else "—"
 
     return f"""
 <!DOCTYPE html>
@@ -946,14 +813,21 @@ def calendar_page(
                     <div class="info-value">{month_title(y, m)}</div>
                 </div>
 
-                {coffee_html}
+                <div class="info-box">
+                    <div class="info-label">Кофемашина</div>
+                    <div class="info-value">{coffee_text}</div>
+                </div>
+
+                <div class="info-box">
+                    <div class="info-label">Ставка кофемашины</div>
+                    <div class="info-value">{coffee_rate_text}</div>
+                </div>
 
                 <div class="info-box">
                     <div class="info-label">Правило поставок</div>
                     <div class="info-value">До 5 коробок не оплачивается</div>
                 </div>
             </div>
-            {rates_warning}
 
             <div class="sum-grid">
                 <div class="sum-box">
@@ -966,10 +840,10 @@ def calendar_page(
                     <div class="sum-value">{overall["total"]} ₽</div>
                 </div>
 
-                {f'''<div class="sum-box">
+                <div class="sum-box">
                     <div class="sum-title">Начислено за кофемашину</div>
                     <div class="sum-value">{point_total["coffee_sum"]} ₽</div>
-                </div>''' if point_total["coffee_enabled"] else ''}
+                </div>
             </div>
 
             <div class="calendar-wrap">
@@ -990,9 +864,8 @@ def calendar_page(
             <div class="calendar-note">
                 Поставки до 5 коробок не оплачиваются.
             </div>
-            {records_html}
 
-            <a class="back" href="/point-page">← Выбрать другую точку</a>
+            <a class="back" href="/point-page?fio={fio}">← Выбрать другую точку</a>
         </div>
     </div>
 </body>
@@ -1002,7 +875,7 @@ def calendar_page(
 
 @app.get("/day-action-page", response_class=HTMLResponse)
 def day_action_page(
-    request: Request,
+    fio: str,
     point_code: str,
     day: int,
     db: Session = Depends(get_db)
@@ -1011,19 +884,18 @@ def day_action_page(
     y = period["year"]
     m = period["month"]
 
-    merchant, session = current_merchant(request, db)
-    point_code = normalize_point_code(point_code)
-    if not point_code:
-        raise HTTPException(status_code=400, detail="Invalid point code")
+    merchant = get_merchant_by_fio(db, fio)
+    if not merchant:
+        return RedirectResponse(url="/login-page", status_code=303)
 
     if day < 1 or day > days_in_month(y, m):
-        return RedirectResponse(url=url("/calendar-page", point_code=point_code), status_code=303)
+        return RedirectResponse(url=f"/calendar-page?fio={fio}&point_code={point_code}", status_code=303)
 
     visits = get_visits_for_month(db, merchant["id"], point_code, y, m)
     day_visits = visits.get(day, set())
 
-    can_inventory = inventory_allowed(db, y, m, day)
-    locked = is_submitted(db, merchant["id"], y, m)
+    wd = weekday_of(y, m, day)
+    is_fri_or_sat = wd in (4, 5)
 
     day_btn_text = "Убрать выход" if "DAY" in day_visits else "Добавить выход"
     inv_btn_text = "Убрать полный инвент" if "FULL_INVENT" in day_visits else "Добавить полный инвент"
@@ -1048,29 +920,18 @@ def day_action_page(
             </div>
 
             <div class="action-list">
-                <form method="post" action="/toggle-day">
-                    <input type="hidden" name="csrf_token" value="{safe(session["csrf"])}">
-                    <input type="hidden" name="point_code" value="{safe(point_code)}">
-                    <input type="hidden" name="day" value="{day}">
-                    <button class="btn btn-small" type="submit" {'disabled' if locked else ''}>
+                <a class="btn btn-small" href="/toggle-day?fio={fio}&point_code={point_code}&day={day}">
                     {day_btn_text}
-                    </button>
-                </form>
+                </a>
 
                 {f'''
-                <form method="post" action="/toggle-inventory">
-                    <input type="hidden" name="csrf_token" value="{safe(session["csrf"])}">
-                    <input type="hidden" name="point_code" value="{safe(point_code)}">
-                    <input type="hidden" name="day" value="{day}">
-                    <button class="btn btn-secondary btn-small" type="submit" {'disabled' if locked else ''}>
+                <a class="btn btn-secondary btn-small" href="/toggle-inventory?fio={fio}&point_code={point_code}&day={day}">
                     {inv_btn_text}
-                    </button>
-                </form>
-                ''' if can_inventory else ''}
+                </a>
+                ''' if is_fri_or_sat else ''}
             </div>
 
-            {'<div class="error-box">Сверка отправлена и заблокирована для изменений.</div>' if locked else ''}
-            <a class="back" href="{safe(url("/calendar-page", point_code=point_code))}">← Назад к календарю</a>
+            <a class="back" href="/calendar-page?fio={fio}&point_code={point_code}">← Назад к календарю</a>
         </div>
     </div>
 </body>
@@ -1078,68 +939,64 @@ def day_action_page(
 """
 
 
-@app.post("/toggle-day")
+@app.get("/toggle-day")
 def toggle_day(
-    request: Request,
-    point_code: str = Form(...),
-    day: int = Form(...),
-    csrf_token: str = Form(...),
+    fio: str,
+    point_code: str,
+    day: int,
     db: Session = Depends(get_db)
 ):
     period = get_active_period()
     y = period["year"]
     m = period["month"]
 
-    merchant, session = current_merchant(request, db)
-    verify_csrf(session, csrf_token)
-    point_code = normalize_point_code(point_code)
-    if is_submitted(db, merchant["id"], y, m):
-        raise HTTPException(status_code=409, detail="Reconciliation is submitted")
+    merchant = get_merchant_by_fio(db, fio)
+    if not merchant:
+        return RedirectResponse(url="/login-page", status_code=303)
 
     if 1 <= day <= days_in_month(y, m):
         toggle_day_visit(db, merchant["id"], point_code, y, m, day)
 
     return RedirectResponse(
-        url=url("/calendar-page", point_code=point_code),
+        url=f"/calendar-page?fio={fio}&point_code={point_code}",
         status_code=303
     )
 
 
-@app.post("/toggle-inventory")
+@app.get("/toggle-inventory")
 def toggle_inventory(
-    request: Request,
-    point_code: str = Form(...),
-    day: int = Form(...),
-    csrf_token: str = Form(...),
+    fio: str,
+    point_code: str,
+    day: int,
     db: Session = Depends(get_db)
 ):
     period = get_active_period()
     y = period["year"]
     m = period["month"]
 
-    merchant, session = current_merchant(request, db)
-    verify_csrf(session, csrf_token)
-    point_code = normalize_point_code(point_code)
-    if is_submitted(db, merchant["id"], y, m):
-        raise HTTPException(status_code=409, detail="Reconciliation is submitted")
+    merchant = get_merchant_by_fio(db, fio)
+    if not merchant:
+        return RedirectResponse(url="/login-page", status_code=303)
 
     if 1 <= day <= days_in_month(y, m):
-        if inventory_allowed(db, y, m, day):
+        wd = weekday_of(y, m, day)
+        if wd in (4, 5):
             toggle_inventory_visit(db, merchant["id"], point_code, y, m, day)
 
     return RedirectResponse(
-        url=url("/calendar-page", point_code=point_code),
+        url=f"/calendar-page?fio={fio}&point_code={point_code}",
         status_code=303
     )
 
 
 @app.get("/summary-page", response_class=HTMLResponse)
-def summary_page(request: Request, db: Session = Depends(get_db)):
+def summary_page(fio: str = "", db: Session = Depends(get_db)):
     period = get_active_period()
-    merchant, session = current_merchant(request, db)
-    fio = safe(merchant["fio"])
-    overall = compute_overall_total(db, merchant["id"], period["year"], period["month"])
-    locked = is_submitted(db, merchant["id"], period["year"], period["month"])
+    merchant = get_merchant_by_fio(db, fio)
+    overall = {"total": 0, "per_point": {}}
+
+    if merchant:
+        overall = compute_overall_total(db, merchant["id"], period["year"], period["month"])
 
     point_lines = ""
     if overall["per_point"]:
@@ -1174,13 +1031,8 @@ def summary_page(request: Request, db: Session = Depends(get_db)):
             <div class="hint">
                 Сейчас открыт период за {month_title(period["year"], period["month"])}.
             </div>
-            {f'<div class="hint">Сверка отправлена. Изменения заблокированы.</div>' if locked else f'''
-            <form method="post" action="/submit-reconciliation">
-                <input type="hidden" name="csrf_token" value="{safe(session["csrf"])}">
-                <button class="btn" type="submit">Отправить сверку по всем точкам — {overall["total"]} ₽</button>
-            </form>'''}
 
-            <a class="back" href="/menu-page">← Назад</a>
+            <a class="back" href="/menu-page?fio={fio}">← Назад</a>
         </div>
     </div>
 </body>

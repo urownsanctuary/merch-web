@@ -1,10 +1,7 @@
 import os
 import re
 import hashlib
-import hmac
-import math
 from datetime import date, timedelta
-from decimal import Decimal
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
@@ -16,6 +13,12 @@ if not SECRET_SALT:
 SLOT_DAY = "DAY"
 SLOT_FULL_INVENT = "FULL_INVENT"
 
+DEFAULT_RATE_SUPPLY = 800
+DEFAULT_RATE_NO_SUPPLY = 400
+DEFAULT_RATE_INVENTORY = 400
+DEFAULT_RATE_COFFEE = 100
+
+
 def fio_norm(s: str) -> str:
     s = (s or "").strip().lower()
     s = s.replace("ё", "е")
@@ -26,10 +29,7 @@ def fio_norm(s: str) -> str:
 
 
 def hash_last4(last4: str) -> str:
-    normalized = (last4 or "").strip()
-    if not re.fullmatch(r"\d{4}", normalized):
-        return ""
-    s = (normalized + SECRET_SALT).encode("utf-8")
+    s = (last4.strip() + SECRET_SALT).encode("utf-8")
     return hashlib.sha256(s).hexdigest()
 
 
@@ -92,7 +92,7 @@ def login_user(db: Session, fio: str, last4: str):
 
     incoming_hash = hash_last4(last4)
 
-    if not incoming_hash or not hmac.compare_digest(incoming_hash, str(result["pass_hash"])):
+    if incoming_hash != result["pass_hash"]:
         return None
 
     return {
@@ -157,11 +157,7 @@ def month_title(y: int, m: int) -> str:
 def normalize_point_code(v) -> str:
     s = str(v or "").strip()
     s = re.sub(r"\s+", "", s)
-    return s if re.fullmatch(r"[A-Za-zА-Яа-я0-9_-]{1,32}", s) else ""
-
-
-def _day_of(value) -> int:
-    return value.day if hasattr(value, "day") else date.fromisoformat(str(value)[:10]).day
+    return s
 
 
 def point_has_any_supply_in_month(db: Session, point_code: str, y: int, m: int) -> bool:
@@ -203,7 +199,7 @@ def get_supply_boxes_map(db: Session, point_code: str, y: int, m: int) -> dict[i
 
     result: dict[int, int] = {}
     for row in rows:
-        day = _day_of(row["supply_date"])
+        day = row["supply_date"].day
         result[day] = int(row["boxes"] or 0)
 
     return result
@@ -229,7 +225,7 @@ def get_visits_for_month(db: Session, merchant_id: int, point_code: str, y: int,
 
     result: dict[int, set[str]] = {}
     for row in rows:
-        day = _day_of(row["visit_date"])
+        day = row["visit_date"].day
         result.setdefault(day, set()).add(str(row["slot"]))
 
     return result
@@ -331,23 +327,21 @@ def get_point_rates(db: Session, point_code: str, y: int, m: int):
 
     if not row:
         return {
-            "rate_supply": 0,
-            "rate_no_supply": 0,
-            "rate_inventory": 0,
+            "rate_supply": DEFAULT_RATE_SUPPLY,
+            "rate_no_supply": DEFAULT_RATE_NO_SUPPLY,
+            "rate_inventory": DEFAULT_RATE_INVENTORY,
             "coffee_enabled": False,
-            "coffee_rate": 0,
+            "coffee_rate": DEFAULT_RATE_COFFEE,
             "pay_lt5": False,
-            "rates_configured": False,
         }
 
     return {
-        "rate_supply": int(row["rate_supply"] or 0),
-        "rate_no_supply": int(row["rate_no_supply"] or 0),
-        "rate_inventory": int(row["rate_inventory"] or 0),
+        "rate_supply": int(row["rate_supply"] or DEFAULT_RATE_SUPPLY),
+        "rate_no_supply": int(row["rate_no_supply"] or DEFAULT_RATE_NO_SUPPLY),
+        "rate_inventory": int(row["rate_inventory"] or DEFAULT_RATE_INVENTORY),
         "coffee_enabled": bool(row["coffee_enabled"]),
-        "coffee_rate": int(row["coffee_rate"] or 0),
+        "coffee_rate": int(row["coffee_rate"] or DEFAULT_RATE_COFFEE),
         "pay_lt5": bool(row["pay_lt5"]),
-        "rates_configured": all(row[name] is not None for name in ("rate_supply", "rate_no_supply", "rate_inventory")),
     }
 
 
@@ -362,7 +356,7 @@ def compute_point_total(db: Session, merchant_id: int, point_code: str, y: int, 
     visits = get_visits_for_month(db, merchant_id, point_code, y, m)
     rates = get_point_rates(db, point_code, y, m)
 
-    total = Decimal("0")
+    total = 0
     cnt_supply = 0
     cnt_no_supply = 0
     cnt_day_total = 0
@@ -383,23 +377,10 @@ def compute_point_total(db: Session, merchant_id: int, point_code: str, y: int, 
             cnt_full_inv += 1
             total += rates["rate_inventory"]
 
-    coffee_sum = Decimal("0")
+    coffee_sum = 0
     if rates["coffee_enabled"] and cnt_day_total > 0:
-        coffee_sum = Decimal(rates["coffee_rate"]) * cnt_day_total
+        coffee_sum = rates["coffee_rate"] * cnt_day_total
         total += coffee_sum
-
-    adjustments = db.execute(text("""
-        SELECT
-            COALESCE((SELECT SUM(amount) FROM point_notes
-                WHERE merchant_id=:merchant_id AND point_code=:point_code AND year=:year AND month=:month), 0) AS notes,
-            COALESCE((SELECT SUM(amount) FROM point_reimbursements
-                WHERE merchant_id=:merchant_id AND point_code=:point_code AND year=:year AND month=:month), 0) AS reimbursements
-    """), {
-        "merchant_id": merchant_id, "point_code": point_code, "year": y, "month": m
-    }).mappings().one()
-    notes_sum = Decimal(str(adjustments["notes"] or 0))
-    reimbursements_sum = Decimal(str(adjustments["reimbursements"] or 0))
-    total += notes_sum + reimbursements_sum
 
     return {
         "total": total,
@@ -410,13 +391,10 @@ def compute_point_total(db: Session, merchant_id: int, point_code: str, y: int, 
         "coffee_enabled": rates["coffee_enabled"],
         "coffee_rate": rates["coffee_rate"],
         "coffee_sum": coffee_sum,
-        "notes_sum": notes_sum,
-        "reimbursements_sum": reimbursements_sum,
         "pay_lt5": rates["pay_lt5"],
         "rate_supply": rates["rate_supply"],
         "rate_no_supply": rates["rate_no_supply"],
         "rate_inventory": rates["rate_inventory"],
-        "rates_configured": rates["rates_configured"],
     }
 
 
@@ -425,23 +403,16 @@ def get_points_for_month(db: Session, merchant_id: int, y: int, m: int) -> list[
     end = month_end_exclusive(y, m)
 
     rows = db.execute(text("""
-        SELECT DISTINCT point_code FROM (
-            SELECT point_code FROM visits
-            WHERE merchant_id=:merchant_id AND visit_date >= :start_date AND visit_date < :end_date
-            UNION ALL
-            SELECT point_code FROM point_notes
-            WHERE merchant_id=:merchant_id AND year=:year AND month=:month
-            UNION ALL
-            SELECT point_code FROM point_reimbursements
-            WHERE merchant_id=:merchant_id AND year=:year AND month=:month
-        ) AS owned_points
+        SELECT DISTINCT point_code
+        FROM visits
+        WHERE merchant_id = :merchant_id
+          AND visit_date >= :start_date
+          AND visit_date < :end_date
         ORDER BY point_code
     """), {
         "merchant_id": merchant_id,
         "start_date": start,
-        "end_date": end,
-        "year": y,
-        "month": m,
+        "end_date": end
     }).all()
 
     return [r[0] for r in rows if r and r[0]]
@@ -461,36 +432,3 @@ def compute_overall_total(db: Session, merchant_id: int, y: int, m: int):
         "total": total,
         "per_point": per_point
     }
-
-
-def get_merchant_by_id(db: Session, merchant_id: int):
-    result = db.execute(text("""
-        SELECT id, fio, fio_norm, telegram_id, tu, created_at
-        FROM merchants WHERE id=:merchant_id LIMIT 1
-    """), {"merchant_id": merchant_id}).mappings().first()
-    return dict(result) if result else None
-
-
-def payroll_gross(total: Decimal | int | float) -> int:
-    return math.ceil(Decimal(str(total)) / Decimal("0.87"))
-
-
-def is_real_intersection(slot_a: str, slot_b: str) -> bool:
-    return slot_a not in {SLOT_DAY, SLOT_FULL_INVENT} and slot_a == slot_b
-
-
-def inventory_allowed(db: Session, y: int, m: int, day: int) -> bool:
-    target = date(y, m, day)
-    if target.weekday() in (4, 5):
-        return True
-    return db.execute(text("""
-        SELECT 1 FROM special_inventory_dates WHERE inventory_date=:target LIMIT 1
-    """), {"target": target}).first() is not None
-
-
-def is_submitted(db: Session, merchant_id: int, y: int, m: int) -> bool:
-    return db.execute(text("""
-        SELECT 1 FROM reconciliation_submissions
-        WHERE merchant_id=:merchant_id AND year=:year AND month=:month AND reopened_at IS NULL
-        LIMIT 1
-    """), {"merchant_id": merchant_id, "year": y, "month": m}).first() is not None
