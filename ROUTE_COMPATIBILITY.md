@@ -50,4 +50,3 @@ redirects; the same paths now also accept protected POST forms.
 | `GET /admin-export-check` | preserved | complete filtered dataset | n/a | export inventory |
 | `GET /admin-export-payroll` | preserved | complete filtered dataset | n/a | export inventory |
 | `GET /admin-export-overlaps` | preserved | MORNING/EVENING only, no A/B duplicates | n/a | intersection tests |
-
