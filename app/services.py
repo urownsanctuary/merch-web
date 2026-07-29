@@ -2,17 +2,24 @@ import os
 import re
 import math
 import hashlib
+import hmac
 from datetime import date, datetime, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import text, bindparam
 from openpyxl import load_workbook
+from app.security import request_merchant_matches
 
 SECRET_SALT = os.getenv("SECRET_SALT")
 if not SECRET_SALT:
     raise RuntimeError("SECRET_SALT is not set")
 
-SLOT_DAY = "DAY"
+SLOT_MORNING = "MORNING"
+SLOT_EVENING = "EVENING"
+SLOT_DAY = "DAY"  # backward-compatible value for records created before explicit slot selection
 SLOT_FULL_INVENT = "FULL_INVENT"
+VISIT_SLOTS = frozenset({SLOT_MORNING, SLOT_EVENING, SLOT_DAY})
+OVERLAP_SLOTS = frozenset({SLOT_MORNING, SLOT_EVENING})
+ALL_SLOTS = frozenset({*VISIT_SLOTS, SLOT_FULL_INVENT})
 
 DEFAULT_RATE_SUPPLY = 800
 DEFAULT_RATE_NO_SUPPLY = 400
@@ -30,7 +37,10 @@ def fio_norm(s: str) -> str:
 
 
 def hash_last4(last4: str) -> str:
-    s = (last4.strip() + SECRET_SALT).encode("utf-8")
+    normalized = str(last4 or "").strip()
+    if not re.fullmatch(r"\d{4}", normalized):
+        return ""
+    s = (normalized + SECRET_SALT).encode("utf-8")
     return hashlib.sha256(s).hexdigest()
 
 
@@ -90,7 +100,8 @@ def login_user(db: Session, fio: str, last4: str):
 
     if not result:
         return None
-    if hash_last4(last4) != result["pass_hash"]:
+    incoming = hash_last4(last4)
+    if not incoming or not hmac.compare_digest(incoming, str(result["pass_hash"])):
         return None
 
     return {
@@ -105,6 +116,8 @@ def login_user(db: Session, fio: str, last4: str):
 
 def get_merchant_by_fio(db: Session, fio: str):
     fio_n = fio_norm(fio)
+    if not request_merchant_matches(fio_n):
+        return None
     result = db.execute(
         text(
             """
@@ -197,7 +210,7 @@ def month_title(y: int, m: int) -> str:
 def normalize_point_code(v) -> str:
     s = str(v or "").strip()
     s = re.sub(r"\s+", "", s)
-    return s
+    return s if re.fullmatch(r"[A-Za-zА-Яа-я0-9_-]{1,32}", s) else ""
 
 
 def point_has_any_supply_in_month(db: Session, point_code: str, y: int, m: int) -> bool:
@@ -309,7 +322,24 @@ def get_visits_for_month(db: Session, merchant_id: int, point_code: str, y: int,
     return result
 
 
-def toggle_day_visit(db: Session, merchant_id: int, point_code: str, y: int, m: int, day: int):
+def normalize_visit_slot(slot: str | None, *, allow_legacy_day: bool = True) -> str:
+    normalized = str(slot or "").strip().upper()
+    allowed = VISIT_SLOTS if allow_legacy_day else OVERLAP_SLOTS
+    if normalized not in allowed:
+        raise ValueError("Unsupported visit slot")
+    return normalized
+
+
+def toggle_day_visit(
+    db: Session,
+    merchant_id: int,
+    point_code: str,
+    y: int,
+    m: int,
+    day: int,
+    slot: str = SLOT_DAY,
+):
+    slot = normalize_visit_slot(slot)
     visit_date = date(y, m, day)
     existing = db.execute(
         text(
@@ -327,7 +357,7 @@ def toggle_day_visit(db: Session, merchant_id: int, point_code: str, y: int, m: 
             "merchant_id": merchant_id,
             "point_code": point_code,
             "visit_date": visit_date,
-            "slot": SLOT_DAY,
+            "slot": slot,
         },
     ).scalar()
 
@@ -348,7 +378,7 @@ def toggle_day_visit(db: Session, merchant_id: int, point_code: str, y: int, m: 
             "merchant_id": merchant_id,
             "point_code": point_code,
             "visit_date": visit_date,
-            "slot": SLOT_DAY,
+            "slot": slot,
         },
     )
     db.commit()
@@ -705,7 +735,7 @@ def compute_point_total(db: Session, merchant_id: int, point_code: str, y: int, 
     sum_inventory = 0
 
     for day, slots in visits.items():
-        if SLOT_DAY in slots:
+        for work_slot in slots.intersection(VISIT_SLOTS):
             cnt_day_total += 1
             boxes = boxes_map.get(day, 0)
             if effective_has_supply(boxes, rates["pay_lt5"]):
@@ -831,6 +861,8 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
         "end_date": end_date,
         "month_key": start_date,
         "slot_day": SLOT_DAY,
+        "slot_morning": SLOT_MORNING,
+        "slot_evening": SLOT_EVENING,
         "slot_full_invent": SLOT_FULL_INVENT,
         "default_rate_supply": DEFAULT_RATE_SUPPLY,
         "default_rate_no_supply": DEFAULT_RATE_NO_SUPPLY,
@@ -868,13 +900,13 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
                 v.merchant_id,
                 v.point_code,
                 SUM(CASE
-                    WHEN v.slot = :slot_day
+                    WHEN v.slot IN (:slot_day, :slot_morning, :slot_evening)
                      AND COALESCE(s.boxes, 0) > 0
                      AND (COALESCE(pr.pay_lt5, FALSE) = TRUE OR COALESCE(s.boxes, 0) >= 5)
                     THEN 1 ELSE 0 END) AS cnt_supply,
 
                 SUM(CASE
-                    WHEN v.slot = :slot_day
+                    WHEN v.slot IN (:slot_day, :slot_morning, :slot_evening)
                      AND NOT (
                         COALESCE(s.boxes, 0) > 0
                         AND (COALESCE(pr.pay_lt5, FALSE) = TRUE OR COALESCE(s.boxes, 0) >= 5)
@@ -882,7 +914,7 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
                     THEN 1 ELSE 0 END) AS cnt_no_supply,
 
                 SUM(CASE WHEN v.slot = :slot_full_invent THEN 1 ELSE 0 END) AS cnt_full_inv,
-                SUM(CASE WHEN v.slot = :slot_day THEN 1 ELSE 0 END) AS cnt_day_total
+                SUM(CASE WHEN v.slot IN (:slot_day, :slot_morning, :slot_evening) THEN 1 ELSE 0 END) AS cnt_day_total
             FROM visits v
             LEFT JOIN supplies s
               ON s.point_code = v.point_code
@@ -904,6 +936,7 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
              AND v1.merchant_id <> v2.merchant_id
             WHERE v1.visit_date >= :start_date
               AND v1.visit_date < :end_date
+              AND v1.slot IN (:slot_morning, :slot_evening)
         )
         SELECT
             bp.merchant_id,
@@ -1057,6 +1090,7 @@ def get_intersections_rows(db: Session, y: int, m: int, tu: str | None = None):
         JOIN merchants m2 ON m2.id = v2.merchant_id
         WHERE v1.visit_date >= :start_date
           AND v1.visit_date < :end_date
+          AND v1.slot IN ('MORNING', 'EVENING')
     """
     params = {"start_date": start, "end_date": end}
     if tu:
@@ -1074,6 +1108,32 @@ def get_intersections_rows(db: Session, y: int, m: int, tu: str | None = None):
         "tu2": r["tu2"] or "",
         "slot2": r["slot2"],
     } for r in rows]
+
+
+def find_visit_intersections(visits: list[dict]) -> list[dict]:
+    """Pure reference implementation used by tests and non-SQL exports."""
+    grouped: dict[tuple, dict[int, str]] = {}
+    for visit in visits:
+        slot = str(visit.get("slot") or "").upper()
+        if slot not in OVERLAP_SLOTS:
+            continue
+        key = (visit.get("point_code"), visit.get("visit_date"), slot)
+        grouped.setdefault(key, {})[int(visit["merchant_id"])] = str(visit.get("fio") or "")
+    result = []
+    for (point_code, visit_date, slot), merchants in sorted(grouped.items(), key=lambda item: str(item[0])):
+        ids = sorted(merchants)
+        for left_index, merchant_a in enumerate(ids):
+            for merchant_b in ids[left_index + 1:]:
+                result.append({
+                    "point_code": point_code,
+                    "visit_date": visit_date,
+                    "slot": slot,
+                    "merchant_a": merchant_a,
+                    "fio_a": merchants[merchant_a],
+                    "merchant_b": merchant_b,
+                    "fio_b": merchants[merchant_b],
+                })
+    return result
 
 
 # ===== импорт файлов =====
@@ -1173,12 +1233,14 @@ def import_supplies_xlsx(db: Session, file_obj) -> dict:
     loaded_points = set()
     loaded_dates = set()
 
-    for row in rows_iter:
+    for row_idx, row in enumerate(rows_iter, start=2):
         if not row:
             continue
 
         point_code = normalize_point_code(row[0] if len(row) > 0 else None)
         if not point_code:
+            if any(value not in (None, "") for value in row):
+                raise ValueError(f"Ошибка в строке поставок {row_idx}: некорректный номер точки")
             continue
 
         row_has_any_supply = False
@@ -1190,8 +1252,10 @@ def import_supplies_xlsx(db: Session, file_obj) -> dict:
 
             try:
                 boxes = int(float(raw_boxes))
-            except Exception:
-                continue
+            except Exception as exc:
+                raise ValueError(f"Ошибка в строке поставок {row_idx}: некорректное число коробок") from exc
+            if boxes < 0:
+                raise ValueError(f"Ошибка в строке поставок {row_idx}: число коробок не может быть отрицательным")
 
             supply_rows.append({
                 "point_code": point_code,
@@ -1280,26 +1344,35 @@ def upsert_rate_row(db: Session, point_code: str, month_key: date, rate_supply: 
 
 
 def import_rates_xlsx(db: Session, file_obj, year: int, month: int) -> dict:
-    wb = load_workbook(file_obj, data_only=True)
+    wb = load_workbook(file_obj, data_only=True, read_only=True)
     ws = wb[wb.sheetnames[0]]
     month_key = month_start(year, month)
-    loaded_rows = 0
-
-    for row_idx in range(2, ws.max_row + 1):
-        point_code = normalize_point_code(ws.cell(row=row_idx, column=1).value)
-        if not point_code:
+    parsed = []
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        if not any(value not in (None, "") for value in row):
             continue
-        rate_supply = int(ws.cell(row=row_idx, column=2).value or 0)
-        rate_no_supply = int(ws.cell(row=row_idx, column=3).value or 0)
-        rate_inventory = int(ws.cell(row=row_idx, column=4).value or 0)
-        coffee_enabled = str(ws.cell(row=row_idx, column=5).value or "").strip().lower() == "да"
-        pay_lt5 = str(ws.cell(row=row_idx, column=6).value or "").strip().lower() == "да"
-        coffee_rate = int(ws.cell(row=row_idx, column=7).value or 0)
-        upsert_rate_row(db, point_code, month_key, rate_supply, rate_no_supply, rate_inventory, coffee_enabled, coffee_rate, pay_lt5)
-        loaded_rows += 1
-
-    db.commit()
-    return {"loaded_rows": loaded_rows}
+        try:
+            point_code = normalize_point_code(row[0])
+            if not point_code:
+                raise ValueError("пустой номер точки")
+            rates = [int(row[index] or 0) for index in (1, 2, 3, 6)]
+            if any(value < 0 for value in rates):
+                raise ValueError("ставка не может быть отрицательной")
+            coffee_enabled = str(row[4] or "").strip().lower() in {"да", "true", "1"}
+            pay_lt5 = str(row[5] or "").strip().lower() in {"да", "true", "1"}
+            parsed.append((point_code, rates[0], rates[1], rates[2], coffee_enabled, rates[3], pay_lt5))
+        except (ValueError, TypeError, IndexError) as exc:
+            raise ValueError(f"Ошибка в строке ставок {row_idx}: {exc}") from exc
+    if not parsed:
+        raise ValueError("В файле ставок нет данных")
+    try:
+        for values in parsed:
+            upsert_rate_row(db, values[0], month_key, *values[1:])
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return {"loaded_rows": len(parsed)}
 
 
 def upsert_merchant_row(db: Session, fio: str, last4: str, tu: str):
@@ -1332,21 +1405,30 @@ def upsert_merchant_row(db: Session, fio: str, last4: str, tu: str):
 
 
 def import_merchants_xlsx(db: Session, file_obj, tu: str) -> dict:
-    wb = load_workbook(file_obj, data_only=True)
+    wb = load_workbook(file_obj, data_only=True, read_only=True)
     ws = wb[wb.sheetnames[0]]
-    loaded_rows = 0
-    for row_idx in range(2, ws.max_row + 1):
-        fio = ws.cell(row=row_idx, column=1).value
-        last4 = ws.cell(row=row_idx, column=2).value
-        if not fio or last4 is None:
+    tu = str(tu or "").strip()
+    if not tu:
+        raise ValueError("ТУ обязателен")
+    parsed = []
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        if not any(value not in (None, "") for value in row):
             continue
-        last4_str = re.sub(r"\D", "", str(last4))[-4:]
-        if len(last4_str) != 4:
-            continue
-        upsert_merchant_row(db, str(fio), last4_str, tu)
-        loaded_rows += 1
-    db.commit()
-    return {"loaded_rows": loaded_rows}
+        fio = str(row[0] or "").strip()
+        last4_str = re.sub(r"\D", "", str(row[1] if len(row) > 1 else ""))[-4:]
+        if not fio or len(last4_str) != 4:
+            raise ValueError(f"Ошибка в строке мерчендайзеров {row_idx}: нужны ФИО и последние 4 цифры")
+        parsed.append((fio, last4_str))
+    if not parsed:
+        raise ValueError("В файле мерчендайзеров нет данных")
+    try:
+        for fio, last4 in parsed:
+            upsert_merchant_row(db, fio, last4, tu)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return {"loaded_rows": len(parsed)}
 
 
 def clear_month_data(db: Session, year: int, month: int) -> dict:

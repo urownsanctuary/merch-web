@@ -2,13 +2,14 @@
 import os
 import uuid
 import hashlib
+import hmac
 from datetime import date, datetime
 from io import BytesIO
 from html import escape
 from pathlib import Path
 from typing import Optional, List
 
-from fastapi import FastAPI, Depends, HTTPException, Form, UploadFile, File, Cookie
+from fastapi import FastAPI, Depends, HTTPException, Form, UploadFile, File, Cookie, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
@@ -57,9 +58,40 @@ from app.services import (
     get_supply_adjustment_amount,
     get_point_rates,
     effective_has_supply,
+    SLOT_MORNING,
+    SLOT_EVENING,
+    normalize_visit_slot,
+)
+from app.production_calendar import (
+    calendar_day_off,
+    get_calendar_overrides,
+    import_calendar_xlsx,
+)
+from app.security import (
+    MERCHANT_COOKIE,
+    create_merchant_session,
+    read_merchant_session,
+    reset_request_merchant,
+    secure_cookie,
+    set_request_merchant,
+    verify_csrf,
 )
 
 app = FastAPI()
+
+
+@app.middleware("http")
+async def bind_merchant_identity(request: Request, call_next):
+    session = read_merchant_session(request.cookies.get(MERCHANT_COOKIE))
+    context_token = set_request_merchant(session.get("sub") if session else None)
+    try:
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "same-origin"
+        return response
+    finally:
+        reset_request_merchant(context_token)
 
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
@@ -70,6 +102,7 @@ app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 ADMIN_LOGIN = os.getenv("ADMIN_LOGIN", "")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 SECRET_SALT = os.getenv("SECRET_SALT", "")
+MAX_RECEIPT_BYTES = int(os.getenv("MAX_RECEIPT_BYTES", str(5 * 1024 * 1024)))
 
 
 def get_db():
@@ -88,7 +121,7 @@ def get_admin_cookie_value() -> str:
 def is_admin_authenticated(admin_auth: Optional[str]) -> bool:
     if not ADMIN_LOGIN or not ADMIN_PASSWORD or not SECRET_SALT:
         return False
-    return admin_auth == get_admin_cookie_value()
+    return bool(admin_auth) and hmac.compare_digest(admin_auth, get_admin_cookie_value())
 
 
 def style_sheet(ws):
@@ -148,26 +181,55 @@ def ensure_receipt_files_table(db: Session):
             original_filename TEXT,
             content_type TEXT,
             data BYTEA NOT NULL,
+            merchant_id INTEGER,
             created_at TIMESTAMP NOT NULL DEFAULT NOW()
         )
     """))
+    db.execute(text("ALTER TABLE receipt_files ADD COLUMN IF NOT EXISTS merchant_id INTEGER"))
     db.commit()
 
 
-def save_receipt_file_to_db(db: Session, original_filename: str | None, content_type: str | None, content: bytes) -> str:
+def validate_receipt(original_filename: str | None, content_type: str | None, content: bytes) -> None:
+    name = Path(original_filename or "").name
+    extension = Path(name).suffix.lower()
+    content_type = str(content_type or "").lower()
+    allowed = {
+        "application/pdf": ({".pdf"}, (b"%PDF-",)),
+        "image/png": ({".png"}, (b"\x89PNG\r\n\x1a\n",)),
+        "image/jpeg": ({".jpg", ".jpeg"}, (b"\xff\xd8\xff",)),
+        "image/webp": ({".webp"}, (b"RIFF",)),
+    }
+    if not content or len(content) > MAX_RECEIPT_BYTES:
+        raise ValueError("Чек пуст или превышает допустимый размер")
+    if content_type not in allowed or extension not in allowed[content_type][0]:
+        raise ValueError("Разрешены только PDF, PNG, JPEG и WEBP с корректным MIME")
+    if not any(content.startswith(signature) for signature in allowed[content_type][1]):
+        raise ValueError("Содержимое чека не соответствует заявленному типу")
+    if content_type == "image/webp" and content[8:12] != b"WEBP":
+        raise ValueError("Некорректный WEBP")
+
+
+def save_receipt_file_to_db(
+    db: Session,
+    merchant_id: int,
+    original_filename: str | None,
+    content_type: str | None,
+    content: bytes,
+) -> str:
     ensure_receipt_files_table(db)
+    validate_receipt(original_filename, content_type, content)
     file_id = uuid.uuid4().hex
     display_filename = safe_receipt_filename(original_filename)
     db.execute(text("""
-        INSERT INTO receipt_files (file_id, original_filename, content_type, data)
-        VALUES (:file_id, :original_filename, :content_type, :data)
+        INSERT INTO receipt_files (file_id, original_filename, content_type, data, merchant_id)
+        VALUES (:file_id, :original_filename, :content_type, :data, :merchant_id)
     """), {
         "file_id": file_id,
         "original_filename": original_filename or display_filename,
         "content_type": content_type or "application/octet-stream",
         "data": content,
+        "merchant_id": merchant_id,
     })
-    db.commit()
     return f"receipts/{file_id}/{display_filename}"
 
 
@@ -802,17 +864,39 @@ def db_check():
 
 
 @app.get("/receipts/{file_id}/{filename}")
-def receipt_file(file_id: str, filename: str, db: Session = Depends(get_db)):
+def receipt_file(
+    request: Request,
+    file_id: str,
+    filename: str,
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db),
+):
     ensure_receipt_files_table(db)
     row = db.execute(text("""
-        SELECT original_filename, content_type, data
-        FROM receipt_files
-        WHERE file_id = :file_id
+        SELECT rf.original_filename, rf.content_type, rf.data, rf.merchant_id, m.fio_norm
+        FROM receipt_files rf
+        LEFT JOIN merchants m ON m.id=rf.merchant_id
+        WHERE rf.file_id = :file_id
         LIMIT 1
     """), {"file_id": file_id}).mappings().first()
 
     if not row:
         raise HTTPException(status_code=404, detail="Not Found")
+    session = read_merchant_session(request.cookies.get(MERCHANT_COOKIE))
+    owner_allowed = bool(session and row["fio_norm"] and session.get("sub") == row["fio_norm"])
+    if session and row["merchant_id"] is None:
+        owner_allowed = db.execute(text("""
+            SELECT 1
+            FROM point_adjustments pa
+            JOIN merchants m ON m.id=pa.merchant_id
+            WHERE m.fio_norm=:fio_norm AND pa.reimb_receipt LIKE :receipt_path
+            LIMIT 1
+        """), {
+            "fio_norm": session["sub"],
+            "receipt_path": f"%receipts/{file_id}/%",
+        }).first() is not None
+    if not owner_allowed and not is_admin_authenticated(admin_auth):
+        raise HTTPException(status_code=403, detail="Forbidden")
 
     content = bytes(row["data"])
     media_type = row.get("content_type") or "application/octet-stream"
@@ -825,18 +909,31 @@ def active_period():
 
 
 @app.get("/debug/merchants-columns")
-def merchants_columns(db: Session = Depends(get_db)):
+def merchants_columns(
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db),
+):
+    if not is_admin_authenticated(admin_auth):
+        raise HTTPException(status_code=403, detail="Forbidden")
     cols = get_merchants_columns(db)
     return {"table": "merchants", "columns": cols}
 
 
 @app.post("/login")
-def login_api(fio: str, last4: str, db: Session = Depends(get_db)):
+def login_api(response: Response, fio: str, last4: str, db: Session = Depends(get_db)):
     user = login_user(db, fio, last4)
 
     if not user:
         raise HTTPException(status_code=401, detail="Неверные данные")
 
+    response.set_cookie(
+        MERCHANT_COOKIE,
+        create_merchant_session(user["fio_norm"]),
+        httponly=True,
+        secure=secure_cookie(),
+        samesite="lax",
+        max_age=12 * 60 * 60,
+    )
     return {"status": "ok", "active_period": get_active_period(), "user": user}
 
 
@@ -909,7 +1006,16 @@ def login_submit(
 </html>
 """
 
-    return RedirectResponse(url=f"/menu-page?fio={user['fio']}", status_code=303)
+    response = RedirectResponse(url=f"/menu-page?fio={user['fio']}", status_code=303)
+    response.set_cookie(
+        MERCHANT_COOKIE,
+        create_merchant_session(user["fio_norm"]),
+        httponly=True,
+        secure=secure_cookie(),
+        samesite="lax",
+        max_age=12 * 60 * 60,
+    )
+    return response
 
 
 @app.get("/menu-page", response_class=HTMLResponse)
@@ -1058,9 +1164,7 @@ def point_submit(
 def build_day_href(fio: str, point_code: str, y: int, m: int, day: int, is_submitted: bool, inventory_allowed: bool) -> str:
     if is_submitted:
         return "#"
-    if inventory_allowed:
-        return f"/day-action-page?fio={escape(fio)}&point_code={escape(point_code)}&day={day}"
-    return f"/toggle-day?fio={escape(fio)}&point_code={escape(point_code)}&day={day}"
+    return f"/day-action-page?fio={escape(fio)}&point_code={escape(point_code)}&day={day}"
 
 
 def russian_non_working_dates(year: int) -> set[date]:
@@ -1095,8 +1199,8 @@ def russian_non_working_dates(year: int) -> set[date]:
     return result
 
 
-def is_calendar_red_day(current_date: date) -> bool:
-    return current_date.weekday() >= 5 or current_date in russian_non_working_dates(current_date.year)
+def is_calendar_red_day(current_date: date, overrides: dict[date, bool]) -> bool:
+    return calendar_day_off(current_date, overrides)
 
 
 def build_calendar_html(
@@ -1108,6 +1212,7 @@ def build_calendar_html(
     visits: dict[int, set[str]],
     is_submitted: bool,
     special_inventory_days: set[date],
+    calendar_overrides: dict[date, bool],
     pay_lt5: bool = False
 ) -> str:
     dim = days_in_month(y, m)
@@ -1133,6 +1238,10 @@ def build_calendar_html(
             badges += '<span class="badge badge-supply">П</span>'
         if "DAY" in day_visits:
             badges += '<span class="badge badge-day">В</span>'
+        if "MORNING" in day_visits:
+            badges += '<span class="badge badge-day">У</span>'
+        if "EVENING" in day_visits:
+            badges += '<span class="badge badge-day">Вч</span>'
         if "FULL_INVENT" in day_visits:
             badges += '<span class="badge badge-inv">И</span>'
 
@@ -1140,7 +1249,7 @@ def build_calendar_html(
         inventory_allowed = current_date.weekday() in (4, 5) or current_date in special_inventory_days
         href = build_day_href(fio, point_code, y, m, day, is_submitted, inventory_allowed)
         cls_parts = ["day"]
-        if is_calendar_red_day(current_date):
+        if is_calendar_red_day(current_date, calendar_overrides):
             cls_parts.append("day-red")
         if is_submitted:
             cls_parts.append("day-disabled")
@@ -1182,6 +1291,7 @@ def calendar_page(
     point_total = compute_point_total(db, merchant["id"], point_code, y, m)
     point_adj = get_point_adjustment(db, merchant["id"], point_code, y, m) or {}
     special_inventory_days = set(get_special_inventory_days(db))
+    calendar_overrides = get_calendar_overrides(db, y, m)
 
     calendar_html = build_calendar_html(
         fio=fio,
@@ -1192,6 +1302,7 @@ def calendar_page(
         visits=visits,
         is_submitted=monthly_submitted,
         special_inventory_days=special_inventory_days,
+        calendar_overrides=calendar_overrides,
         pay_lt5=bool(point_total.get("pay_lt5"))
     )
 
@@ -1667,7 +1778,7 @@ async def save_point_reimbursement(
         if receipt and receipt.filename:
             content = await receipt.read()
             if content:
-                new_paths.append(save_receipt_file_to_db(db, receipt.filename, receipt.content_type, content))
+                new_paths.append(save_receipt_file_to_db(db, merchant["id"], receipt.filename, receipt.content_type, content))
 
     if reimb_amount_value <= 0 or not reimb_comment_value or not new_paths:
         return HTMLResponse(f"""
@@ -1737,7 +1848,7 @@ async def save_point_adjustment(
     if reimb_receipt and reimb_receipt.filename:
         content = await reimb_receipt.read()
         if content:
-            new_receipt_paths.append(save_receipt_file_to_db(db, reimb_receipt.filename, reimb_receipt.content_type, content))
+            new_receipt_paths.append(save_receipt_file_to_db(db, merchant["id"], reimb_receipt.filename, reimb_receipt.content_type, content))
             receipt_path = append_receipt_paths(receipt_path, new_receipt_paths)
 
     add_note_amount = int(note_amount or 0)
@@ -1869,6 +1980,7 @@ def delete_point_reimbursement(
 
 @app.get("/monthly-submit-page", response_class=HTMLResponse)
 def monthly_submit_page(
+    request: Request,
     fio: str,
     submitted: str = "",
     reopened: str = "",
@@ -1917,13 +2029,18 @@ def monthly_submit_page(
         <div class="detail-card" style="margin-top:18px;">
             <div class="detail-title">Статус</div>
             <div class="detail-line">Сверка за месяц отправлена</div>
-            <a class="btn btn-secondary" href="/reopen-monthly-submission?fio={escape(fio)}">Редактировать сверку</a>
+            <form method="post" action="/reopen-monthly-submission">
+                <input type="hidden" name="fio" value="{escape(fio)}" />
+                <input type="hidden" name="csrf_token" value="{escape(session["csrf"])}" />
+                <button class="btn btn-secondary" type="submit">Редактировать сверку</button>
+            </form>
         </div>
         """
     else:
         action_block = f"""
         <form method="post" action="/submit-monthly-submission">
             <input type="hidden" name="fio" value="{escape(fio)}" />
+            <input type="hidden" name="csrf_token" value="{escape(session["csrf"])}" />
             <button class="btn" type="submit">Отправить сверку за месяц</button>
         </form>
         """
@@ -1980,10 +2097,14 @@ def monthly_submit_page(
 
 @app.post("/submit-monthly-submission")
 async def submit_monthly_submission_route(
+    request: Request,
     fio: str = Form(...),
+    csrf_token: str = Form(...),
     db: Session = Depends(get_db)
 ):
     period = get_active_period()
+    if not verify_csrf(read_merchant_session(request.cookies.get(MERCHANT_COOKIE)), csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
     merchant = get_merchant_by_fio(db, fio)
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
@@ -2001,20 +2122,31 @@ def reopen_monthly_submission_route(
     fio: str,
     db: Session = Depends(get_db)
 ):
+    return RedirectResponse(
+        url=f"/monthly-submit-page?fio={escape(fio)}",
+        status_code=303
+    )
+
+
+@app.post("/reopen-monthly-submission")
+def reopen_monthly_submission_post(
+    request: Request,
+    fio: str = Form(...),
+    csrf_token: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    if not verify_csrf(read_merchant_session(request.cookies.get(MERCHANT_COOKIE)), csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
     period = get_active_period()
     merchant = get_merchant_by_fio(db, fio)
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
-
     reopen_monthly_submission(db, merchant["id"], period["year"], period["month"])
-
-    return RedirectResponse(
-        url=f"/monthly-submit-page?fio={escape(fio)}&reopened=1",
-        status_code=303
-    )
+    return RedirectResponse(url=f"/monthly-submit-page?fio={escape(fio)}&reopened=1", status_code=303)
 
 @app.get("/day-action-page", response_class=HTMLResponse)
 def day_action_page(
+    request: Request,
     fio: str,
     point_code: str,
     day: int,
@@ -2040,12 +2172,13 @@ def day_action_page(
 
     current_date = date(y, m, day)
     inventory_allowed = is_inventory_allowed_date(db, current_date)
+    session = read_merchant_session(request.cookies.get(MERCHANT_COOKIE))
+    if not session:
+        return RedirectResponse(url="/login-page", status_code=303)
 
-    day_btn_text = "Убрать выход" if "DAY" in day_visits else "Добавить выход"
+    morning_btn_text = "Убрать утренний выход" if "MORNING" in day_visits else "Добавить утренний выход"
+    evening_btn_text = "Убрать вечерний выход" if "EVENING" in day_visits else "Добавить вечерний выход"
     inv_btn_text = "Убрать полный инвент" if "FULL_INVENT" in day_visits else "Добавить полный инвент"
-
-    if not inventory_allowed:
-        return RedirectResponse(url=f"/toggle-day?fio={escape(fio)}&point_code={escape(point_code)}&day={day}", status_code=303)
 
     return f"""
 <!DOCTYPE html>
@@ -2066,13 +2199,38 @@ def day_action_page(
                 Дата: {day:02d}.{m:02d}.{y}
             </div>
 
-            <a class="btn btn-small" href="/toggle-day?fio={escape(fio)}&point_code={escape(point_code)}&day={day}">
-                {day_btn_text}
-            </a>
+            <form method="post" action="/toggle-day">
+                <input type="hidden" name="fio" value="{escape(fio)}" />
+                <input type="hidden" name="point_code" value="{escape(point_code)}" />
+                <input type="hidden" name="day" value="{day}" />
+                <input type="hidden" name="slot" value="MORNING" />
+                <input type="hidden" name="csrf_token" value="{escape(session["csrf"])}" />
+                <button class="btn btn-small" type="submit">{morning_btn_text}</button>
+            </form>
+            <form method="post" action="/toggle-day">
+                <input type="hidden" name="fio" value="{escape(fio)}" />
+                <input type="hidden" name="point_code" value="{escape(point_code)}" />
+                <input type="hidden" name="day" value="{day}" />
+                <input type="hidden" name="slot" value="EVENING" />
+                <input type="hidden" name="csrf_token" value="{escape(session["csrf"])}" />
+                <button class="btn btn-small" type="submit">{evening_btn_text}</button>
+            </form>
+            {f'''<form method="post" action="/toggle-day">
+                <input type="hidden" name="fio" value="{escape(fio)}" />
+                <input type="hidden" name="point_code" value="{escape(point_code)}" />
+                <input type="hidden" name="day" value="{day}" />
+                <input type="hidden" name="slot" value="DAY" />
+                <input type="hidden" name="csrf_token" value="{escape(session["csrf"])}" />
+                <button class="btn btn-secondary btn-small" type="submit">Убрать старый выход без слота</button>
+            </form>''' if "DAY" in day_visits else ''}
 
-            <a class="btn btn-secondary btn-small" href="/toggle-inventory?fio={escape(fio)}&point_code={escape(point_code)}&day={day}">
-                {inv_btn_text}
-            </a>
+            {f'''<form method="post" action="/toggle-inventory">
+                <input type="hidden" name="fio" value="{escape(fio)}" />
+                <input type="hidden" name="point_code" value="{escape(point_code)}" />
+                <input type="hidden" name="day" value="{day}" />
+                <input type="hidden" name="csrf_token" value="{escape(session["csrf"])}" />
+                <button class="btn btn-secondary btn-small" type="submit">{inv_btn_text}</button>
+            </form>''' if inventory_allowed else ''}
 
             <a class="back" href="/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}">← Назад к календарю</a>
         </div>
@@ -2089,21 +2247,45 @@ def toggle_day(
     day: int,
     db: Session = Depends(get_db)
 ):
-    period = get_active_period()
-    y = period["year"]
-    m = period["month"]
+    return RedirectResponse(
+        url=f"/day-action-page?fio={escape(fio)}&point_code={escape(point_code)}&day={day}",
+        status_code=303,
+    )
 
+
+@app.post("/toggle-day")
+def toggle_day_post(
+    request: Request,
+    fio: str = Form(...),
+    point_code: str = Form(...),
+    day: int = Form(...),
+    slot: str = Form(...),
+    csrf_token: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    session = read_merchant_session(request.cookies.get(MERCHANT_COOKIE))
+    if not verify_csrf(session, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
+    period = get_active_period()
     merchant = get_merchant_by_fio(db, fio)
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
-
-    overall = compute_overall_total(db, merchant["id"], y, m)
-    if overall["submission_status"] == "submitted":
-        return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}", status_code=303)
-
-    if 1 <= day <= days_in_month(y, m):
-        toggle_day_visit(db, merchant["id"], point_code, y, m, day)
-
+    session = read_merchant_session(request.cookies.get(MERCHANT_COOKIE))
+    if not session:
+        return RedirectResponse(url="/login-page", status_code=303)
+    if compute_overall_total(db, merchant["id"], period["year"], period["month"])["submission_status"] == "submitted":
+        raise HTTPException(status_code=409, detail="Reconciliation is submitted")
+    if str(slot).upper() == "DAY":
+        existing = get_visits_for_month(
+            db, merchant["id"], point_code, period["year"], period["month"]
+        ).get(day, set())
+        if "DAY" not in existing:
+            raise HTTPException(status_code=422, detail="Legacy DAY may only be removed")
+        normalized_slot = "DAY"
+    else:
+        normalized_slot = normalize_visit_slot(slot, allow_legacy_day=False)
+    if 1 <= day <= days_in_month(period["year"], period["month"]):
+        toggle_day_visit(db, merchant["id"], point_code, period["year"], period["month"], day, normalized_slot)
     return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}", status_code=303)
 
 
@@ -2114,23 +2296,34 @@ def toggle_inventory(
     day: int,
     db: Session = Depends(get_db)
 ):
-    period = get_active_period()
-    y = period["year"]
-    m = period["month"]
+    return RedirectResponse(
+        url=f"/day-action-page?fio={escape(fio)}&point_code={escape(point_code)}&day={day}",
+        status_code=303,
+    )
 
+
+@app.post("/toggle-inventory")
+def toggle_inventory_post(
+    request: Request,
+    fio: str = Form(...),
+    point_code: str = Form(...),
+    day: int = Form(...),
+    csrf_token: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    session = read_merchant_session(request.cookies.get(MERCHANT_COOKIE))
+    if not verify_csrf(session, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
+    period = get_active_period()
     merchant = get_merchant_by_fio(db, fio)
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
-
-    overall = compute_overall_total(db, merchant["id"], y, m)
-    if overall["submission_status"] == "submitted":
-        return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}", status_code=303)
-
-    if 1 <= day <= days_in_month(y, m):
-        current_date = date(y, m, day)
+    if compute_overall_total(db, merchant["id"], period["year"], period["month"])["submission_status"] == "submitted":
+        raise HTTPException(status_code=409, detail="Reconciliation is submitted")
+    if 1 <= day <= days_in_month(period["year"], period["month"]):
+        current_date = date(period["year"], period["month"], day)
         if is_inventory_allowed_date(db, current_date):
-            toggle_inventory_visit(db, merchant["id"], point_code, y, m, day)
-
+            toggle_inventory_visit(db, merchant["id"], point_code, period["year"], period["month"], day)
     return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}", status_code=303)
 
 
@@ -2254,7 +2447,7 @@ def admin_login_submit(login: str = Form(...), password: str = Form(...)):
         value=get_admin_cookie_value(),
         httponly=True,
         samesite="lax",
-        secure=False,
+        secure=secure_cookie(),
         max_age=60 * 60 * 12,
     )
     return response
@@ -2597,6 +2790,15 @@ def admin_data_page(
 
                     {special_inventory_html}
                 </div>
+                <div class="detail-card">
+                    <div class="detail-title">Производственный календарь РФ</div>
+                    <form method="post" action="/admin-upload-production-calendar" enctype="multipart/form-data">
+                        <label for="calendar_file">XLSX: дата, выходной, название, источник</label>
+                        <input id="calendar_file" name="file" type="file" accept=".xlsx" required />
+                        <button class="btn" type="submit">Загрузить календарь</button>
+                    </form>
+                    <div class="hint">Явная запись рабочего дня переопределяет обычное правило субботы/воскресенья.</div>
+                </div>
             </div>
         </div>
     </div>
@@ -2619,7 +2821,25 @@ async def admin_upload_supplies(
         msg = f"Поставки загружены: строк {result['loaded_rows']}, точек {result['loaded_points']}."
         return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
     except Exception as e:
+        db.rollback()
         return RedirectResponse(url=f"/admin-data?error={str(e)}", status_code=303)
+
+
+@app.post("/admin-upload-production-calendar")
+async def admin_upload_production_calendar(
+    file: UploadFile = File(...),
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db),
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+    try:
+        result = import_calendar_xlsx(db, file.file)
+        msg = f"Производственный календарь загружен: строк {result['loaded_rows']}."
+        return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
+    except Exception as exc:
+        db.rollback()
+        return RedirectResponse(url=f"/admin-data?error={str(exc)}", status_code=303)
 
 
 @app.post("/admin-upload-rates")
@@ -2638,6 +2858,7 @@ async def admin_upload_rates(
         msg = f"Ставки загружены: строк {result['loaded_rows']}."
         return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
     except Exception as e:
+        db.rollback()
         return RedirectResponse(url=f"/admin-data?error={str(e)}", status_code=303)
 
 
@@ -2656,6 +2877,7 @@ async def admin_upload_merchants(
         msg = f"Мерчи загружены: строк {result['loaded_rows']}."
         return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
     except Exception as e:
+        db.rollback()
         return RedirectResponse(url=f"/admin-data?error={str(e)}", status_code=303)
 
 
