@@ -94,6 +94,15 @@ class RouteTests(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 403)
 
+    def test_cross_site_mutation_is_rejected_before_route(self):
+        with TestClient(app) as client:
+            response = client.post(
+                "/save-point-note-normal",
+                headers={"Origin": "https://attacker.invalid", "Sec-Fetch-Site": "cross-site"},
+                data={"fio": "Иванов Иван", "point_code": "P1", "note_amount": "1", "note_comment": "x"},
+            )
+        self.assertEqual(response.status_code, 403)
+
     def test_original_route_inventory_is_preserved(self):
         paths = {route.path for route in app.routes}
         original = {

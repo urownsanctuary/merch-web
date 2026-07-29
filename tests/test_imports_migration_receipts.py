@@ -6,6 +6,8 @@ from datetime import date
 os.environ.setdefault("DATABASE_URL", "sqlite+pysqlite:///:memory:")
 os.environ.setdefault("SECRET_SALT", "test-secret-salt-at-least-24-characters")
 os.environ.setdefault("SESSION_SECRET", "test-session-secret-at-least-24-characters")
+os.environ.setdefault("ADMIN_LOGIN", "admin")
+os.environ.setdefault("ADMIN_PASSWORD", "strong-password")
 os.environ.setdefault("ENVIRONMENT", "test")
 
 from openpyxl import Workbook
@@ -126,12 +128,16 @@ class ImportTests(unittest.TestCase):
 
     def test_production_calendar_workbook(self):
         file_obj = workbook_bytes(
-            ["дата", "выходной", "название", "источник"],
-            [[date(2026, 6, 12), "да", "День России", "admin"], [date(2026, 8, 1), "нет", "Рабочая суббота", "admin"]],
+            ["дата", "выходной день", "название", "источник", "комментарий"],
+            [
+                [date(2026, 6, 12), "да", "Тестовый праздник", "test", "синтетический пример"],
+                [date(2026, 8, 1), "нет", "Рабочая суббота", "test", "синтетический пример"],
+            ],
         )
         rows = parse_calendar_workbook(file_obj)
         self.assertTrue(rows[0]["is_day_off"])
         self.assertFalse(rows[1]["is_day_off"])
+        self.assertEqual(rows[0]["comment"], "синтетический пример")
 
 
 class ReceiptValidationTests(unittest.TestCase):

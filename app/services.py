@@ -293,6 +293,15 @@ def get_supply_adjustment_amount(db: Session, point_code: str, y: int, m: int) -
     return -max(0, diff)
 
 
+def no_supply_adjustment_marker(supply_date: date) -> str:
+    return f"Не принимал поставку {supply_date.strftime('%d.%m')}"
+
+
+def filter_unadjusted_supply_days(supply_days: list[date], note_comment: str | None) -> list[date]:
+    existing = str(note_comment or "")
+    return [day for day in supply_days if no_supply_adjustment_marker(day) not in existing]
+
+
 def get_visits_for_month(db: Session, merchant_id: int, point_code: str, y: int, m: int) -> dict[int, set[str]]:
     start = month_start(y, m)
     end = month_end_exclusive(y, m)

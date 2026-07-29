@@ -16,7 +16,9 @@ from app.services import (
     SLOT_MORNING,
     effective_has_supply,
     find_visit_intersections,
+    filter_unadjusted_supply_days,
     fio_norm,
+    no_supply_adjustment_marker,
     normalize_visit_slot,
 )
 
@@ -53,6 +55,12 @@ class SupplyRulesTests(unittest.TestCase):
 
     def test_pay_lt5(self):
         self.assertTrue(effective_has_supply(1, True))
+
+    def test_no_supply_adjustment_date_is_offered_once(self):
+        first = date(2026, 7, 4)
+        second = date(2026, 7, 11)
+        comment = f"-450 ₽ — {no_supply_adjustment_marker(first)}. smoke"
+        self.assertEqual(filter_unadjusted_supply_days([first, second], comment), [second])
 
 
 class SlotRulesTests(unittest.TestCase):

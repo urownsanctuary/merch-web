@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS production_calendar (
     calendar_date DATE PRIMARY KEY,
     is_day_off BOOLEAN NOT NULL,
     title TEXT NOT NULL DEFAULT '',
+    comment TEXT NOT NULL DEFAULT '',
     year INTEGER NOT NULL,
     source TEXT NOT NULL DEFAULT 'admin',
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -22,6 +23,11 @@ CREATE TABLE IF NOT EXISTS production_calendar (
 
 def ensure_production_calendar_table(db: Session, *, commit: bool = True) -> None:
     db.execute(text(CALENDAR_DDL))
+    dialect = getattr(getattr(getattr(db, "bind", None), "dialect", None), "name", "")
+    if dialect == "postgresql":
+        db.execute(text(
+            "ALTER TABLE production_calendar ADD COLUMN IF NOT EXISTS comment TEXT NOT NULL DEFAULT ''"
+        ))
     if commit:
         db.commit()
 
@@ -67,9 +73,10 @@ def parse_calendar_workbook(file_obj) -> list[dict]:
     }
     aliases = {
         "calendar_date": ("calendar_date", "дата"),
-        "is_day_off": ("is_day_off", "выходной", "нерабочий день"),
-        "title": ("title", "название", "примечание"),
+        "is_day_off": ("is_day_off", "выходной", "выходной день", "нерабочий день"),
+        "title": ("title", "название"),
         "source": ("source", "источник"),
+        "comment": ("comment", "комментарий", "примечание"),
     }
     indexes = {}
     for canonical, names in aliases.items():
@@ -96,6 +103,7 @@ def parse_calendar_workbook(file_obj) -> list[dict]:
                 "calendar_date": calendar_date,
                 "is_day_off": _bool(row[indexes["is_day_off"]]),
                 "title": str(row[indexes["title"]] or "").strip() if "title" in indexes else "",
+                "comment": str(row[indexes["comment"]] or "").strip() if "comment" in indexes else "",
                 "year": calendar_date.year,
                 "source": str(row[indexes["source"]] or "admin").strip() if "source" in indexes else "admin",
             })
@@ -112,11 +120,12 @@ def import_calendar_xlsx(db: Session, file_obj) -> dict:
         ensure_production_calendar_table(db, commit=False)
         db.execute(text("""
             INSERT INTO production_calendar
-                (calendar_date, is_day_off, title, year, source)
-            VALUES (:calendar_date, :is_day_off, :title, :year, :source)
+                (calendar_date, is_day_off, title, comment, year, source)
+            VALUES (:calendar_date, :is_day_off, :title, :comment, :year, :source)
             ON CONFLICT (calendar_date) DO UPDATE SET
                 is_day_off=EXCLUDED.is_day_off,
                 title=EXCLUDED.title,
+                comment=EXCLUDED.comment,
                 year=EXCLUDED.year,
                 source=EXCLUDED.source,
                 updated_at=CURRENT_TIMESTAMP

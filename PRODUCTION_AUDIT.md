@@ -21,6 +21,8 @@ tag exists.
   merchants. SQL and the overlap export use one canonical A/B ordering.
 - PostgreSQL-backed production calendar with explicit working-day overrides,
   administrative XLSX import, and weekend fallback when a date is absent.
+  A parser-verified workbook with synthetic examples and instructions is kept
+  at `docs/production-calendar-template.xlsx`.
 - Full-file validation before writes for rates and merchants, one commit after
   all rows, rollback on errors, and retention of existing data on invalid input.
 - Controlled `python -m app.legacy_migration --dry-run|--apply`; application
@@ -32,21 +34,18 @@ tag exists.
   owner, are private to that owner/admin, and are checked for size, extension,
   MIME, and magic bytes. HTML, SVG, and executable disguises are rejected.
 
-## Test deployment plan
+## Test deployment
 
-1. Fetch the exact audit HEAD and build an isolated Render test service.
-2. Clone a recent production PostgreSQL snapshot into an isolated staging DB.
-3. Set `DATABASE_URL`, unchanged `SECRET_SALT`, a new random
-   `SESSION_SECRET`, `ADMIN_LOGIN`, `ADMIN_PASSWORD`, and
-   `ENVIRONMENT=production`.
-4. Run `python -m app.legacy_migration --dry-run`; archive its JSON report.
-5. Review every ambiguous record. Run `--apply` only after counts and ownership
-   are approved, then repeat `--apply` and confirm zero new rows.
-6. Import representative supplies, rates, merchants, and a production calendar.
-7. Exercise owner/other/admin receipt access, morning/evening overlaps, all
-   three XLSX exports, submit/reopen locking, and every compatibility route.
-8. Keep the test deployment for acceptance; do not point production traffic at
-   it until review approval.
+The exact requested revision `b8cdf8fc0770a66dafaf7620776c18164710bdf0`
+was deployed first to the isolated Frankfurt Render service
+`merch-web-audit-b8cdf8f-eu`. It used an existing non-production Render
+PostgreSQL 18 database through the isolated schema
+`merch_audit_b8cdf8f`; neither the production service nor production database
+was used. The final audit revision is redeployed to the same test service only
+after all local checks pass.
+
+The sanitized deployment, fixture, migration, and smoke evidence is recorded in
+`TEST_DEPLOYMENT_REPORT.md`.
 
 ## Rollback plan
 
@@ -61,10 +60,7 @@ tag exists.
 
 ## Required before merge
 
-- Run the legacy command against an anonymized production snapshot and resolve
-  every ambiguous row.
-- Execute the full HTTP/receipt/import/export acceptance sequence against
-  PostgreSQL (SQLite is used only for local route smoke tests).
-- Review the precise Russian production-calendar workbook for the target year.
-- Confirm Render environment variables and perform a test deployment.
-- Obtain human review of the large production merge and migration report.
+One external action remains: provide an anonymized production PostgreSQL
+snapshot and review the ambiguous-record report from a dry run on that snapshot.
+The synthetic production-like fixture cannot prove that every real legacy text
+format has been represented.

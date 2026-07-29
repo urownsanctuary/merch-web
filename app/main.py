@@ -8,6 +8,7 @@ from io import BytesIO
 from html import escape
 from pathlib import Path
 from typing import Optional, List
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Depends, HTTPException, Form, UploadFile, File, Cookie, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
@@ -56,6 +57,8 @@ from app.services import (
     is_inventory_allowed_date,
     get_supply_days_for_point,
     get_supply_adjustment_amount,
+    no_supply_adjustment_marker,
+    filter_unadjusted_supply_days,
     get_point_rates,
     effective_has_supply,
     SLOT_MORNING,
@@ -78,6 +81,24 @@ from app.security import (
 )
 
 app = FastAPI()
+
+
+@app.middleware("http")
+async def reject_cross_site_mutations(request: Request, call_next):
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path not in {
+        "/login",
+        "/login-page",
+        "/admin-login",
+    }:
+        if request.headers.get("sec-fetch-site", "").lower() == "cross-site":
+            return HTMLResponse("Cross-site request rejected", status_code=403)
+        origin = request.headers.get("origin")
+        if origin:
+            origin_host = urlsplit(origin).netloc.lower()
+            request_host = request.headers.get("host", "").lower()
+            if not origin_host or not hmac.compare_digest(origin_host, request_host):
+                return HTMLResponse("Cross-site request rejected", status_code=403)
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -1326,6 +1347,12 @@ def calendar_page(
             '</div>'
         )
 
+    supply_policy_note = (
+        "Для этой точки поставки от 1 коробки оплачиваются по ставке поставки."
+        if point_total.get("pay_lt5")
+        else "Поставки до 5 коробок не оплачиваются."
+    )
+
     point_form = ""
     if not monthly_submitted:
         point_form = f"""
@@ -1432,12 +1459,12 @@ def calendar_page(
             </div>
 
             <div class="calendar-note">
-                В обычные дни нажатие по дню сразу ставит или убирает выход.
-                В пятницу и субботу открывается выбор: выход или полный инвент.
+                Нажмите на день и выберите утренний или вечерний выход.
+                В пятницу, субботу и специальные даты также доступен полный инвент.
             </div>
 
             <div class="calendar-note">
-                Поставки до 5 коробок не оплачиваются.
+                {supply_policy_note}
             </div>
 
             {point_form}
@@ -1544,6 +1571,11 @@ def point_note_page(
 
     if mode == "no_supply":
         supply_days = get_supply_days_for_point(db, point_code_clean, period["year"], period["month"])
+        existing = get_point_adjustment(
+            db, merchant["id"], point_code_clean, period["year"], period["month"]
+        ) or {}
+        existing_note_comment = str(existing.get("note_comment") or "")
+        supply_days = filter_unadjusted_supply_days(supply_days, existing_note_comment)
         adjustment = get_supply_adjustment_amount(db, point_code_clean, period["year"], period["month"])
         options = "".join([f"<option value='{d.day}'>{d.strftime('%d.%m.%Y')}</option>" for d in supply_days])
         if not options:
@@ -1671,13 +1703,21 @@ def save_point_note_no_supply(
         return RedirectResponse(url="/login-page", status_code=303)
 
     point_code_clean = normalize_point_code(point_code)
-    adjustment = get_supply_adjustment_amount(db, point_code_clean, period["year"], period["month"])
     supply_date = date(period["year"], period["month"], int(supply_day))
-    base_comment = f"Не принимал поставку {supply_date.strftime('%d.%m')}"
+    allowed_dates = set(get_supply_days_for_point(
+        db, point_code_clean, period["year"], period["month"]
+    ))
+    if supply_date not in allowed_dates:
+        raise HTTPException(status_code=400, detail="Дата не является оплачиваемым днём поставки")
+
+    adjustment = get_supply_adjustment_amount(db, point_code_clean, period["year"], period["month"])
+    base_comment = no_supply_adjustment_marker(supply_date)
     note_comment = base_comment if not comment else f"{base_comment}. {comment}"
     existing = get_point_adjustment(db, merchant["id"], point_code_clean, period["year"], period["month"]) or {}
     existing_note_amount = int(existing.get("note_amount") or 0)
     existing_note_comment = existing.get("note_comment") or ""
+    if base_comment in existing_note_comment:
+        raise HTTPException(status_code=409, detail="Корректировка для этой даты уже добавлена")
     new_note_comment = append_multiline_comment(existing_note_comment, adjustment, note_comment)
 
     upsert_point_adjustment(
