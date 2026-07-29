@@ -1,8 +1,20 @@
-from fastapi import FastAPI, Depends, HTTPException, Form
-from fastapi.responses import HTMLResponse, RedirectResponse
+
+import os
+import uuid
+import hashlib
+from datetime import date, datetime
+from io import BytesIO
+from html import escape
+from pathlib import Path
+from typing import Optional, List
+
+from fastapi import FastAPI, Depends, HTTPException, Form, UploadFile, File, Cookie
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
 
 from app.db import SessionLocal, engine
 from app.services import (
@@ -21,11 +33,43 @@ from app.services import (
     days_in_month,
     weekday_of,
     month_title,
+    get_monthly_submission,
+    upsert_monthly_submission_draft,
+    submit_monthly_submission,
+    reopen_monthly_submission,
+    get_admin_report_rows,
+    get_admin_payroll_rows,
+    get_intersections_rows,
+    get_all_tu_values,
+    import_supplies_xlsx,
+    import_rates_xlsx,
+    import_merchants_xlsx,
+    upsert_merchant_row,
+    clear_month_data,
+    clear_merchants_by_tu,
+    get_point_adjustment,
+    upsert_point_adjustment,
+    add_special_inventory_day,
+    delete_special_inventory_day,
+    get_special_inventory_days,
+    is_inventory_allowed_date,
+    get_supply_days_for_point,
+    get_supply_adjustment_amount,
+    get_point_rates,
+    effective_has_supply,
 )
 
 app = FastAPI()
 
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
+
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+ADMIN_LOGIN = os.getenv("ADMIN_LOGIN", "")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+SECRET_SALT = os.getenv("SECRET_SALT", "")
 
 
 def get_db():
@@ -36,37 +80,172 @@ def get_db():
         db.close()
 
 
-@app.get("/")
-def root():
-    return RedirectResponse(url="/login-page")
+def get_admin_cookie_value() -> str:
+    raw = f"{ADMIN_LOGIN}:{ADMIN_PASSWORD}:{SECRET_SALT}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-@app.get("/db-check")
-def db_check():
-    with engine.connect() as conn:
-        conn.execute(text("SELECT 1"))
-    return {"status": "ok", "db": "connected"}
+def is_admin_authenticated(admin_auth: Optional[str]) -> bool:
+    if not ADMIN_LOGIN or not ADMIN_PASSWORD or not SECRET_SALT:
+        return False
+    return admin_auth == get_admin_cookie_value()
 
 
-@app.get("/active-period")
-def active_period():
-    return get_active_period()
+def style_sheet(ws):
+    green_fill = PatternFill("solid", fgColor="E8F5E9")
+    bold = Font(bold=True)
+    for cell in ws[1]:
+        cell.font = bold
+        cell.fill = green_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for col in ws.columns:
+        max_len = 0
+        col_letter = col[0].column_letter
+        for cell in col:
+            value = "" if cell.value is None else str(cell.value)
+            max_len = max(max_len, len(value))
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+        ws.column_dimensions[col_letter].width = min(max(max_len + 2, 12), 35)
+    ws.freeze_panes = "A2"
 
 
-@app.get("/debug/merchants-columns")
-def merchants_columns(db: Session = Depends(get_db)):
-    cols = get_merchants_columns(db)
-    return {"table": "merchants", "columns": cols}
+def build_excel_response(wb: Workbook, filename: str) -> StreamingResponse:
+    buffer = BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
 
 
-@app.post("/login")
-def login_api(fio: str, last4: str, db: Session = Depends(get_db)):
-    user = login_user(db, fio, last4)
 
-    if not user:
-        raise HTTPException(status_code=401, detail="Неверные данные")
+def split_receipt_paths(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [p.strip() for p in str(value).split("|") if p and p.strip()]
 
-    return {"status": "ok", "active_period": get_active_period(), "user": user}
+
+def append_receipt_paths(existing: str | None, new_paths: list[str]) -> str | None:
+    paths = split_receipt_paths(existing)
+    paths.extend([p for p in new_paths if p])
+    return "|".join(paths) if paths else None
+
+
+def safe_receipt_filename(filename: str | None) -> str:
+    raw = (filename or "receipt").strip() or "receipt"
+    ext = Path(raw).suffix.lower()
+    if ext not in {".jpg", ".jpeg", ".png", ".pdf", ".webp"}:
+        ext = ".bin"
+    return f"receipt{ext}"
+
+
+def ensure_receipt_files_table(db: Session):
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS receipt_files (
+            file_id TEXT PRIMARY KEY,
+            original_filename TEXT,
+            content_type TEXT,
+            data BYTEA NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        )
+    """))
+    db.commit()
+
+
+def save_receipt_file_to_db(db: Session, original_filename: str | None, content_type: str | None, content: bytes) -> str:
+    ensure_receipt_files_table(db)
+    file_id = uuid.uuid4().hex
+    display_filename = safe_receipt_filename(original_filename)
+    db.execute(text("""
+        INSERT INTO receipt_files (file_id, original_filename, content_type, data)
+        VALUES (:file_id, :original_filename, :content_type, :data)
+    """), {
+        "file_id": file_id,
+        "original_filename": original_filename or display_filename,
+        "content_type": content_type or "application/octet-stream",
+        "data": content,
+    })
+    db.commit()
+    return f"receipts/{file_id}/{display_filename}"
+
+
+def render_receipt_links(value: str | None, text: str = "Открыть") -> str:
+    paths = split_receipt_paths(value)
+    if not paths:
+        return "—"
+    links = []
+    for idx, path in enumerate(paths, start=1):
+        label = text if len(paths) == 1 else f"{text} {idx}"
+        links.append(f"<a href='/{escape(path)}' target='_blank'>{label}</a>")
+    return "<br>".join(links)
+
+def render_multiline_text(value: str | None) -> str:
+    text_value = (value or "").strip()
+    if not text_value:
+        return "—"
+    return escape(text_value).replace("\n", "<br>")
+
+
+def append_multiline_comment(existing: str | None, amount: int, comment: str) -> str:
+    line = f"{amount} ₽ — {comment.strip()}"
+    existing_clean = (existing or "").strip()
+    return line if not existing_clean else existing_clean + "\n" + line
+
+
+
+def split_adjustment_lines(value: str | None) -> list[str]:
+    """Возвращает непустые строки примечаний/возмещений."""
+    if not value:
+        return []
+    return [line.strip() for line in str(value).splitlines() if line and line.strip()]
+
+
+def parse_amount_from_adjustment_line(line: str) -> int:
+    """Достаёт сумму из строки формата '1500 ₽ — комментарий' или '-400 ₽ — комментарий'."""
+    match = __import__("re").match(r"^\s*([+-]?\d+)", str(line or "").strip())
+    if not match:
+        return 0
+    try:
+        return int(match.group(1))
+    except Exception:
+        return 0
+
+
+def sum_adjustment_lines(lines: list[str]) -> int:
+    return sum(parse_amount_from_adjustment_line(line) for line in lines)
+
+
+def render_adjustment_items(
+    value: str | None,
+    delete_url: str,
+    fio: str,
+    point_code: str,
+    empty_text: str = "—",
+) -> str:
+    lines = split_adjustment_lines(value)
+    if not lines:
+        return empty_text
+
+    html = "<div style='display:flex; flex-direction:column; gap:10px; margin-top:10px;'>"
+    for idx, line in enumerate(lines):
+        html += f"""
+        <div style="border:1px solid #E5E7EB; border-radius:12px; padding:10px 12px; background:#FFFFFF;">
+            <div style="font-size:15px; line-height:1.35;">{escape(line)}</div>
+            <form method="post" action="{delete_url}" style="margin-top:8px;">
+                <input type="hidden" name="fio" value="{escape(fio)}" />
+                <input type="hidden" name="point_code" value="{escape(point_code)}" />
+                <input type="hidden" name="item_index" value="{idx}" />
+                <button class="btn btn-danger btn-small" type="submit" style="width:auto; padding:8px 12px; font-size:13px; margin-top:0;">
+                    Удалить
+                </button>
+            </form>
+        </div>
+        """
+    html += "</div>"
+    return html
+
 
 
 def base_css():
@@ -90,12 +269,11 @@ def base_css():
             --soft: #EEF4EF;
             --soft-2: #F3F7F3;
             --error: #B91C1C;
+            --ok: #166534;
             --shadow: 0 12px 32px rgba(0, 0, 0, 0.08);
         }
 
-        * {
-            box-sizing: border-box;
-        }
+        * { box-sizing: border-box; }
 
         body {
             margin: 0;
@@ -107,7 +285,7 @@ def base_css():
         }
 
         .page {
-            max-width: 980px;
+            max-width: 1580px;
             margin: 0 auto;
             min-height: calc(100vh - 40px);
             display: flex;
@@ -126,10 +304,10 @@ def base_css():
 
         .card-wide {
             width: 100%;
-            max-width: 960px;
+            max-width: 1580px;
             background: var(--card);
             border-radius: 24px;
-            padding: 32px 28px;
+            padding: 22px 20px 28px;
             box-shadow: var(--shadow);
         }
 
@@ -138,14 +316,14 @@ def base_css():
             font-size: 28px;
             line-height: 1;
             color: var(--green);
-            margin-bottom: 10px;
+            margin-bottom: 8px;
         }
 
         h1 {
             font-family: 'Villula', -apple-system, sans-serif;
             font-size: 34px;
             line-height: 1.05;
-            margin: 0 0 10px 0;
+            margin: 0 0 8px 0;
             color: var(--text);
         }
 
@@ -153,11 +331,7 @@ def base_css():
             color: var(--muted);
             font-size: 15px;
             line-height: 1.45;
-            margin-bottom: 24px;
-        }
-
-        .muted {
-            color: var(--muted);
+            margin-bottom: 18px;
         }
 
         label {
@@ -168,16 +342,22 @@ def base_css():
             color: var(--text);
         }
 
-        input {
+        input, textarea, select {
             width: 100%;
             padding: 14px 16px;
             border: 1px solid var(--line);
             border-radius: 14px;
             font-size: 16px;
             background: #fff;
+            font-family: inherit;
         }
 
-        input:focus {
+        textarea {
+            resize: vertical;
+            min-height: 92px;
+        }
+
+        input:focus, textarea:focus, select:focus {
             outline: none;
             border-color: var(--green);
             box-shadow: 0 0 0 3px rgba(46, 125, 50, 0.10);
@@ -186,7 +366,7 @@ def base_css():
         .btn {
             display: inline-block;
             width: 100%;
-            margin-top: 20px;
+            margin-top: 16px;
             padding: 15px 16px;
             border: none;
             border-radius: 14px;
@@ -199,17 +379,22 @@ def base_css():
             cursor: pointer;
         }
 
-        .btn:hover {
-            background: var(--green-dark);
-        }
+        .btn:hover { background: var(--green-dark); }
 
         .btn-secondary {
             background: var(--soft);
             color: var(--text);
         }
 
-        .btn-secondary:hover {
-            background: #e3ece3;
+        .btn-secondary:hover { background: #e3ece3; }
+
+        .btn-danger {
+            background: #B91C1C;
+            color: #fff;
+        }
+
+        .btn-danger:hover {
+            background: #991B1B;
         }
 
         .btn-small {
@@ -218,14 +403,11 @@ def base_css():
             font-size: 15px;
         }
 
-        .hint {
-            margin-top: 16px;
-            padding: 12px 14px;
-            border-radius: 14px;
-            background: var(--soft);
-            color: var(--muted);
-            font-size: 13px;
-            line-height: 1.4;
+        .btn-inline {
+            width: auto;
+            margin-top: 0;
+            padding: 12px 16px;
+            font-size: 14px;
         }
 
         .footer {
@@ -243,6 +425,16 @@ def base_css():
             font-weight: 800;
         }
 
+        .hint {
+            margin-top: 16px;
+            padding: 12px 14px;
+            border-radius: 14px;
+            background: var(--soft);
+            color: var(--muted);
+            font-size: 13px;
+            line-height: 1.4;
+        }
+
         .error-box {
             margin-top: 16px;
             background: #FEF2F2;
@@ -253,44 +445,136 @@ def base_css():
             font-weight: 700;
         }
 
-        .top-grid {
+        .success-box {
+            margin-top: 16px;
+            background: #ECFDF3;
+            color: var(--ok);
+            border-radius: 14px;
+            padding: 14px;
+            line-height: 1.45;
+            font-weight: 700;
+        }
+
+        .calendar-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 14px;
+            flex-wrap: wrap;
+        }
+
+        .calendar-month {
+            font-family: 'Villula', -apple-system, sans-serif;
+            font-size: 28px;
+            line-height: 1;
+        }
+
+        .calendar-meta {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .mini-pill {
+            background: var(--soft-2);
+            border-radius: 999px;
+            padding: 8px 12px;
+            font-size: 13px;
+            color: var(--text);
+            font-weight: 700;
+        }
+
+        .sum-strip {
             display: grid;
             grid-template-columns: 1fr 1fr;
-            gap: 14px;
-            margin-bottom: 24px;
+            gap: 12px;
+            margin-bottom: 16px;
         }
 
-        .info-box {
-            background: var(--soft-2);
+        .sum-card {
+            background: #F7FBF8;
+            border: 1px solid #E5E7EB;
             border-radius: 16px;
-            padding: 16px;
+            padding: 14px 16px;
         }
 
-        .info-label {
+        .sum-title {
             color: var(--muted);
             font-size: 13px;
             margin-bottom: 6px;
         }
 
-        .info-value {
+        .sum-value {
+            font-size: 22px;
+            font-weight: 900;
+        }
+
+        .details-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 12px;
+            margin-bottom: 18px;
+        }
+
+        .detail-card {
+            background: #FAFCFA;
+            border: 1px solid #E5E7EB;
+            border-radius: 16px;
+            padding: 14px 16px;
+        }
+
+        .detail-title {
+            color: var(--muted);
+            font-size: 13px;
+            margin-bottom: 8px;
+        }
+
+        .point-adjustment-card {
+            padding: 18px 18px 20px;
+        }
+
+        .point-adjustment-card .detail-title {
+            color: var(--text);
+            font-size: 22px;
+            font-weight: 800;
+            margin-bottom: 14px;
+            line-height: 1.2;
+        }
+
+        .point-adjustment-card label {
             font-size: 18px;
             font-weight: 800;
+            color: var(--text);
+            margin: 14px 0 8px;
         }
 
-        .calendar-wrap {
-            margin-top: 10px;
+        .point-adjustment-card input[type="text"],
+        .point-adjustment-card input[type="number"],
+        .point-adjustment-card input[type="file"] {
+            font-size: 18px;
         }
 
-        .weekdays,
-        .calendar-grid {
+        .point-adjustment-card .hint {
+            font-size: 15px;
+            line-height: 1.45;
+        }
+
+        .detail-line {
+            font-size: 15px;
+            font-weight: 700;
+            line-height: 1.5;
+        }
+
+        .calendar-wrap { margin-top: 4px; }
+
+        .weekdays, .calendar-grid {
             display: grid;
             grid-template-columns: repeat(7, 1fr);
             gap: 10px;
         }
 
-        .weekdays {
-            margin-bottom: 10px;
-        }
+        .weekdays { margin-bottom: 10px; }
 
         .weekday {
             text-align: center;
@@ -300,9 +584,8 @@ def base_css():
             padding: 6px 0;
         }
 
-        .day,
-        .day-empty {
-            min-height: 96px;
+        .day, .day-empty {
+            min-height: 90px;
             border-radius: 18px;
             padding: 10px;
         }
@@ -323,8 +606,21 @@ def base_css():
             box-shadow: 0 0 0 2px rgba(46, 125, 50, 0.06);
         }
 
-        .day-empty {
-            background: transparent;
+        .day-red {
+            background: #FFF5F5;
+            border-color: #FECACA;
+        }
+
+        .day-red .day-number {
+            color: #B91C1C;
+        }
+
+        .day-empty { background: transparent; }
+
+        .day-disabled {
+            opacity: 0.65;
+            cursor: default;
+            pointer-events: none;
         }
 
         .day-number {
@@ -369,7 +665,7 @@ def base_css():
         }
 
         .legend {
-            margin-top: 20px;
+            margin-top: 18px;
             display: flex;
             flex-wrap: wrap;
             gap: 10px;
@@ -385,82 +681,163 @@ def base_css():
         }
 
         .calendar-note {
-            margin-top: 18px;
+            margin-top: 14px;
             color: var(--muted);
             line-height: 1.5;
+            font-size: 14px;
         }
 
-        .action-list {
+        details.point-detail {
+            margin-top: 10px;
+            border: 1px solid #E5E7EB;
+            border-radius: 14px;
+            background: #FAFCFA;
+            padding: 10px 14px;
+        }
+
+        details.point-detail summary {
+            cursor: pointer;
+            font-weight: 800;
+            list-style: none;
+        }
+
+        details.point-detail summary::-webkit-details-marker {
+            display: none;
+        }
+
+        .summary-content {
+            margin-top: 10px;
+            color: var(--text);
+            line-height: 1.6;
+        }
+
+        .filter-grid {
             display: grid;
+            grid-template-columns: 140px 140px 240px 220px;
             gap: 12px;
-            margin-top: 20px;
+            margin-bottom: 16px;
+            align-items: end;
         }
 
-        .sum-grid {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 14px;
-            margin-bottom: 24px;
-        }
-
-        .sum-box {
-            background: #F7FBF8;
+        .table-wrap {
             border: 1px solid #E5E7EB;
             border-radius: 16px;
-            padding: 16px;
+            background: #fff;
+            overflow: visible;
         }
 
-        .sum-title {
-            color: var(--muted);
-            font-size: 13px;
-            margin-bottom: 8px;
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            table-layout: fixed;
         }
 
-        .sum-value {
-            font-size: 22px;
-            font-weight: 900;
+        th, td {
+            padding: 10px 8px;
+            border-bottom: 1px solid #E5E7EB;
+            text-align: left;
+            vertical-align: top;
+            font-size: 12px;
+            word-break: break-word;
         }
 
-        @media (max-width: 760px) {
-            .page {
-                align-items: flex-start;
-            }
+        th {
+            background: #F7FBF8;
+            font-weight: 800;
+        }
 
-            .card-wide {
-                padding: 24px 16px;
-            }
+        .admin-actions {
+            display: flex;
+            gap: 12px;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+            flex-wrap: wrap;
+        }
 
-            .top-grid,
-            .sum-grid {
-                grid-template-columns: 1fr;
-            }
+        .admin-export-buttons {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-top: 14px;
+        }
 
-            .weekdays,
-            .calendar-grid {
-                gap: 8px;
-            }
+        .data-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+        }
 
-            .day,
-            .day-empty {
-                min-height: 84px;
+        @media (max-width: 960px) {
+            .page { align-items: flex-start; }
+            .card-wide { padding: 18px 14px 24px; }
+            .sum-strip, .details-grid, .filter-grid, .data-grid { grid-template-columns: 1fr; }
+            .weekdays, .calendar-grid { gap: 8px; }
+            .day, .day-empty {
+                min-height: 80px;
                 border-radius: 14px;
                 padding: 8px;
             }
-
-            .day-number {
-                font-size: 16px;
-            }
-
-            h1 {
-                font-size: 30px;
-            }
-
-            .brand {
-                font-size: 24px;
-            }
+            .day-number { font-size: 16px; }
+            h1 { font-size: 30px; }
+            .brand { font-size: 24px; }
+            .calendar-month { font-size: 24px; }
+            .table-wrap { overflow-x: auto; }
+            table { min-width: 1200px; }
         }
     </style>
     """
+
+
+@app.get("/")
+def root():
+    return RedirectResponse(url="/login-page")
+
+
+@app.get("/db-check")
+def db_check():
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+    return {"status": "ok", "db": "connected"}
+
+
+@app.get("/receipts/{file_id}/{filename}")
+def receipt_file(file_id: str, filename: str, db: Session = Depends(get_db)):
+    ensure_receipt_files_table(db)
+    row = db.execute(text("""
+        SELECT original_filename, content_type, data
+        FROM receipt_files
+        WHERE file_id = :file_id
+        LIMIT 1
+    """), {"file_id": file_id}).mappings().first()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    content = bytes(row["data"])
+    media_type = row.get("content_type") or "application/octet-stream"
+    return StreamingResponse(BytesIO(content), media_type=media_type)
+
+
+@app.get("/active-period")
+def active_period():
+    return get_active_period()
+
+
+@app.get("/debug/merchants-columns")
+def merchants_columns(db: Session = Depends(get_db)):
+    cols = get_merchants_columns(db)
+    return {"table": "merchants", "columns": cols}
+
+
+@app.post("/login")
+def login_api(fio: str, last4: str, db: Session = Depends(get_db)):
+    user = login_user(db, fio, last4)
+
+    if not user:
+        raise HTTPException(status_code=401, detail="Неверные данные")
+
+    return {"status": "ok", "active_period": get_active_period(), "user": user}
 
 
 @app.get("/login-page", response_class=HTMLResponse)
@@ -480,41 +857,21 @@ def login_page():
         <div class="card">
             <div class="brand">ВкусВилл</div>
             <h1>Сверки мерчендайзеров</h1>
-            <div class="subtitle">
-                Введите ФИО и последние 4 цифры телефона
-            </div>
+            <div class="subtitle">Введите ФИО и последние 4 цифры телефона</div>
 
             <form method="post" action="/login-page">
                 <label for="fio">ФИО</label>
-                <input
-                    id="fio"
-                    name="fio"
-                    type="text"
-                    placeholder="Иванов Иван Иванович"
-                    required
-                />
+                <input id="fio" name="fio" type="text" placeholder="Иванов Иван Иванович" required />
 
                 <label for="last4">Последние 4 цифры телефона</label>
-                <input
-                    id="last4"
-                    name="last4"
-                    type="text"
-                    inputmode="numeric"
-                    maxlength="4"
-                    placeholder="1234"
-                    required
-                />
+                <input id="last4" name="last4" type="text" inputmode="numeric" maxlength="4" placeholder="1234" required />
 
                 <button class="btn" type="submit">Войти</button>
             </form>
 
-            <div class="hint">
-                Сейчас открыт период за {month_title(period["year"], period["month"])}.
-            </div>
+            <div class="hint">Сейчас открыт период за {month_title(period["year"], period["month"])}.</div>
 
-            <div class="footer">
-                Веб-версия сверок мерчендайзеров
-            </div>
+            <div class="footer">Веб-версия сверок мерчендайзеров</div>
         </div>
     </div>
 </body>
@@ -544,9 +901,7 @@ def login_submit(
     <div class="page">
         <div class="card">
             <h1>Ошибка входа</h1>
-            <div class="error-box">
-                Неверные данные. Проверьте ФИО и последние 4 цифры телефона.
-            </div>
+            <div class="error-box">Неверные данные. Проверьте ФИО и последние 4 цифры телефона.</div>
             <a class="back" href="/login-page">← Попробовать снова</a>
         </div>
     </div>
@@ -554,11 +909,7 @@ def login_submit(
 </html>
 """
 
-    fio_safe = user["fio"]
-    return RedirectResponse(
-        url=f"/menu-page?fio={fio_safe}",
-        status_code=303
-    )
+    return RedirectResponse(url=f"/menu-page?fio={user['fio']}", status_code=303)
 
 
 @app.get("/menu-page", response_class=HTMLResponse)
@@ -583,18 +934,17 @@ def menu_page(fio: str = "", db: Session = Depends(get_db)):
         <div class="card">
             <div class="brand">ВкусВилл</div>
             <h1>Главное меню</h1>
-            <div class="subtitle">{fio}</div>
-            <div class="hint">
-                Сейчас открыт период за {month_title(period["year"], period["month"])}.
-            </div>
+            <div class="subtitle">{escape(fio)}</div>
+            <div class="hint">Сейчас открыт период за {month_title(period["year"], period["month"])}.</div>
 
-            <div class="sum-box" style="margin-top: 18px;">
+            <div class="sum-card" style="margin-top: 18px;">
                 <div class="sum-title">Общая сумма за месяц</div>
                 <div class="sum-value">{overall["total"]} ₽</div>
             </div>
 
-            <a class="btn" href="/point-page?fio={fio}">Заполнить сверку</a>
-            <a class="btn btn-secondary" href="/summary-page?fio={fio}">Моя сумма</a>
+            <a class="btn" href="/point-page?fio={escape(fio)}">Заполнить сверку</a>
+            <a class="btn btn-secondary" href="/summary-page?fio={escape(fio)}">Моя сумма</a>
+            <a class="btn btn-secondary" href="/monthly-submit-page?fio={escape(fio)}">Отправить сверку за месяц</a>
         </div>
     </div>
 </body>
@@ -620,14 +970,14 @@ def point_page(fio: str = ""):
         <div class="card">
             <div class="brand">ВкусВилл</div>
             <h1>Выбор точки</h1>
-            <div class="subtitle">{fio}</div>
+            <div class="subtitle">{escape(fio)}</div>
 
             <div class="hint" style="margin-top: 0; margin-bottom: 18px;">
                 Сверка заполняется за {month_title(period["year"], period["month"])}.
             </div>
 
             <form method="post" action="/point-page">
-                <input type="hidden" name="fio" value="{fio}" />
+                <input type="hidden" name="fio" value="{escape(fio)}" />
 
                 <label for="point_code">Номер точки</label>
                 <input id="point_code" name="point_code" type="text" placeholder="2674" required />
@@ -635,7 +985,7 @@ def point_page(fio: str = ""):
                 <button class="btn" type="submit">Продолжить</button>
             </form>
 
-            <a class="back" href="/menu-page?fio={fio}">← Назад</a>
+            <a class="back" href="/menu-page?fio={escape(fio)}">← Назад</a>
         </div>
     </div>
 </body>
@@ -667,19 +1017,14 @@ def point_submit(
         <div class="card">
             <h1>Ошибка</h1>
             <div class="error-box">Номер точки слишком короткий.</div>
-            <a class="back" href="/point-page?fio={fio}">← Назад</a>
+            <a class="back" href="/point-page?fio={escape(fio)}">← Назад</a>
         </div>
     </div>
 </body>
 </html>
 """
 
-    has_supply = point_has_any_supply_in_month(
-        db=db,
-        point_code=point_code,
-        y=period["year"],
-        m=period["month"]
-    )
+    has_supply = point_has_any_supply_in_month(db, point_code, period["year"], period["month"])
 
     if not has_supply:
         return f"""
@@ -696,27 +1041,77 @@ def point_submit(
         <div class="card">
             <h1>Точка не найдена</h1>
             <div class="error-box">
-                В периоде {month_title(period["year"], period["month"])} по точке {point_code} нет поставок.
+                В периоде {month_title(period["year"], period["month"])} по точке {escape(point_code)} нет поставок.
                 <br><br>
                 Проверьте номер точки или обратитесь к управляющему.
             </div>
-            <a class="back" href="/point-page?fio={fio}">← Попробовать снова</a>
+            <a class="back" href="/point-page?fio={escape(fio)}">← Попробовать снова</a>
         </div>
     </div>
 </body>
 </html>
 """
 
-    return RedirectResponse(
-        url=f"/calendar-page?fio={fio}&point_code={point_code}",
-        status_code=303
-    )
+    return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}", status_code=303)
 
 
-def build_calendar_html(fio: str, point_code: str, y: int, m: int, boxes_map: dict[int, int], visits: dict[int, set[str]]) -> str:
+def build_day_href(fio: str, point_code: str, y: int, m: int, day: int, is_submitted: bool, inventory_allowed: bool) -> str:
+    if is_submitted:
+        return "#"
+    if inventory_allowed:
+        return f"/day-action-page?fio={escape(fio)}&point_code={escape(point_code)}&day={day}"
+    return f"/toggle-day?fio={escape(fio)}&point_code={escape(point_code)}&day={day}"
+
+
+def russian_non_working_dates(year: int) -> set[date]:
+    """Основные нерабочие праздничные дни РФ + перенос на понедельник, если праздник выпал на выходной.
+
+    Это нужно только для визуальной подсветки календаря. Расчёт оплаты не меняет.
+    """
+    fixed_ranges = []
+    # Новогодние каникулы и Рождество
+    for d in range(1, 9):
+        fixed_ranges.append(date(year, 1, d))
+
+    fixed_days = [
+        date(year, 2, 23),
+        date(year, 3, 8),
+        date(year, 5, 1),
+        date(year, 5, 9),
+        date(year, 6, 12),
+        date(year, 11, 4),
+    ]
+
+    result = set(fixed_ranges + fixed_days)
+
+    # Базовый перенос: если праздник попал на субботу/воскресенье, подсвечиваем ближайший понедельник.
+    # Для точных ежегодных переносов можно позже добавить отдельную админ-таблицу производственного календаря.
+    for d in fixed_days:
+        if d.weekday() == 5:
+            result.add(d + __import__("datetime").timedelta(days=2))
+        elif d.weekday() == 6:
+            result.add(d + __import__("datetime").timedelta(days=1))
+
+    return result
+
+
+def is_calendar_red_day(current_date: date) -> bool:
+    return current_date.weekday() >= 5 or current_date in russian_non_working_dates(current_date.year)
+
+
+def build_calendar_html(
+    fio: str,
+    point_code: str,
+    y: int,
+    m: int,
+    boxes_map: dict[int, int],
+    visits: dict[int, set[str]],
+    is_submitted: bool,
+    special_inventory_days: set[date],
+    pay_lt5: bool = False
+) -> str:
     dim = days_in_month(y, m)
     first_wd = weekday_of(y, m, 1)
-
     weekdays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
     html = '<div class="weekdays">'
@@ -734,18 +1129,25 @@ def build_calendar_html(fio: str, point_code: str, y: int, m: int, boxes_map: di
         day_visits = visits.get(day, set())
 
         badges = ""
-
-        if boxes > 0:
+        if effective_has_supply(boxes, pay_lt5):
             badges += '<span class="badge badge-supply">П</span>'
-
         if "DAY" in day_visits:
             badges += '<span class="badge badge-day">В</span>'
-
         if "FULL_INVENT" in day_visits:
             badges += '<span class="badge badge-inv">И</span>'
 
+        current_date = date(y, m, day)
+        inventory_allowed = current_date.weekday() in (4, 5) or current_date in special_inventory_days
+        href = build_day_href(fio, point_code, y, m, day, is_submitted, inventory_allowed)
+        cls_parts = ["day"]
+        if is_calendar_red_day(current_date):
+            cls_parts.append("day-red")
+        if is_submitted:
+            cls_parts.append("day-disabled")
+        cls = " ".join(cls_parts)
+
         html += f"""
-        <a class="day" href="/day-action-page?fio={fio}&point_code={point_code}&day={day}">
+        <a class="{cls}" href="{href}">
             <div class="day-number">{day}</div>
             <div class="day-badges">{badges}</div>
         </a>
@@ -759,6 +1161,7 @@ def build_calendar_html(fio: str, point_code: str, y: int, m: int, boxes_map: di
 def calendar_page(
     fio: str,
     point_code: str,
+    saved: str = "",
     db: Session = Depends(get_db)
 ):
     period = get_active_period()
@@ -769,14 +1172,69 @@ def calendar_page(
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
 
+    point_code = normalize_point_code(point_code)
+
+    overall = compute_overall_total(db, merchant["id"], y, m)
+    monthly_submitted = overall["submission_status"] == "submitted"
+
     boxes_map = get_supply_boxes_map(db, point_code, y, m)
     visits = get_visits_for_month(db, merchant["id"], point_code, y, m)
     point_total = compute_point_total(db, merchant["id"], point_code, y, m)
-    overall = compute_overall_total(db, merchant["id"], y, m)
-    calendar_html = build_calendar_html(fio, point_code, y, m, boxes_map, visits)
+    point_adj = get_point_adjustment(db, merchant["id"], point_code, y, m) or {}
+    special_inventory_days = set(get_special_inventory_days(db))
 
-    coffee_text = "Да" if point_total["coffee_enabled"] else "Нет"
-    coffee_rate_text = f'{point_total["coffee_rate"]} ₽' if point_total["coffee_enabled"] else "—"
+    calendar_html = build_calendar_html(
+        fio=fio,
+        point_code=point_code,
+        y=y,
+        m=m,
+        boxes_map=boxes_map,
+        visits=visits,
+        is_submitted=monthly_submitted,
+        special_inventory_days=special_inventory_days,
+        pay_lt5=bool(point_total.get("pay_lt5"))
+    )
+
+    info_box = ""
+    if saved == "1":
+        info_box = "<div class=\"success-box\">Данные по точке сохранены.</div>"
+
+    point_receipt_links = render_receipt_links(point_total.get("reimb_receipt"))
+    point_receipt_link = ""
+    if point_receipt_links != "—":
+        point_receipt_link = f"<div class='hint' style='margin-top:10px'>Чеки по возмещению:<br>{point_receipt_links}</div>"
+
+    coffee_meta_html = ""
+    coffee_card_html = ""
+    if point_total.get("coffee_enabled"):
+        coffee_meta_html = '<div class="mini-pill">КМ: Да</div>'
+        coffee_card_html = (
+            '<div class="detail-card">'
+            '<div class="detail-title">Кофемашина</div>'
+            f'<div class="detail-line">{point_total["coffee_cnt"]} × {point_total["coffee_rate"]} ₽ = {point_total["coffee_sum"]} ₽</div>'
+            '</div>'
+        )
+
+    point_form = ""
+    if not monthly_submitted:
+        point_form = f"""
+            <div class="details-grid" style="margin-top:18px;">
+                <div class="detail-card point-adjustment-card">
+                    <div class="detail-title">Примечание по точке</div>
+                    <div class="detail-line">{point_total['note_amount']} ₽</div>
+                    <div class="calendar-note">{render_adjustment_items(point_total['note_comment'], '/delete-point-note', fio, point_code)}</div>
+                    <a class="btn btn-secondary" href="/point-note-page?fio={escape(fio)}&point_code={escape(point_code)}">Добавить примечание</a>
+                </div>
+
+                <div class="detail-card point-adjustment-card">
+                    <div class="detail-title">Возмещение по точке</div>
+                    <div class="detail-line">{point_total['reimb_amount']} ₽</div>
+                    <div class="calendar-note">{render_adjustment_items(point_total['reimb_comment'], '/delete-point-reimbursement', fio, point_code)}</div>
+                    {point_receipt_link}
+                    <a class="btn btn-secondary" href="/point-reimbursement-page?fio={escape(fio)}&point_code={escape(point_code)}">Добавить возмещение</a>
+                </div>
+            </div>
+        """
 
     return f"""
 <!DOCTYPE html>
@@ -786,92 +1244,774 @@ def calendar_page(
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Календарь</title>
     {base_css()}
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {{
+        const savedY = sessionStorage.getItem('calendarScrollY');
+        if (savedY) {{
+            window.scrollTo(0, parseInt(savedY, 10));
+            sessionStorage.removeItem('calendarScrollY');
+        }}
+        document.querySelectorAll('.day').forEach(el => {{
+            el.addEventListener('click', function() {{
+                sessionStorage.setItem('calendarScrollY', String(window.scrollY));
+            }});
+        }});
+    }});
+    </script>
 </head>
 <body>
     <div class="page">
         <div class="card-wide">
-            <div class="brand">ВкусВилл</div>
-            <h1>Сверка точки</h1>
-            <div class="subtitle">
-                Нажмите на нужный день.
-                Для пятницы и субботы можно добавить полный инвент.
-            </div>
-
-            <div class="top-grid">
-                <div class="info-box">
-                    <div class="info-label">ФИО</div>
-                    <div class="info-value">{fio}</div>
+            <div class="calendar-head">
+                <div>
+                    <div class="brand">ВкусВилл</div>
+                    <div class="calendar-month">{month_title(y, m)}</div>
                 </div>
 
-                <div class="info-box">
-                    <div class="info-label">Точка</div>
-                    <div class="info-value">{point_code}</div>
-                </div>
-
-                <div class="info-box">
-                    <div class="info-label">Расчётный месяц</div>
-                    <div class="info-value">{month_title(y, m)}</div>
-                </div>
-
-                <div class="info-box">
-                    <div class="info-label">Кофемашина</div>
-                    <div class="info-value">{coffee_text}</div>
-                </div>
-
-                <div class="info-box">
-                    <div class="info-label">Ставка кофемашины</div>
-                    <div class="info-value">{coffee_rate_text}</div>
-                </div>
-
-                <div class="info-box">
-                    <div class="info-label">Правило поставок</div>
-                    <div class="info-value">До 5 коробок не оплачивается</div>
+                <div class="calendar-meta">
+                    <div class="mini-pill">Точка: {escape(point_code)}</div>
+                    <div class="mini-pill">{escape(fio)}</div>
+                    {coffee_meta_html}
+                    <div class="mini-pill">Месячная сверка: {"Отправлена" if monthly_submitted else "Черновик"}</div>
                 </div>
             </div>
 
-            <div class="sum-grid">
-                <div class="sum-box">
+            {info_box}
+
+            <div class="sum-strip">
+                <div class="sum-card">
                     <div class="sum-title">Сумма по точке</div>
                     <div class="sum-value">{point_total["total"]} ₽</div>
                 </div>
 
-                <div class="sum-box">
+                <div class="sum-card">
                     <div class="sum-title">Общая сумма за месяц</div>
                     <div class="sum-value">{overall["total"]} ₽</div>
                 </div>
-
-                <div class="sum-box">
-                    <div class="sum-title">Начислено за кофемашину</div>
-                    <div class="sum-value">{point_total["coffee_sum"]} ₽</div>
-                </div>
             </div>
+
+            <div class="details-grid">
+                <div class="detail-card">
+                    <div class="detail-title">Выходы с поставкой</div>
+                    <div class="detail-line">{point_total["cnt_supply"]} × {point_total["rate_supply"]} ₽ = {point_total["sum_supply"]} ₽</div>
+                </div>
+
+                <div class="detail-card">
+                    <div class="detail-title">Выходы без поставки</div>
+                    <div class="detail-line">{point_total["cnt_no_supply"]} × {point_total["rate_no_supply"]} ₽ = {point_total["sum_no_supply"]} ₽</div>
+                </div>
+
+                <div class="detail-card">
+                    <div class="detail-title">Полные инвенты</div>
+                    <div class="detail-line">{point_total["cnt_full_inv"]} × {point_total["rate_inventory"]} ₽ = {point_total["sum_inventory"]} ₽</div>
+                </div>
+
+                {coffee_card_html}
+            </div>
+
 
             <div class="calendar-wrap">
                 {calendar_html}
             </div>
 
             <div class="legend">
-                <div class="legend-item">П — в этот день была поставка</div>
+                <div class="legend-item">П — оплачиваемая поставка</div>
                 <div class="legend-item">В — отмечен выход</div>
-                <div class="legend-item">И — отмечен полный инвент</div>
+                <div class="legend-item">И — полный инвент</div>
             </div>
 
             <div class="calendar-note">
-                Выход считается по ставке «с поставкой» или «без поставки» автоматически.
-                Кофемашина начисляется автоматически за каждый дневной выход.
+                В обычные дни нажатие по дню сразу ставит или убирает выход.
+                В пятницу и субботу открывается выбор: выход или полный инвент.
             </div>
 
             <div class="calendar-note">
                 Поставки до 5 коробок не оплачиваются.
             </div>
 
-            <a class="back" href="/point-page?fio={fio}">← Выбрать другую точку</a>
+            {point_form}
+
+            <div class="admin-export-buttons" style="margin-top:18px;">
+                <a class="btn btn-secondary btn-inline" href="/point-page?fio={escape(fio)}">Следующая точка</a>
+                <a class="btn btn-secondary btn-inline" href="/summary-page?fio={escape(fio)}">Моя сумма</a>
+                <a class="btn btn-secondary btn-inline" href="/monthly-submit-page?fio={escape(fio)}">Отправить сверку за месяц</a>
+            </div>
+
+            <a class="back" href="/menu-page?fio={escape(fio)}">← На главный экран</a>
         </div>
     </div>
 </body>
 </html>
 """
 
+
+@app.get("/point-note-page", response_class=HTMLResponse)
+def point_note_page(
+    fio: str,
+    point_code: str,
+    mode: str = "",
+    db: Session = Depends(get_db)
+):
+    period = get_active_period()
+    merchant = get_merchant_by_fio(db, fio)
+    if not merchant:
+        return RedirectResponse(url="/login-page", status_code=303)
+
+    point_code_clean = normalize_point_code(point_code)
+    point_total = compute_point_total(db, merchant["id"], point_code_clean, period["year"], period["month"])
+
+    if not mode:
+        return f"""
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Добавить примечание</title>
+    {base_css()}
+</head>
+<body>
+    <div class="page">
+        <div class="card">
+            <div class="brand">ВкусВилл</div>
+            <h1>Добавить примечание</h1>
+            <div class="subtitle">Точка: {escape(point_code_clean)}</div>
+
+            <a class="btn" href="/point-note-page?fio={escape(fio)}&point_code={escape(point_code_clean)}&mode=normal">
+                1. Обычное примечание<br>
+                <span style="font-size:13px;font-weight:600;">например: закрытие точки</span>
+            </a>
+
+            <a class="btn btn-secondary" href="/point-note-page?fio={escape(fio)}&point_code={escape(point_code_clean)}&mode=no_supply">
+                2. Не принимал поставку в день с поставкой<br>
+                <span style="font-size:13px;font-weight:600;">если вы вышли на точку в день с поставкой, но поставку принимал другой сотрудник</span>
+            </a>
+
+            <a class="back" href="/calendar-page?fio={escape(fio)}&point_code={escape(point_code_clean)}">← Назад к точке</a>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+    if mode == "normal":
+        return f"""
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Обычное примечание</title>
+    {base_css()}
+</head>
+<body>
+    <div class="page">
+        <div class="card">
+            <div class="brand">ВкусВилл</div>
+            <h1>Обычное примечание</h1>
+            <div class="subtitle">Точка: {escape(point_code_clean)}</div>
+
+            <form method="post" action="/save-point-note-normal" autocomplete="off">
+                <input type="hidden" name="fio" value="{escape(fio)}" />
+                <input type="hidden" name="point_code" value="{escape(point_code_clean)}" />
+
+                <label for="note_amount">Сумма, ₽</label>
+                <input id="note_amount" name="note_amount" type="number" min="1" value="" placeholder="Например: 1500" required />
+
+                <label for="note_comment">Комментарий</label>
+                <input id="note_comment" name="note_comment" type="text" value="" placeholder="Например: Закрытие точки" required />
+
+                <button class="btn" type="submit">Сохранить примечание</button>
+            </form>
+
+            <a class="back" href="/point-note-page?fio={escape(fio)}&point_code={escape(point_code_clean)}">← Назад</a>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+    if mode == "no_supply":
+        supply_days = get_supply_days_for_point(db, point_code_clean, period["year"], period["month"])
+        adjustment = get_supply_adjustment_amount(db, point_code_clean, period["year"], period["month"])
+        options = "".join([f"<option value='{d.day}'>{d.strftime('%d.%m.%Y')}</option>" for d in supply_days])
+        if not options:
+            options = "<option value=''>Нет дней с поставкой</option>"
+
+        return f"""
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Не принимал поставку</title>
+    {base_css()}
+</head>
+<body>
+    <div class="page">
+        <div class="card">
+            <div class="brand">ВкусВилл</div>
+            <h1>Не принимал поставку</h1>
+            <div class="subtitle">Точка: {escape(point_code_clean)}</div>
+
+            <div class="hint">Выберите день с поставкой. Сумма корректировки рассчитается автоматически.</div>
+
+            <form method="post" action="/save-point-note-no-supply" autocomplete="off">
+                <input type="hidden" name="fio" value="{escape(fio)}" />
+                <input type="hidden" name="point_code" value="{escape(point_code_clean)}" />
+
+                <label for="supply_day">День с поставкой</label>
+                <select id="supply_day" name="supply_day" required>
+                    {options}
+                </select>
+
+                <div class="sum-card" style="margin-top:16px;">
+                    <div class="sum-title">Корректировка</div>
+                    <div class="sum-value">{adjustment} ₽</div>
+                </div>
+
+                <label for="comment">Комментарий</label>
+                <input id="comment" name="comment" type="text" placeholder="Не принимал поставку" />
+
+                <button class="btn" type="submit">Сохранить примечание</button>
+            </form>
+
+            <a class="back" href="/point-note-page?fio={escape(fio)}&point_code={escape(point_code_clean)}">← Назад</a>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+    return RedirectResponse(url=f"/point-note-page?fio={escape(fio)}&point_code={escape(point_code_clean)}", status_code=303)
+
+
+@app.post("/save-point-note-normal")
+def save_point_note_normal(
+    fio: str = Form(...),
+    point_code: str = Form(...),
+    note_amount: int = Form(...),
+    note_comment: str = Form(...),
+    db: Session = Depends(get_db)
+):
+    period = get_active_period()
+    merchant = get_merchant_by_fio(db, fio)
+    if not merchant:
+        return RedirectResponse(url="/login-page", status_code=303)
+
+    point_code_clean = normalize_point_code(point_code)
+    note_amount_value = int(note_amount or 0)
+    note_comment_value = (note_comment or "").strip()
+
+    if note_amount_value <= 0 or not note_comment_value:
+        return HTMLResponse(f"""
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ошибка</title>
+    {base_css()}
+</head>
+<body>
+    <div class="page">
+        <div class="card">
+            <h1>Ошибка</h1>
+            <div class="error-box">Для примечания необходимо заполнить сумму больше 0 и комментарий.</div>
+            <a class="back" href="/point-note-page?fio={escape(fio)}&point_code={escape(point_code_clean)}&mode=normal">← Вернуться к примечанию</a>
+        </div>
+    </div>
+</body>
+</html>
+        """, status_code=400)
+
+    existing = get_point_adjustment(db, merchant["id"], point_code_clean, period["year"], period["month"]) or {}
+    existing_note_amount = int(existing.get("note_amount") or 0)
+    existing_note_comment = existing.get("note_comment") or ""
+    new_note_comment = append_multiline_comment(existing_note_comment, note_amount_value, note_comment_value)
+
+    upsert_point_adjustment(
+        db=db,
+        merchant_id=merchant["id"],
+        point_code=point_code_clean,
+        y=period["year"],
+        m=period["month"],
+        note_amount=existing_note_amount + note_amount_value,
+        note_comment=new_note_comment,
+        reimb_amount=int(existing.get("reimb_amount") or 0),
+        reimb_comment=existing.get("reimb_comment") or "",
+        reimb_receipt=existing.get("reimb_receipt"),
+    )
+
+    return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code_clean)}&saved=1", status_code=303)
+
+
+@app.post("/save-point-note-no-supply")
+def save_point_note_no_supply(
+    fio: str = Form(...),
+    point_code: str = Form(...),
+    supply_day: int = Form(...),
+    comment: str = Form(""),
+    db: Session = Depends(get_db)
+):
+    period = get_active_period()
+    merchant = get_merchant_by_fio(db, fio)
+    if not merchant:
+        return RedirectResponse(url="/login-page", status_code=303)
+
+    point_code_clean = normalize_point_code(point_code)
+    adjustment = get_supply_adjustment_amount(db, point_code_clean, period["year"], period["month"])
+    supply_date = date(period["year"], period["month"], int(supply_day))
+    base_comment = f"Не принимал поставку {supply_date.strftime('%d.%m')}"
+    note_comment = base_comment if not comment else f"{base_comment}. {comment}"
+    existing = get_point_adjustment(db, merchant["id"], point_code_clean, period["year"], period["month"]) or {}
+    existing_note_amount = int(existing.get("note_amount") or 0)
+    existing_note_comment = existing.get("note_comment") or ""
+    new_note_comment = append_multiline_comment(existing_note_comment, adjustment, note_comment)
+
+    upsert_point_adjustment(
+        db=db,
+        merchant_id=merchant["id"],
+        point_code=point_code_clean,
+        y=period["year"],
+        m=period["month"],
+        note_amount=existing_note_amount + adjustment,
+        note_comment=new_note_comment,
+        reimb_amount=int(existing.get("reimb_amount") or 0),
+        reimb_comment=existing.get("reimb_comment") or "",
+        reimb_receipt=existing.get("reimb_receipt"),
+    )
+
+    return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code_clean)}&saved=1", status_code=303)
+
+
+@app.get("/point-reimbursement-page", response_class=HTMLResponse)
+def point_reimbursement_page(
+    fio: str,
+    point_code: str,
+    db: Session = Depends(get_db)
+):
+    period = get_active_period()
+    merchant = get_merchant_by_fio(db, fio)
+    if not merchant:
+        return RedirectResponse(url="/login-page", status_code=303)
+
+    point_code_clean = normalize_point_code(point_code)
+    point_total = compute_point_total(db, merchant["id"], point_code_clean, period["year"], period["month"])
+    receipt_links = render_receipt_links(point_total.get("reimb_receipt"))
+
+    return f"""
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Возмещение</title>
+    {base_css()}
+</head>
+<body>
+    <div class="page">
+        <div class="card">
+            <div class="brand">ВкусВилл</div>
+            <h1>Добавить возмещение</h1>
+            <div class="subtitle">Точка: {escape(point_code_clean)}</div>
+
+            <form method="post" action="/save-point-reimbursement" enctype="multipart/form-data" autocomplete="off">
+                <input type="hidden" name="fio" value="{escape(fio)}" />
+                <input type="hidden" name="point_code" value="{escape(point_code_clean)}" />
+
+                <label for="reimb_amount">Сумма, ₽</label>
+                <input id="reimb_amount" name="reimb_amount" type="number" min="1" value="" placeholder="Например: 150" required />
+
+                <label for="reimb_comment">Комментарий</label>
+                <input id="reimb_comment" name="reimb_comment" type="text" value="" placeholder="Например: Покупка пакетов" required />
+
+                <label for="reimb_receipts">Чеки</label>
+                <input id="reimb_receipts" name="reimb_receipts" type="file" accept=".jpg,.jpeg,.png,.pdf,.webp" multiple />
+                <div class="hint">Если указано возмещение, необходимо прикрепить чек. Можно загрузить несколько чеков.</div>
+
+                <div class="hint" style="margin-top:10px;">Уже загруженные чеки по этой точке:<br>{receipt_links}</div>
+
+                <button class="btn" type="submit">Сохранить возмещение</button>
+            </form>
+
+            <a class="back" href="/calendar-page?fio={escape(fio)}&point_code={escape(point_code_clean)}">← Назад к точке</a>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+
+@app.post("/save-point-reimbursement")
+async def save_point_reimbursement(
+    fio: str = Form(...),
+    point_code: str = Form(...),
+    reimb_amount: int = Form(0),
+    reimb_comment: str = Form(""),
+    reimb_receipts: List[UploadFile] = File(default=[]),
+    db: Session = Depends(get_db)
+):
+    period = get_active_period()
+    merchant = get_merchant_by_fio(db, fio)
+    if not merchant:
+        return RedirectResponse(url="/login-page", status_code=303)
+
+    point_code_clean = normalize_point_code(point_code)
+    reimb_amount_value = int(reimb_amount or 0)
+    reimb_comment_value = (reimb_comment or "").strip()
+    existing = get_point_adjustment(db, merchant["id"], point_code_clean, period["year"], period["month"]) or {}
+
+    new_paths = []
+    for receipt in reimb_receipts or []:
+        if receipt and receipt.filename:
+            content = await receipt.read()
+            if content:
+                new_paths.append(save_receipt_file_to_db(db, receipt.filename, receipt.content_type, content))
+
+    if reimb_amount_value <= 0 or not reimb_comment_value or not new_paths:
+        return HTMLResponse(f"""
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ошибка</title>
+    {base_css()}
+</head>
+<body>
+    <div class="page">
+        <div class="card">
+            <h1>Ошибка</h1>
+            <div class="error-box">Для возмещения необходимо заполнить сумму больше 0, комментарий и приложить чек.</div>
+            <a class="back" href="/point-reimbursement-page?fio={escape(fio)}&point_code={escape(point_code_clean)}">← Вернуться к возмещению</a>
+        </div>
+    </div>
+</body>
+</html>
+        """, status_code=400)
+
+    combined_receipts = append_receipt_paths(existing.get("reimb_receipt"), new_paths)
+    existing_reimb_amount = int(existing.get("reimb_amount") or 0)
+    existing_reimb_comment = existing.get("reimb_comment") or ""
+    new_reimb_comment = append_multiline_comment(existing_reimb_comment, reimb_amount_value, reimb_comment_value)
+
+    upsert_point_adjustment(
+        db=db,
+        merchant_id=merchant["id"],
+        point_code=point_code_clean,
+        y=period["year"],
+        m=period["month"],
+        note_amount=int(existing.get("note_amount") or 0),
+        note_comment=existing.get("note_comment") or "",
+        reimb_amount=existing_reimb_amount + reimb_amount_value,
+        reimb_comment=new_reimb_comment,
+        reimb_receipt=combined_receipts,
+    )
+
+    return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code_clean)}&saved=1", status_code=303)
+
+
+@app.post("/save-point-adjustment")
+async def save_point_adjustment(
+    fio: str = Form(...),
+    point_code: str = Form(...),
+    note_amount: int = Form(0),
+    note_comment: str = Form(""),
+    reimb_amount: int = Form(0),
+    reimb_comment: str = Form(""),
+    reimb_receipt: UploadFile | None = File(None),
+    db: Session = Depends(get_db)
+):
+    # Compatibility route for old form versions.
+    period = get_active_period()
+    merchant = get_merchant_by_fio(db, fio)
+    if not merchant:
+        return RedirectResponse(url="/login-page", status_code=303)
+    point_code_clean = normalize_point_code(point_code)
+    existing = get_point_adjustment(db, merchant["id"], point_code_clean, period["year"], period["month"]) or {}
+    # Старый маршрут оставлен только для совместимости со старыми версиями формы.
+    # Важно: он НЕ перетирает уже внесённые примечания/возмещения, а добавляет новые значения.
+    receipt_path = existing.get("reimb_receipt")
+    new_receipt_paths = []
+    if reimb_receipt and reimb_receipt.filename:
+        content = await reimb_receipt.read()
+        if content:
+            new_receipt_paths.append(save_receipt_file_to_db(db, reimb_receipt.filename, reimb_receipt.content_type, content))
+            receipt_path = append_receipt_paths(receipt_path, new_receipt_paths)
+
+    add_note_amount = int(note_amount or 0)
+    add_note_comment = (note_comment or "").strip()
+    add_reimb_amount = int(reimb_amount or 0)
+    add_reimb_comment = (reimb_comment or "").strip()
+
+    existing_note_amount = int(existing.get("note_amount") or 0)
+    existing_note_comment = existing.get("note_comment") or ""
+    existing_reimb_amount = int(existing.get("reimb_amount") or 0)
+    existing_reimb_comment = existing.get("reimb_comment") or ""
+
+    final_note_amount = existing_note_amount
+    final_note_comment = existing_note_comment
+    if add_note_amount > 0 or add_note_comment:
+        if add_note_amount <= 0 or not add_note_comment:
+            return RedirectResponse(url=f"/point-note-page?fio={escape(fio)}&point_code={escape(point_code_clean)}&mode=normal", status_code=303)
+        final_note_amount = existing_note_amount + add_note_amount
+        final_note_comment = append_multiline_comment(existing_note_comment, add_note_amount, add_note_comment)
+
+    final_reimb_amount = existing_reimb_amount
+    final_reimb_comment = existing_reimb_comment
+    if add_reimb_amount > 0 or add_reimb_comment or new_receipt_paths:
+        if add_reimb_amount <= 0 or not add_reimb_comment or not new_receipt_paths:
+            return RedirectResponse(url=f"/point-reimbursement-page?fio={escape(fio)}&point_code={escape(point_code_clean)}", status_code=303)
+        final_reimb_amount = existing_reimb_amount + add_reimb_amount
+        final_reimb_comment = append_multiline_comment(existing_reimb_comment, add_reimb_amount, add_reimb_comment)
+
+    upsert_point_adjustment(
+        db=db,
+        merchant_id=merchant["id"],
+        point_code=point_code_clean,
+        y=period["year"],
+        m=period["month"],
+        note_amount=final_note_amount,
+        note_comment=final_note_comment,
+        reimb_amount=final_reimb_amount,
+        reimb_comment=final_reimb_comment,
+        reimb_receipt=receipt_path,
+    )
+    return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code_clean)}&saved=1", status_code=303)
+
+
+
+
+@app.post("/delete-point-note")
+def delete_point_note(
+    fio: str = Form(...),
+    point_code: str = Form(...),
+    item_index: int = Form(...),
+    db: Session = Depends(get_db)
+):
+    period = get_active_period()
+    merchant = get_merchant_by_fio(db, fio)
+    if not merchant:
+        return RedirectResponse(url="/login-page", status_code=303)
+
+    point_code_clean = normalize_point_code(point_code)
+    overall = compute_overall_total(db, merchant["id"], period["year"], period["month"])
+    if overall["submission_status"] == "submitted":
+        return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code_clean)}", status_code=303)
+
+    existing = get_point_adjustment(db, merchant["id"], point_code_clean, period["year"], period["month"]) or {}
+    note_lines = split_adjustment_lines(existing.get("note_comment"))
+
+    if 0 <= int(item_index) < len(note_lines):
+        note_lines.pop(int(item_index))
+
+    new_note_comment = "\n".join(note_lines)
+    new_note_amount = sum_adjustment_lines(note_lines)
+
+    upsert_point_adjustment(
+        db=db,
+        merchant_id=merchant["id"],
+        point_code=point_code_clean,
+        y=period["year"],
+        m=period["month"],
+        note_amount=new_note_amount,
+        note_comment=new_note_comment,
+        reimb_amount=int(existing.get("reimb_amount") or 0),
+        reimb_comment=existing.get("reimb_comment") or "",
+        reimb_receipt=existing.get("reimb_receipt"),
+    )
+
+    return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code_clean)}&saved=1", status_code=303)
+
+
+@app.post("/delete-point-reimbursement")
+def delete_point_reimbursement(
+    fio: str = Form(...),
+    point_code: str = Form(...),
+    item_index: int = Form(...),
+    db: Session = Depends(get_db)
+):
+    period = get_active_period()
+    merchant = get_merchant_by_fio(db, fio)
+    if not merchant:
+        return RedirectResponse(url="/login-page", status_code=303)
+
+    point_code_clean = normalize_point_code(point_code)
+    overall = compute_overall_total(db, merchant["id"], period["year"], period["month"])
+    if overall["submission_status"] == "submitted":
+        return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code_clean)}", status_code=303)
+
+    existing = get_point_adjustment(db, merchant["id"], point_code_clean, period["year"], period["month"]) or {}
+    reimb_lines = split_adjustment_lines(existing.get("reimb_comment"))
+
+    if 0 <= int(item_index) < len(reimb_lines):
+        reimb_lines.pop(int(item_index))
+
+    new_reimb_comment = "\n".join(reimb_lines)
+    new_reimb_amount = sum_adjustment_lines(reimb_lines)
+
+    upsert_point_adjustment(
+        db=db,
+        merchant_id=merchant["id"],
+        point_code=point_code_clean,
+        y=period["year"],
+        m=period["month"],
+        note_amount=int(existing.get("note_amount") or 0),
+        note_comment=existing.get("note_comment") or "",
+        reimb_amount=new_reimb_amount,
+        reimb_comment=new_reimb_comment,
+        reimb_receipt=existing.get("reimb_receipt"),
+    )
+
+    return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code_clean)}&saved=1", status_code=303)
+
+
+@app.get("/monthly-submit-page", response_class=HTMLResponse)
+def monthly_submit_page(
+    fio: str,
+    submitted: str = "",
+    reopened: str = "",
+    db: Session = Depends(get_db)
+):
+    period = get_active_period()
+    y = period["year"]
+    m = period["month"]
+
+    merchant = get_merchant_by_fio(db, fio)
+    if not merchant:
+        return RedirectResponse(url="/login-page", status_code=303)
+
+    overall = compute_overall_total(db, merchant["id"], y, m)
+    monthly_submitted = overall["submission_status"] == "submitted"
+
+    info_box = ""
+    if submitted == "1":
+        info_box += "<div class='success-box'>Месячная сверка отправлена.</div>"
+    if reopened == "1":
+        info_box += "<div class='success-box'>Месячная сверка разблокирована для редактирования.</div>"
+
+    points_html = ""
+    if overall["per_point_details"]:
+        for point_code, d in overall["per_point_details"].items():
+            points_html += f"""
+            <details class="point-detail">
+                <summary>{escape(point_code)} — {d["total"]} ₽</summary>
+                <div class="summary-content">
+                    <div>С поставкой: {d["cnt_supply"]} × {d["rate_supply"]} ₽ = {d["sum_supply"]} ₽</div>
+                    <div>Без поставки: {d["cnt_no_supply"]} × {d["rate_no_supply"]} ₽ = {d["sum_no_supply"]} ₽</div>
+                    <div>Полный инвент: {d["cnt_full_inv"]} × {d["rate_inventory"]} ₽ = {d["sum_inventory"]} ₽</div>
+                    {f'<div>Кофемашина: {d["coffee_cnt"]} × {d["coffee_rate"]} ₽ = {d["coffee_sum"]} ₽</div>' if d["coffee_enabled"] else ''}
+                    <div>Примечание по точке: {d["note_amount"]} ₽ — {escape(d["note_comment"]) if d["note_comment"] else "—"}</div>
+                    <div>Возмещение по точке: {d["reimb_amount"]} ₽ — {escape(d["reimb_comment"]) if d["reimb_comment"] else "—"}</div>
+                    <div>Чек по возмещению: {render_receipt_links(d["reimb_receipt"], "открыть")}</div>
+                </div>
+            </details>
+            """
+    else:
+        points_html = "<div class='hint'>В этом месяце пока нет отмеченных точек.</div>"
+
+    action_block = ""
+    if monthly_submitted:
+        action_block = f"""
+        <div class="detail-card" style="margin-top:18px;">
+            <div class="detail-title">Статус</div>
+            <div class="detail-line">Сверка за месяц отправлена</div>
+            <a class="btn btn-secondary" href="/reopen-monthly-submission?fio={escape(fio)}">Редактировать сверку</a>
+        </div>
+        """
+    else:
+        action_block = f"""
+        <form method="post" action="/submit-monthly-submission">
+            <input type="hidden" name="fio" value="{escape(fio)}" />
+            <button class="btn" type="submit">Отправить сверку за месяц</button>
+        </form>
+        """
+
+    return f"""
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Отправка месячной сверки</title>
+    {base_css()}
+</head>
+<body>
+    <div class="page">
+        <div class="card-wide">
+            <div class="brand">ВкусВилл</div>
+            <h1>Отправить сверку за месяц</h1>
+            <div class="subtitle">{escape(fio)} · {month_title(y, m)}</div>
+
+            {info_box}
+
+            <div class="sum-strip">
+                <div class="sum-card">
+                    <div class="sum-title">Сумма по точкам</div>
+                    <div class="sum-value">{sum(overall["per_point"].values())} ₽</div>
+                </div>
+
+                <div class="sum-card">
+                    <div class="sum-title">Итог за месяц</div>
+                    <div class="sum-value">{overall["total"]} ₽</div>
+                </div>
+            </div>
+
+            <div class="hint">
+                Пожалуйста, убедитесь перед отправкой, что данные по всем точкам заполнены корректно.
+            </div>
+
+            {points_html}
+
+            {action_block}
+
+            <div class="admin-export-buttons" style="margin-top:18px;">
+                <a class="btn btn-secondary btn-inline" href="/point-page?fio={escape(fio)}">Перейти к другой точке</a>
+                <a class="btn btn-secondary btn-inline" href="/summary-page?fio={escape(fio)}">Моя сумма</a>
+                <a class="btn btn-secondary btn-inline" href="/menu-page?fio={escape(fio)}">Главный экран</a>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+
+@app.post("/submit-monthly-submission")
+async def submit_monthly_submission_route(
+    fio: str = Form(...),
+    db: Session = Depends(get_db)
+):
+    period = get_active_period()
+    merchant = get_merchant_by_fio(db, fio)
+    if not merchant:
+        return RedirectResponse(url="/login-page", status_code=303)
+
+    submit_monthly_submission(db, merchant["id"], period["year"], period["month"])
+
+    return RedirectResponse(
+        url=f"/monthly-submit-page?fio={escape(fio)}&submitted=1",
+        status_code=303
+    )
+
+
+@app.get("/reopen-monthly-submission")
+def reopen_monthly_submission_route(
+    fio: str,
+    db: Session = Depends(get_db)
+):
+    period = get_active_period()
+    merchant = get_merchant_by_fio(db, fio)
+    if not merchant:
+        return RedirectResponse(url="/login-page", status_code=303)
+
+    reopen_monthly_submission(db, merchant["id"], period["year"], period["month"])
+
+    return RedirectResponse(
+        url=f"/monthly-submit-page?fio={escape(fio)}&reopened=1",
+        status_code=303
+    )
 
 @app.get("/day-action-page", response_class=HTMLResponse)
 def day_action_page(
@@ -888,17 +2028,24 @@ def day_action_page(
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
 
+    overall = compute_overall_total(db, merchant["id"], y, m)
+    if overall["submission_status"] == "submitted":
+        return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}", status_code=303)
+
     if day < 1 or day > days_in_month(y, m):
-        return RedirectResponse(url=f"/calendar-page?fio={fio}&point_code={point_code}", status_code=303)
+        return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}", status_code=303)
 
     visits = get_visits_for_month(db, merchant["id"], point_code, y, m)
     day_visits = visits.get(day, set())
 
-    wd = weekday_of(y, m, day)
-    is_fri_or_sat = wd in (4, 5)
+    current_date = date(y, m, day)
+    inventory_allowed = is_inventory_allowed_date(db, current_date)
 
     day_btn_text = "Убрать выход" if "DAY" in day_visits else "Добавить выход"
     inv_btn_text = "Убрать полный инвент" if "FULL_INVENT" in day_visits else "Добавить полный инвент"
+
+    if not inventory_allowed:
+        return RedirectResponse(url=f"/toggle-day?fio={escape(fio)}&point_code={escape(point_code)}&day={day}", status_code=303)
 
     return f"""
 <!DOCTYPE html>
@@ -915,23 +2062,19 @@ def day_action_page(
             <div class="brand">ВкусВилл</div>
             <h1>Выбор действия</h1>
             <div class="subtitle">
-                Точка: {point_code}<br>
+                Точка: {escape(point_code)}<br>
                 Дата: {day:02d}.{m:02d}.{y}
             </div>
 
-            <div class="action-list">
-                <a class="btn btn-small" href="/toggle-day?fio={fio}&point_code={point_code}&day={day}">
-                    {day_btn_text}
-                </a>
+            <a class="btn btn-small" href="/toggle-day?fio={escape(fio)}&point_code={escape(point_code)}&day={day}">
+                {day_btn_text}
+            </a>
 
-                {f'''
-                <a class="btn btn-secondary btn-small" href="/toggle-inventory?fio={fio}&point_code={point_code}&day={day}">
-                    {inv_btn_text}
-                </a>
-                ''' if is_fri_or_sat else ''}
-            </div>
+            <a class="btn btn-secondary btn-small" href="/toggle-inventory?fio={escape(fio)}&point_code={escape(point_code)}&day={day}">
+                {inv_btn_text}
+            </a>
 
-            <a class="back" href="/calendar-page?fio={fio}&point_code={point_code}">← Назад к календарю</a>
+            <a class="back" href="/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}">← Назад к календарю</a>
         </div>
     </div>
 </body>
@@ -954,13 +2097,14 @@ def toggle_day(
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
 
+    overall = compute_overall_total(db, merchant["id"], y, m)
+    if overall["submission_status"] == "submitted":
+        return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}", status_code=303)
+
     if 1 <= day <= days_in_month(y, m):
         toggle_day_visit(db, merchant["id"], point_code, y, m, day)
 
-    return RedirectResponse(
-        url=f"/calendar-page?fio={fio}&point_code={point_code}",
-        status_code=303
-    )
+    return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}", status_code=303)
 
 
 @app.get("/toggle-inventory")
@@ -978,32 +2122,45 @@ def toggle_inventory(
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
 
+    overall = compute_overall_total(db, merchant["id"], y, m)
+    if overall["submission_status"] == "submitted":
+        return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}", status_code=303)
+
     if 1 <= day <= days_in_month(y, m):
-        wd = weekday_of(y, m, day)
-        if wd in (4, 5):
+        current_date = date(y, m, day)
+        if is_inventory_allowed_date(db, current_date):
             toggle_inventory_visit(db, merchant["id"], point_code, y, m, day)
 
-    return RedirectResponse(
-        url=f"/calendar-page?fio={fio}&point_code={point_code}",
-        status_code=303
-    )
+    return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}", status_code=303)
 
 
 @app.get("/summary-page", response_class=HTMLResponse)
 def summary_page(fio: str = "", db: Session = Depends(get_db)):
     period = get_active_period()
     merchant = get_merchant_by_fio(db, fio)
-    overall = {"total": 0, "per_point": {}}
+    overall = {"total": 0, "per_point": {}, "per_point_details": {}}
 
     if merchant:
         overall = compute_overall_total(db, merchant["id"], period["year"], period["month"])
 
-    point_lines = ""
-    if overall["per_point"]:
-        for p, total in overall["per_point"].items():
-            point_lines += f"<div class='hint' style='margin-top:10px'>{p} — {total} ₽</div>"
+    details_html = ""
+    if overall["per_point_details"]:
+        for point_code, d in overall["per_point_details"].items():
+            details_html += f"""
+            <details class="point-detail">
+                <summary>{escape(point_code)} — {d["total"]} ₽</summary>
+                <div class="summary-content">
+                    <div>С поставкой: {d["cnt_supply"]} × {d["rate_supply"]} ₽ = {d["sum_supply"]} ₽</div>
+                    <div>Без поставки: {d["cnt_no_supply"]} × {d["rate_no_supply"]} ₽ = {d["sum_no_supply"]} ₽</div>
+                    <div>Полный инвент: {d["cnt_full_inv"]} × {d["rate_inventory"]} ₽ = {d["sum_inventory"]} ₽</div>
+                    {f'<div>Кофемашина: {d["coffee_cnt"]} × {d["coffee_rate"]} ₽ = {d["coffee_sum"]} ₽</div>' if d["coffee_enabled"] else ''}
+                    <div><strong>Итого по точке: {d["total"]} ₽</strong></div>
+                </div>
+            </details>
+            """
     else:
-        point_lines = "<div class='hint' style='margin-top:10px'>Пока нет отмеченных точек за этот месяц.</div>"
+        details_html = "<div class='hint' style='margin-top:10px'>Пока нет отмеченных точек за этот месяц.</div>"
+
 
     return f"""
 <!DOCTYPE html>
@@ -1019,22 +2176,758 @@ def summary_page(fio: str = "", db: Session = Depends(get_db)):
         <div class="card">
             <div class="brand">ВкусВилл</div>
             <h1>Моя сумма</h1>
-            <div class="subtitle">{fio}</div>
+            <div class="subtitle">{escape(fio)}</div>
 
-            <div class="sum-box">
+            <div class="sum-card">
                 <div class="sum-title">Общая сумма за месяц</div>
                 <div class="sum-value">{overall["total"]} ₽</div>
             </div>
 
-            {point_lines}
+            {details_html}
 
-            <div class="hint">
-                Сейчас открыт период за {month_title(period["year"], period["month"])}.
-            </div>
+            <div class="hint">Сейчас открыт период за {month_title(period["year"], period["month"])}.</div>
 
-            <a class="back" href="/menu-page?fio={fio}">← Назад</a>
+            <a class="back" href="/menu-page?fio={escape(fio)}">← Назад</a>
         </div>
     </div>
 </body>
 </html>
 """
+
+
+@app.get("/admin-login", response_class=HTMLResponse)
+def admin_login_page(error: str = ""):
+    error_box = ""
+    if error == "1":
+        error_box = "<div class='error-box'>Неверный логин или пароль.</div>"
+
+    env_box = ""
+    if not ADMIN_LOGIN or not ADMIN_PASSWORD:
+        env_box = "<div class='error-box'>В Render нужно задать ADMIN_LOGIN и ADMIN_PASSWORD.</div>"
+
+    return f"""
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Админ-вход</title>
+    {base_css()}
+</head>
+<body>
+    <div class="page">
+        <div class="card">
+            <div class="brand">ВкусВилл</div>
+            <h1>Админка</h1>
+            <div class="subtitle">Вход в отчёт по сверкам</div>
+
+            {env_box}
+            {error_box}
+
+            <form method="post" action="/admin-login">
+                <label for="login">Логин</label>
+                <input id="login" name="login" type="text" required />
+
+                <label for="password">Пароль</label>
+                <input id="password" name="password" type="password" required />
+
+                <button class="btn" type="submit">Войти</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+
+@app.post("/admin-login")
+def admin_login_submit(login: str = Form(...), password: str = Form(...)):
+    if not ADMIN_LOGIN or not ADMIN_PASSWORD:
+        return RedirectResponse(url="/admin-login?error=1", status_code=303)
+
+    if login != ADMIN_LOGIN or password != ADMIN_PASSWORD:
+        return RedirectResponse(url="/admin-login?error=1", status_code=303)
+
+    response = RedirectResponse(url="/admin-report", status_code=303)
+    response.set_cookie(
+        key="admin_auth",
+        value=get_admin_cookie_value(),
+        httponly=True,
+        samesite="lax",
+        secure=False,
+        max_age=60 * 60 * 12,
+    )
+    return response
+
+
+@app.get("/admin-logout")
+def admin_logout():
+    response = RedirectResponse(url="/admin-login", status_code=303)
+    response.delete_cookie("admin_auth")
+    return response
+
+
+@app.get("/admin-report", response_class=HTMLResponse)
+def admin_report(
+    year: int | None = None,
+    month: int | None = None,
+    tu: str = "",
+    status: str = "",
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db)
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+
+    period = get_active_period()
+    year = year or period["year"]
+    month = month or period["month"]
+
+    tu_filter = tu.strip() or None
+    status_filter = status.strip() or None
+
+    rows = get_admin_report_rows(db, year, month, tu_filter, status_filter)
+    tu_values = get_all_tu_values(db)
+
+    tu_options = "<option value=''>Все ТУ</option>"
+    for item in tu_values:
+        selected = "selected" if item == tu else ""
+        tu_options += f"<option value='{escape(item)}' {selected}>{escape(item)}</option>"
+
+    status_options = f"""
+        <option value='' {'selected' if not status else ''}>Все статусы</option>
+        <option value='не отправлено' {'selected' if status == 'не отправлено' else ''}>Не отправлено</option>
+        <option value='draft' {'selected' if status == 'draft' else ''}>Черновик</option>
+        <option value='submitted' {'selected' if status == 'submitted' else ''}>Отправлено</option>
+    """
+
+    rows_html = ""
+    if rows:
+        for r in rows:
+            receipt_html = "—"
+            if r["receipt_path"]:
+                receipt_html = f"<a href='/{r['receipt_path']}' target='_blank'>Открыть</a>"
+
+            rows_html += f"""
+            <tr>
+                <td>{escape(r["fio"])}</td>
+                <td>{escape(r["tu"]) if r["tu"] else "—"}</td>
+                <td>{escape(r["point_code"])}</td>
+                <td>{month_title(year, month)}</td>
+                <td>{r["cnt_supply"]} / {r["sum_supply"]} ₽</td>
+                <td>{r["cnt_no_supply"]} / {r["sum_no_supply"]} ₽</td>
+                <td><strong>{r.get("cnt_total_exits", r["cnt_supply"] + r["cnt_no_supply"])}</strong></td>
+                <td>{r["cnt_full_inv"]} / {r["sum_inventory"]} ₽</td>
+                <td>{r["coffee_cnt"]} × {r["coffee_rate"]} = {r["coffee_sum"]} ₽</td>
+                <td>{r["note_amount"]} ₽<br>{escape(r["note_comment"]) if r["note_comment"] else "—"}</td>
+                <td>{r["reimb_amount"]} ₽<br>{escape(r["reimb_comment"]) if r["reimb_comment"] else "—"}</td>
+                <td><strong>{r["point_total"]} ₽</strong></td>
+                <td>{escape(r["status"])}</td>
+                <td>{render_receipt_links(r["reimb_receipt"], "Открыть")}</td>
+                <td>{"<span style='color:#B91C1C;font-weight:900;'>Да</span>" if r.get("has_overlap") else "—"}</td>
+                <td>{escape(r["comment"]) if r["comment"] else "—"}</td>
+            </tr>
+            """
+    else:
+        rows_html = """
+        <tr>
+            <td colspan="16">По выбранным фильтрам данных нет.</td>
+        </tr>
+        """
+
+    month_options = ""
+    for m in range(1, 13):
+        selected = "selected" if m == month else ""
+        month_options += f"<option value='{m}' {selected}>{m:02d}</option>"
+
+    export_query = f"year={year}&month={month}&tu={escape(tu)}&status={escape(status)}"
+
+    return f"""
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Админ-отчёт</title>
+    {base_css()}
+</head>
+<body>
+    <div class="page">
+        <div class="card-wide">
+            <div class="admin-actions">
+                <div>
+                    <div class="brand">ВкусВилл</div>
+                    <h1>Отчёт по сверкам</h1>
+                    <div class="subtitle">Админ-панель</div>
+                </div>
+                <div class="admin-export-buttons">
+                    <a class="btn btn-secondary btn-inline" href="/admin-data">Управление данными</a>
+                    <a class="btn btn-secondary btn-inline" href="/admin-logout">Выйти</a>
+                </div>
+            </div>
+
+            <form method="get" action="/admin-report">
+                <div class="filter-grid">
+                    <div>
+                        <label for="year">Год</label>
+                        <input id="year" name="year" type="number" value="{year}" />
+                    </div>
+
+                    <div>
+                        <label for="month">Месяц</label>
+                        <select id="month" name="month">
+                            {month_options}
+                        </select>
+                    </div>
+
+                    <div>
+                        <label for="tu">Территориальный управляющий</label>
+                        <select id="tu" name="tu">
+                            {tu_options}
+                        </select>
+                    </div>
+
+                    <div>
+                        <label for="status">Статус сверки</label>
+                        <select id="status" name="status">
+                            {status_options}
+                        </select>
+                    </div>
+                </div>
+
+                <button class="btn btn-inline" type="submit">Применить фильтр</button>
+            </form>
+
+            <div class="admin-export-buttons">
+                <a class="btn btn-secondary btn-inline" href="/admin-export-check?{export_query}">Выгрузка для проверки</a>
+                <a class="btn btn-secondary btn-inline" href="/admin-export-payroll?{export_query}">Выгрузка в ведомость</a>
+                <a class="btn btn-secondary btn-inline" href="/admin-export-overlaps?{export_query}">Выгрузка пересечений</a>
+            </div>
+
+            <div class="hint">
+                Период отчёта: {month_title(year, month)}. Всего строк: {len(rows)}.
+            </div>
+
+            <div class="table-wrap" style="margin-top:16px;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ФИО</th>
+                            <th>ТУ</th>
+                            <th>Точка</th>
+                            <th>Месяц</th>
+                            <th>С поставкой</th>
+                            <th>Без поставки</th>
+                            <th>Выходов всего</th>
+                            <th>Инвенты</th>
+                            <th>Кофемашина</th>
+                            <th>Примечание по точке</th>
+                            <th>Возмещение по точке</th>
+                            <th>Итог по точке</th>
+                            <th>Статус</th>
+                            <th>Чек по точке</th>
+                            <th>Пересечение</th>
+                            <th>Комментарий месяца</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {rows_html}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+
+@app.get("/admin-data", response_class=HTMLResponse)
+def admin_data_page(
+    success: str = "",
+    error: str = "",
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db)
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+
+    period = get_active_period()
+    tu_values = get_all_tu_values(db)
+
+    tu_options = ""
+    for item in tu_values:
+        tu_options += f"<option value='{escape(item)}'>{escape(item)}</option>"
+
+    info_box = ""
+    if success:
+        info_box += f"<div class='success-box'>{escape(success)}</div>"
+    if error:
+        info_box += f"<div class='error-box'>{escape(error)}</div>"
+
+    special_inventory_days = get_special_inventory_days(db)
+    if special_inventory_days:
+        rows = []
+        for inv_day in special_inventory_days:
+            rows.append(f"""<form method='post' action='/admin-delete-special-inventory-day' style='margin-top:10px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;'>
+                <input type='hidden' name='inv_date' value='{inv_day.isoformat()}' />
+                <div class='mini-pill'>{inv_day.strftime('%d.%m.%Y')}</div>
+                <button class='btn btn-danger btn-inline' type='submit'>Удалить</button>
+            </form>""")
+        special_inventory_html = ''.join(rows)
+    else:
+        special_inventory_html = "<div class='hint' style='margin-top:14px;'>Специальные даты пока не добавлены.</div>"
+
+    return f"""
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Управление данными</title>
+    {base_css()}
+</head>
+<body>
+    <div class="page">
+        <div class="card-wide">
+            <div class="admin-actions">
+                <div>
+                    <div class="brand">ВкусВилл</div>
+                    <h1>Управление данными</h1>
+                    <div class="subtitle">Загрузка файлов и очистка месяца</div>
+                </div>
+                <div class="admin-export-buttons">
+                    <a class="btn btn-secondary btn-inline" href="/admin-report">Назад к отчёту</a>
+                    <a class="btn btn-secondary btn-inline" href="/admin-logout">Выйти</a>
+                </div>
+            </div>
+
+            {info_box}
+
+            <div class="data-grid">
+                <div class="detail-card">
+                    <div class="detail-title">Загрузка поставок</div>
+                    <form method="post" action="/admin-upload-supplies" enctype="multipart/form-data">
+                        <label for="supplies_file">Файл поставок</label>
+                        <input id="supplies_file" name="file" type="file" accept=".xlsx" required />
+                        <button class="btn" type="submit">Загрузить поставки</button>
+                    </form>
+                </div>
+
+                <div class="detail-card">
+                    <div class="detail-title">Загрузка ставок</div>
+                    <form method="post" action="/admin-upload-rates" enctype="multipart/form-data">
+                        <label for="rates_year">Год</label>
+                        <input id="rates_year" name="year" type="number" value="{period["year"]}" required />
+
+                        <label for="rates_month">Месяц</label>
+                        <input id="rates_month" name="month" type="number" value="{period["month"]}" min="1" max="12" required />
+
+                        <label for="rates_file">Файл ставок</label>
+                        <input id="rates_file" name="file" type="file" accept=".xlsx" required />
+
+                        <button class="btn" type="submit">Загрузить ставки</button>
+                    </form>
+                </div>
+
+                <div class="detail-card">
+                    <div class="detail-title">Загрузка мерчей</div>
+                    <form method="post" action="/admin-upload-merchants" enctype="multipart/form-data">
+                        <label for="merchants_tu">Территориальный управляющий</label>
+                        <input id="merchants_tu" name="tu" type="text" placeholder="Например: Хрупов" required />
+
+                        <label for="merchants_file">Файл мерчей</label>
+                        <input id="merchants_file" name="file" type="file" accept=".xlsx" required />
+
+                        <button class="btn" type="submit">Загрузить мерчей</button>
+                    </form>
+                </div>
+
+                <div class="detail-card">
+                    <div class="detail-title">Добавить / изменить сотрудника</div>
+                    <form method="post" action="/admin-add-merchant">
+                        <label for="manual_merchant_fio">ФИО</label>
+                        <input id="manual_merchant_fio" name="fio" type="text" placeholder="Иванов Иван Иванович" required />
+
+                        <label for="manual_merchant_last4">Последние 4 цифры телефона</label>
+                        <input id="manual_merchant_last4" name="last4" type="text" inputmode="numeric" maxlength="4" placeholder="1234" required />
+
+                        <label for="manual_merchant_tu">Территориальный управляющий</label>
+                        <input id="manual_merchant_tu" name="tu" type="text" placeholder="Например: Хрупов" required />
+
+                        <button class="btn" type="submit">Сохранить сотрудника</button>
+                    </form>
+                    <div class="hint" style="margin-top:14px;">Если сотрудник уже есть, будут обновлены последние 4 цифры телефона и ТУ.</div>
+                </div>
+
+                <div class="detail-card">
+                    <div class="detail-title">Очистка месяца</div>
+                    <form method="post" action="/admin-clear-month">
+                        <label for="clear_year">Год</label>
+                        <input id="clear_year" name="year" type="number" value="{period["year"]}" required />
+
+                        <label for="clear_month">Месяц</label>
+                        <input id="clear_month" name="month" type="number" value="{period["month"]}" min="1" max="12" required />
+
+                        <button class="btn btn-danger" type="submit">Очистить данные месяца</button>
+                    </form>
+                </div>
+
+                <div class="detail-card">
+                    <div class="detail-title">Очистка мерчей по ТУ</div>
+                    <form method="post" action="/admin-clear-merchants">
+                        <label for="clear_tu">Территориальный управляющий</label>
+                        <select id="clear_tu" name="tu" required>
+                            {tu_options}
+                        </select>
+
+                        <button class="btn btn-danger" type="submit">Удалить мерчей этого ТУ</button>
+                    </form>
+                </div>
+
+                <div class="detail-card">
+                    <div class="detail-title">Специальные даты для инвента</div>
+                    <form method="post" action="/admin-add-special-inventory-day">
+                        <label for="special_inventory_date">Дата</label>
+                        <input id="special_inventory_date" name="inv_date" type="date" required />
+                        <button class="btn" type="submit">Добавить дату</button>
+                    </form>
+
+                    <div class="hint" style="margin-top:14px;">Инвент будет доступен в пятницу, субботу и в датах из списка ниже.</div>
+
+                    {special_inventory_html}
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+
+@app.post("/admin-upload-supplies")
+async def admin_upload_supplies(
+    file: UploadFile = File(...),
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db)
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+
+    try:
+        result = import_supplies_xlsx(db, file.file)
+        msg = f"Поставки загружены: строк {result['loaded_rows']}, точек {result['loaded_points']}."
+        return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
+    except Exception as e:
+        return RedirectResponse(url=f"/admin-data?error={str(e)}", status_code=303)
+
+
+@app.post("/admin-upload-rates")
+async def admin_upload_rates(
+    year: int = Form(...),
+    month: int = Form(...),
+    file: UploadFile = File(...),
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db)
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+
+    try:
+        result = import_rates_xlsx(db, file.file, year, month)
+        msg = f"Ставки загружены: строк {result['loaded_rows']}."
+        return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
+    except Exception as e:
+        return RedirectResponse(url=f"/admin-data?error={str(e)}", status_code=303)
+
+
+@app.post("/admin-upload-merchants")
+async def admin_upload_merchants(
+    tu: str = Form(...),
+    file: UploadFile = File(...),
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db)
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+
+    try:
+        result = import_merchants_xlsx(db, file.file, tu)
+        msg = f"Мерчи загружены: строк {result['loaded_rows']}."
+        return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
+    except Exception as e:
+        return RedirectResponse(url=f"/admin-data?error={str(e)}", status_code=303)
+
+
+@app.post("/admin-add-merchant")
+def admin_add_merchant(
+    fio: str = Form(...),
+    last4: str = Form(...),
+    tu: str = Form(...),
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db)
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+
+    fio_clean = (fio or "").strip()
+    last4_digits = re.sub(r"\D", "", str(last4 or ""))[-4:]
+    tu_clean = (tu or "").strip()
+
+    if not fio_clean:
+        return RedirectResponse(url="/admin-data?error=Укажите ФИО сотрудника", status_code=303)
+    if len(last4_digits) != 4:
+        return RedirectResponse(url="/admin-data?error=Укажите последние 4 цифры телефона", status_code=303)
+    if not tu_clean:
+        return RedirectResponse(url="/admin-data?error=Укажите ТУ", status_code=303)
+
+    try:
+        upsert_merchant_row(db, fio_clean, last4_digits, tu_clean)
+        db.commit()
+        msg = f"Сотрудник сохранён: {fio_clean}, ТУ: {tu_clean}."
+        return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
+    except Exception as e:
+        db.rollback()
+        return RedirectResponse(url=f"/admin-data?error={str(e)}", status_code=303)
+
+
+@app.post("/admin-clear-month")
+def admin_clear_month(
+    year: int = Form(...),
+    month: int = Form(...),
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db)
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+
+    result = clear_month_data(db, year, month)
+    msg = (
+        f"Месяц очищен. Визиты: {result['deleted_visits']}, "
+        f"поставки: {result['deleted_supplies']}, ставки: {result['deleted_rates']}, "
+        f"месячные сверки: {result['deleted_monthly']}, корректировки по точкам: {result.get('deleted_point_adjustments', 0)}."
+    )
+    return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
+
+
+@app.post("/admin-clear-merchants")
+def admin_clear_merchants(
+    tu: str = Form(...),
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db)
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+
+    deleted = clear_merchants_by_tu(db, tu)
+    msg = f"Удалено мерчей ТУ {tu}: {deleted}."
+    return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
+
+
+@app.post("/admin-add-special-inventory-day")
+def admin_add_special_inventory_day(
+    inv_date: str = Form(...),
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db)
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+
+    try:
+        parsed_date = datetime.strptime(inv_date, "%Y-%m-%d").date()
+        add_special_inventory_day(db, parsed_date)
+        msg = f"Добавлена специальная дата для инвента: {parsed_date.strftime('%d.%m.%Y')}."
+        return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
+    except Exception as e:
+        return RedirectResponse(url=f"/admin-data?error={str(e)}", status_code=303)
+
+
+@app.post("/admin-delete-special-inventory-day")
+def admin_delete_special_inventory_day(
+    inv_date: str = Form(...),
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db)
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+
+    try:
+        parsed_date = datetime.strptime(inv_date, "%Y-%m-%d").date()
+        delete_special_inventory_day(db, parsed_date)
+        msg = f"Удалена специальная дата для инвента: {parsed_date.strftime('%d.%m.%Y')}."
+        return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
+    except Exception as e:
+        return RedirectResponse(url=f"/admin-data?error={str(e)}", status_code=303)
+
+
+@app.get("/admin-export-check")
+def admin_export_check(
+    year: int,
+    month: int,
+    tu: str = "",
+    status: str = "",
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db)
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+
+    rows = get_admin_report_rows(
+        db=db,
+        y=year,
+        m=month,
+        tu=tu.strip() or None,
+        status=status.strip() or None
+    )
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Проверка"
+
+    ws.append([
+        "ФИО",
+        "ТУ",
+        "Точка",
+        "Месяц",
+        "Выходы с поставкой (кол-во)",
+        "Выходы с поставкой (сумма)",
+        "Выходы без поставки (кол-во)",
+        "Выходы без поставки (сумма)",
+        "Выходов всего",
+        "Полные инвенты (кол-во)",
+        "Полные инвенты (сумма)",
+        "Кофемашина (кол-во)",
+        "Кофемашина (сумма)",
+        "Примечание по точке (сумма)",
+        "Примечание по точке (комментарий)",
+        "Возмещение по точке (сумма)",
+        "Возмещение по точке (комментарий)",
+        "Чек по точке",
+        "Пересечение",
+        "Статус",
+        "Комментарий месяца",
+        "Итог по точке"
+    ])
+
+    for r in rows:
+        ws.append([
+            r["fio"],
+            r["tu"],
+            r["point_code"],
+            month_title(year, month),
+            r["cnt_supply"],
+            r["sum_supply"],
+            r["cnt_no_supply"],
+            r["sum_no_supply"],
+            r.get("cnt_total_exits", r["cnt_supply"] + r["cnt_no_supply"]),
+            r["cnt_full_inv"],
+            r["sum_inventory"],
+            r["coffee_cnt"],
+            r["coffee_sum"],
+            r["note_amount"],
+            r["note_comment"],
+            r["reimb_amount"],
+            r["reimb_comment"],
+            r["reimb_receipt"] or "",
+            "Да" if r.get("has_overlap") else "",
+            r["status"],
+            r["comment"],
+            r["point_total"]
+        ])
+
+    style_sheet(ws)
+    return build_excel_response(wb, f"proverka_{year}_{month:02d}.xlsx")
+
+
+@app.get("/admin-export-payroll")
+def admin_export_payroll(
+    year: int,
+    month: int,
+    tu: str = "",
+    status: str = "",
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db)
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+
+    rows = get_admin_payroll_rows(
+        db=db,
+        y=year,
+        m=month,
+        tu=tu.strip() or None,
+        status=status.strip() or None
+    )
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Ведомость"
+
+    ws.append([
+        "ФИО",
+        "ТУ",
+        "Сумма по мерчу",
+        "Сумма в ведомость (/0.87, округление вверх)",
+        "Статус"
+    ])
+
+    for r in rows:
+        ws.append([
+            r["fio"],
+            r["tu"],
+            r["clean_total"],
+            r["payroll_total"],
+            r["status"]
+        ])
+
+    style_sheet(ws)
+    return build_excel_response(wb, f"vedomost_{year}_{month:02d}.xlsx")
+
+
+@app.get("/admin-export-overlaps")
+def admin_export_overlaps(
+    year: int,
+    month: int,
+    tu: str = "",
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db)
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+
+    rows = get_intersections_rows(
+        db=db,
+        y=year,
+        m=month,
+        tu=tu.strip() or None
+    )
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Пересечения"
+
+    ws.append([
+        "Дата",
+        "Точка",
+        "Мерч 1",
+        "ТУ 1",
+        "Слот 1",
+        "Мерч 2",
+        "ТУ 2",
+        "Слот 2"
+    ])
+
+    for r in rows:
+        ws.append([
+            r["visit_date"],
+            r["point_code"],
+            r["fio1"],
+            r["tu1"],
+            r["slot1"],
+            r["fio2"],
+            r["tu2"],
+            r["slot2"],
+        ])
+
+    style_sheet(ws)
+    return build_excel_response(wb, f"peresecheniya_{year}_{month:02d}.xlsx")
