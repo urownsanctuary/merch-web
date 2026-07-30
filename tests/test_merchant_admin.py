@@ -1,6 +1,7 @@
 import io
 import os
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("DATABASE_URL", "sqlite+pysqlite:///:memory:")
 os.environ.setdefault("SECRET_SALT", "test-secret-salt-at-least-24-characters")
@@ -16,6 +17,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.main import (
+    admin_add_merchant,
     app,
     get_admin_cookie_value,
     get_admin_csrf_token,
@@ -133,7 +135,9 @@ class MerchantAdminTests(unittest.TestCase):
                 row[1]
                 for row in db.execute(text("PRAGMA table_info(merchants)")).all()
             }
-            self.assertTrue({"last4", "is_active", "updated_at"}.issubset(columns))
+            self.assertTrue(
+                {"last4", "is_active", "created_at", "updated_at"}.issubset(columns)
+            )
             self.assertEqual(
                 db.execute(
                     text(
@@ -142,6 +146,115 @@ class MerchantAdminTests(unittest.TestCase):
                 ).scalar(),
                 1,
             )
+            audit_columns = {
+                row[1]
+                for row in db.execute(
+                    text("PRAGMA table_info(merchant_audit_log)")
+                ).all()
+            }
+            self.assertTrue(
+                {
+                    "id",
+                    "merchant_id",
+                    "action",
+                    "actor",
+                    "changed_fields",
+                    "created_at",
+                }.issubset(audit_columns)
+            )
+            indexes = {
+                row[1]
+                for row in db.execute(text("PRAGMA index_list(merchants)")).all()
+            }
+            self.assertIn("uq_merchants_fio_norm_last4", indexes)
+
+    def test_schema_adds_created_at_to_minimal_legacy_table(self):
+        legacy_engine = create_engine("sqlite+pysqlite:///:memory:")
+        legacy_factory = sessionmaker(bind=legacy_engine)
+        try:
+            with legacy_engine.begin() as connection:
+                connection.exec_driver_sql(
+                    """
+                    CREATE TABLE merchants (
+                        id INTEGER PRIMARY KEY,
+                        fio TEXT NOT NULL,
+                        fio_norm TEXT NOT NULL,
+                        pass_hash TEXT NOT NULL,
+                        tu TEXT
+                    )
+                    """
+                )
+                connection.exec_driver_sql(
+                    """
+                    INSERT INTO merchants (id, fio, fio_norm, pass_hash, tu)
+                    VALUES (1, 'Legacy User', 'legacy user', 'hash', 'TU-1')
+                    """
+                )
+            with legacy_factory() as db:
+                ensure_merchant_admin_schema(db)
+                row = db.execute(
+                    text(
+                        """
+                        SELECT last4, is_active, created_at, updated_at
+                        FROM merchants WHERE id=1
+                        """
+                    )
+                ).mappings().one()
+                self.assertIsNone(row["last4"])
+                self.assertTrue(row["is_active"])
+                self.assertIsNotNone(row["created_at"])
+                self.assertIsNotNone(row["updated_at"])
+        finally:
+            legacy_engine.dispose()
+
+    def test_postgresql_migration_matches_production_legacy_schema(self):
+        class FakeDialect:
+            name = "postgresql"
+
+        class FakeBind:
+            dialect = FakeDialect()
+
+        class FakeDb:
+            def __init__(self):
+                self.statements = []
+                self.committed = False
+
+            def get_bind(self):
+                return FakeBind()
+
+            def execute(self, statement, _params=None):
+                self.statements.append(str(statement))
+                return None
+
+            def commit(self):
+                self.committed = True
+
+        fake_db = FakeDb()
+        legacy_columns = {
+            "id",
+            "fio",
+            "fio_norm",
+            "pass_hash",
+            "telegram_id",
+            "tu",
+            "created_at",
+        }
+        with patch(
+            "app.merchant_admin._merchant_columns", return_value=legacy_columns
+        ):
+            ensure_merchant_admin_schema(fake_db)
+
+        ddl = "\n".join(fake_db.statements)
+        self.assertIn("ADD COLUMN IF NOT EXISTS last4 TEXT", ddl)
+        self.assertIn("ADD COLUMN IF NOT EXISTS is_active BOOLEAN", ddl)
+        self.assertIn("ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP", ddl)
+        self.assertIn("CREATE TABLE IF NOT EXISTS merchant_audit_log", ddl)
+        self.assertIn(
+            "DROP CONSTRAINT IF EXISTS merchants_fio_norm_uq", ddl
+        )
+        self.assertIn("DROP CONSTRAINT IF EXISTS merchants_fio_key", ddl)
+        self.assertIn("ON merchants (fio_norm, last4)", ddl)
+        self.assertTrue(fake_db.committed)
 
     def test_successful_add_normalizes_name_and_allows_login(self):
         response = self.post_create()
@@ -155,12 +268,52 @@ class MerchantAdminTests(unittest.TestCase):
             self.assertTrue(row["is_active"])
             self.assertIsNotNone(login_user(db, "  ЕЛКИН СЕМЕН ", "4321"))
 
+    def test_add_route_does_not_depend_on_missing_main_re_import(self):
+        self.assertNotIn("re", admin_add_merchant.__globals__)
+        response = self.post_create()
+        self.assertEqual(response.status_code, 303)
+        self.assertNotEqual(response.status_code, 500)
+
     def test_empty_name_and_invalid_phone_are_inline_and_preserve_values(self):
         response = self.post_create(fio=" ", last4="12 3", tu="ТУ-Север")
         self.assertEqual(response.status_code, 422)
         self.assertIn("Укажите ФИО", response.text)
         self.assertIn("ровно 4 цифры", response.text)
         self.assertIn('value="ТУ-Север"', response.text)
+        with self.factory() as db:
+            self.assertEqual(db.execute(text("SELECT COUNT(*) FROM merchants")).scalar(), 0)
+
+    def test_database_error_rolls_back_and_returns_form_without_500(self):
+        def insert_then_fail(db, *_args, **_kwargs):
+            sensitive_error_detail = "synthetic database failure with secret-token"
+            db.execute(
+                text(
+                    """
+                    INSERT INTO merchants
+                        (fio, fio_norm, pass_hash, last4, tu, is_active)
+                    VALUES
+                        ('Partial User', 'partial user', 'redacted', '4321', 'TU-1', TRUE)
+                    """
+                )
+            )
+            raise RuntimeError(sensitive_error_detail)
+
+        with patch("app.main.create_merchant", side_effect=insert_then_fail):
+            with self.assertLogs("app.main", level="ERROR") as captured:
+                response = self.post_create(
+                    fio="Preserved User", last4="4321", tu="TU-Preserved"
+                )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertNotEqual(response.status_code, 500)
+        self.assertIn('value="Preserved User"', response.text)
+        self.assertIn('value="4321"', response.text)
+        self.assertIn('value="TU-Preserved"', response.text)
+        self.assertIn("Данные не сохранены", response.text)
+        serialized_logs = "\n".join(captured.output)
+        self.assertIn("RuntimeError", serialized_logs)
+        self.assertNotIn("secret-token", serialized_logs)
+        self.assertNotIn("Preserved User", serialized_logs)
         with self.factory() as db:
             self.assertEqual(db.execute(text("SELECT COUNT(*) FROM merchants")).scalar(), 0)
 
@@ -186,6 +339,8 @@ class MerchantAdminTests(unittest.TestCase):
         self.assertEqual(confirmed.status_code, 303)
         with self.factory() as db:
             self.assertEqual(db.execute(text("SELECT COUNT(*) FROM merchants")).scalar(), 2)
+            self.assertIsNotNone(login_user(db, "Иванов Иван", "1234"))
+            self.assertIsNotNone(login_user(db, "Иванов Иван", "5678"))
 
     def test_edit_keeps_id_and_historical_visit(self):
         merchant = self.create()

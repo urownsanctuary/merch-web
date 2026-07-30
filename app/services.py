@@ -91,23 +91,30 @@ def get_merchants_columns(db: Session):
 
 def login_user(db: Session, fio: str, last4: str):
     fio_n = fio_norm(fio)
-    result = db.execute(
+    results = db.execute(
         text(
             """
             SELECT id, fio, fio_norm, pass_hash, telegram_id, tu, created_at
             FROM merchants
             WHERE fio_norm = :fio_norm
               AND COALESCE(is_active, TRUE) = TRUE
-            LIMIT 1
+            ORDER BY id
             """
         ),
         {"fio_norm": fio_n},
-    ).mappings().first()
-
-    if not result:
-        return None
+    ).mappings().all()
     incoming = hash_last4(last4)
-    if not incoming or not hmac.compare_digest(incoming, str(result["pass_hash"])):
+    if not incoming:
+        return None
+    result = next(
+        (
+            row
+            for row in results
+            if hmac.compare_digest(incoming, str(row["pass_hash"]))
+        ),
+        None,
+    )
+    if result is None:
         return None
 
     return {

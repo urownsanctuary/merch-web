@@ -4,6 +4,7 @@ import json
 import uuid
 import hashlib
 import hmac
+import logging
 from datetime import date, datetime
 from io import BytesIO
 from html import escape
@@ -94,6 +95,7 @@ from app.security import (
 )
 
 app = FastAPI()
+logger = logging.getLogger(__name__)
 
 
 def require_draft_month(db: Session, merchant_id: int, period: dict) -> None:
@@ -190,6 +192,29 @@ def verify_admin_csrf(admin_auth: str | None, csrf_token: str) -> bool:
     return hmac.compare_digest(
         get_admin_csrf_token(str(admin_auth)), str(csrf_token)
     )
+
+
+def log_redacted_exception(event: str, exc: Exception) -> None:
+    """Log traceback frames without exception values or SQL parameters."""
+    logger.error(
+        "%s error_type=%s",
+        event,
+        type(exc).__name__,
+        exc_info=(
+            RuntimeError,
+            RuntimeError("technical details redacted"),
+            exc.__traceback__,
+        ),
+    )
+
+
+def safe_admin_tu_values(db: Session) -> list[str]:
+    try:
+        return get_all_tu_values(db)
+    except Exception as exc:
+        db.rollback()
+        log_redacted_exception("admin_merchant_tu_lookup_failed", exc)
+        return []
 
 
 def style_sheet(ws):
@@ -3723,21 +3748,22 @@ def admin_add_merchant(
             ),
             status_code=422,
         )
-    except Exception:
+    except Exception as exc:
         db.rollback()
+        log_redacted_exception("admin_merchant_create_failed", exc)
         return HTMLResponse(
             render_merchant_form_page(
                 admin_auth=str(admin_auth),
-                tu_values=get_all_tu_values(db),
+                tu_values=safe_admin_tu_values(db),
                 values=values,
-                message="Не удалось добавить сотрудника. Повторите попытку.",
+                message="Не удалось добавить сотрудника. Данные не сохранены; повторите попытку.",
                 fio_query=fio_query,
                 last4_query=last4_query,
                 filter_tu=filter_tu,
                 filter_status=filter_status,
                 sort=sort,
             ),
-            status_code=500,
+            status_code=503,
         )
 
 

@@ -92,6 +92,7 @@ def ensure_merchant_admin_schema(db: Session) -> None:
     additions = (
         ("last4", "TEXT"),
         ("is_active", "BOOLEAN NOT NULL DEFAULT TRUE"),
+        ("created_at", "TIMESTAMP"),
         ("updated_at", "TIMESTAMP"),
     )
     dialect = db.get_bind().dialect.name
@@ -109,11 +110,23 @@ def ensure_merchant_admin_schema(db: Session) -> None:
             """
             UPDATE merchants
             SET is_active = COALESCE(is_active, TRUE),
+                created_at = COALESCE(created_at, CURRENT_TIMESTAMP),
                 updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP)
-            WHERE is_active IS NULL OR updated_at IS NULL
+            WHERE is_active IS NULL OR created_at IS NULL OR updated_at IS NULL
             """
         )
     )
+    if dialect == "postgresql":
+        # Production's legacy schema enforces one row per FIO. Replace only
+        # those known legacy constraints so the new (FIO, last4) identity can
+        # represent namesakes without touching merchant rows.
+        for legacy_name in ("merchants_fio_key", "merchants_fio_norm_uq"):
+            db.execute(
+                text(
+                    f"ALTER TABLE merchants DROP CONSTRAINT IF EXISTS {legacy_name}"
+                )
+            )
+            db.execute(text(f"DROP INDEX IF EXISTS {legacy_name}"))
     db.execute(
         text(
             """
