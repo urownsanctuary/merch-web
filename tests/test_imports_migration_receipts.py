@@ -37,6 +37,9 @@ class FakeResult:
     def scalar(self):
         return self.scalar_value
 
+    def scalar_one(self):
+        return self.scalar_value if self.scalar_value is not None else 1
+
     def fetchall(self):
         return self.rows
 

@@ -8,6 +8,11 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text, bindparam
 from openpyxl import load_workbook
 from app.security import request_merchant_matches
+from app.merchant_admin import (
+    create_merchant,
+    deactivate_merchants_by_tu,
+    validate_merchant_values,
+)
 
 SECRET_SALT = os.getenv("SECRET_SALT")
 if not SECRET_SALT:
@@ -92,6 +97,7 @@ def login_user(db: Session, fio: str, last4: str):
             SELECT id, fio, fio_norm, pass_hash, telegram_id, tu, created_at
             FROM merchants
             WHERE fio_norm = :fio_norm
+              AND COALESCE(is_active, TRUE) = TRUE
             LIMIT 1
             """
         ),
@@ -124,6 +130,7 @@ def get_merchant_by_fio(db: Session, fio: str):
             SELECT id, fio, fio_norm, telegram_id, tu, created_at
             FROM merchants
             WHERE fio_norm = :fio_norm
+              AND COALESCE(is_active, TRUE) = TRUE
             LIMIT 1
             """
         ),
@@ -1384,55 +1391,70 @@ def import_rates_xlsx(db: Session, file_obj, year: int, month: int) -> dict:
     return {"loaded_rows": len(parsed)}
 
 
-def upsert_merchant_row(db: Session, fio: str, last4: str, tu: str):
-    fio_clean = str(fio).strip()
-    fio_normalized = fio_norm(fio_clean)
-    pass_hash = hash_last4(str(last4).strip())
-    existing = db.execute(text("SELECT id FROM merchants WHERE fio_norm=:fio_norm LIMIT 1"), {"fio_norm": fio_normalized}).scalar()
-    if existing:
-        db.execute(text("""
-            UPDATE merchants
-            SET fio=:fio, fio_norm=:fio_norm, pass_hash=:pass_hash, tu=:tu
-            WHERE id=:id
-        """), {
-            "id": existing,
-            "fio": fio_clean,
-            "fio_norm": fio_normalized,
-            "pass_hash": pass_hash,
-            "tu": tu,
-        })
-    else:
-        db.execute(text("""
-            INSERT INTO merchants (fio, fio_norm, pass_hash, tu)
-            VALUES (:fio, :fio_norm, :pass_hash, :tu)
-        """), {
-            "fio": fio_clean,
-            "fio_norm": fio_normalized,
-            "pass_hash": pass_hash,
-            "tu": tu,
-        })
+def upsert_merchant_row(
+    db: Session,
+    fio: str,
+    last4: str,
+    tu: str,
+    *,
+    actor: str = "admin",
+    confirm_same_name: bool = False,
+):
+    """Backward-compatible entry point; creation never silently updates a row."""
+    return create_merchant(
+        db,
+        fio,
+        last4,
+        tu,
+        actor=actor,
+        fio_normalizer=fio_norm,
+        last4_hasher=hash_last4,
+        confirm_same_name=confirm_same_name,
+    )
 
 
-def import_merchants_xlsx(db: Session, file_obj, tu: str) -> dict:
+def import_merchants_xlsx(
+    db: Session,
+    file_obj,
+    tu: str,
+    *,
+    actor: str = "admin-import",
+) -> dict:
     wb = load_workbook(file_obj, data_only=True, read_only=True)
     ws = wb[wb.sheetnames[0]]
     tu = str(tu or "").strip()
     if not tu:
         raise ValueError("ТУ обязателен")
-    parsed = []
+    parsed: list[dict[str, str]] = []
     for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
         if not any(value not in (None, "") for value in row):
             continue
-        fio = str(row[0] or "").strip()
-        last4_str = re.sub(r"\D", "", str(row[1] if len(row) > 1 else ""))[-4:]
-        if not fio or len(last4_str) != 4:
-            raise ValueError(f"Ошибка в строке мерчендайзеров {row_idx}: нужны ФИО и последние 4 цифры")
-        parsed.append((fio, last4_str))
+        try:
+            parsed.append(
+                validate_merchant_values(
+                    row[0] if row else "",
+                    row[1] if len(row) > 1 else "",
+                    tu,
+                    fio_normalizer=fio_norm,
+                )
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"Ошибка в строке мерчендайзеров {row_idx}: {exc}"
+            ) from exc
     if not parsed:
         raise ValueError("В файле мерчендайзеров нет данных")
     try:
-        for fio, last4 in parsed:
-            upsert_merchant_row(db, fio, last4, tu)
+        for values in parsed:
+            create_merchant(
+                db,
+                values["fio"],
+                values["last4"],
+                values["tu"],
+                actor=actor,
+                fio_normalizer=fio_norm,
+                last4_hasher=hash_last4,
+            )
         db.commit()
     except Exception:
         db.rollback()
@@ -1464,8 +1486,14 @@ def clear_month_data(db: Session, year: int, month: int) -> dict:
     }
 
 
-def clear_merchants_by_tu(db: Session, tu: str) -> int:
-    deleted = db.execute(text("DELETE FROM merchants WHERE tu = :tu"), {"tu": tu}).rowcount or 0
+def clear_merchants_by_tu(
+    db: Session,
+    tu: str,
+    *,
+    actor: str = "admin",
+) -> int:
+    """Compatibility operation: deactivate merchants without deleting history."""
+    deleted = deactivate_merchants_by_tu(db, tu, actor=actor)
     db.commit()
     return deleted
 
