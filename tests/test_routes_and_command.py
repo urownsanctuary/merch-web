@@ -1,6 +1,7 @@
 import os
 import unittest
 from datetime import date
+from io import BytesIO
 from unittest.mock import patch
 
 os.environ.setdefault("DATABASE_URL", "sqlite+pysqlite:///:memory:")
@@ -15,6 +16,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
+from openpyxl import load_workbook
 
 from app.db import engine
 from app.legacy_migration import build_migration_plan, run_migration
@@ -53,6 +55,14 @@ class RouteTests(unittest.TestCase):
             response = client.post("/login-page", data={"fio": "Иванов Иван", "last4": "9999"})
         self.assertEqual(response.status_code, 200)
         self.assertIn("Неверные данные", response.text)
+
+    def test_merchant_logout_clears_signed_session(self):
+        with TestClient(app) as client:
+            client.cookies.set("merchant_session", create_merchant_session("иванов иван"))
+            response = client.get("/merchant-logout", follow_redirects=False)
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], "/login-page")
+        self.assertIn("merchant_session=", response.headers["set-cookie"])
 
     def test_one_merchant_cannot_resolve_another(self):
         token = set_request_merchant(fio_norm("Иванов Иван"))
@@ -118,6 +128,7 @@ class RouteTests(unittest.TestCase):
         original = {
             "/", "/db-check", "/receipts/{file_id}/{filename}", "/active-period",
             "/debug/merchants-columns", "/login", "/login-page", "/menu-page", "/point-page",
+            "/merchant-logout",
             "/calendar-page", "/point-note-page", "/save-point-note-normal",
             "/save-point-note-no-supply", "/point-reimbursement-page", "/save-point-reimbursement",
             "/save-point-adjustment", "/delete-point-note", "/delete-point-reimbursement",
@@ -127,6 +138,7 @@ class RouteTests(unittest.TestCase):
             "/admin-upload-supplies", "/admin-upload-rates", "/admin-upload-merchants",
             "/admin-add-merchant", "/admin-clear-month", "/admin-clear-merchants",
             "/admin-add-special-inventory-day", "/admin-delete-special-inventory-day",
+            "/admin-sync-production-calendar", "/admin-calendar-override", "/admin-calendar-reset",
             "/admin-export-check", "/admin-export-payroll", "/admin-export-overlaps",
         }
         self.assertTrue(original.issubset(paths))
@@ -193,6 +205,71 @@ class ReceiptAccessTests(unittest.TestCase):
             client.cookies.set("admin_auth", get_admin_cookie_value())
             response = client.get("/receipts/file/check.pdf")
         self.assertEqual(response.status_code, 200)
+
+
+class ExcelContentTests(unittest.TestCase):
+    def _get_workbook(self, path, patch_target, rows):
+        with patch(patch_target, return_value=rows):
+            with TestClient(app) as client:
+                client.cookies.set("admin_auth", get_admin_cookie_value())
+                response = client.get(path)
+        self.assertEqual(response.status_code, 200)
+        return load_workbook(BytesIO(response.content), data_only=True)
+
+    def test_check_export_contains_complete_financial_row(self):
+        row = {
+            "fio": "Тестовый Мерч", "tu": "ТУ-1", "point_code": "101",
+            "cnt_supply": 2, "sum_supply": 200,
+            "cnt_no_supply": 1, "sum_no_supply": 70, "cnt_total_exits": 3,
+            "cnt_full_inv": 1, "sum_inventory": 90,
+            "coffee_cnt": 1, "coffee_sum": 10,
+            "note_amount": 20, "note_comment": "Примечание",
+            "reimb_amount": 30, "reimb_comment": "Возмещение",
+            "reimb_receipt": "private-receipt", "has_overlap": True,
+            "status": "submitted", "comment": "Месяц", "point_total": 420,
+        }
+        workbook = self._get_workbook(
+            "/admin-export-check?year=2026&month=7",
+            "app.main.get_admin_report_rows",
+            [row],
+        )
+        sheet = workbook["Проверка"]
+        headers = [cell.value for cell in sheet[1]]
+        values = [cell.value for cell in sheet[2]]
+        self.assertIn("Возмещение по точке (сумма)", headers)
+        self.assertIn("Чек по точке", headers)
+        self.assertIn("Пересечение", headers)
+        self.assertEqual(values[0], "Тестовый Мерч")
+        self.assertEqual(values[-1], 420)
+
+    def test_payroll_export_has_one_rounded_row(self):
+        workbook = self._get_workbook(
+            "/admin-export-payroll?year=2026&month=7",
+            "app.main.get_admin_payroll_rows",
+            [{
+                "fio": "Тестовый Мерч", "tu": "ТУ-1",
+                "clean_total": 870, "payroll_total": 1000, "status": "submitted",
+            }],
+        )
+        sheet = workbook["Ведомость"]
+        self.assertEqual(sheet.max_row, 2)
+        self.assertEqual(sheet.cell(2, 3).value, 870)
+        self.assertEqual(sheet.cell(2, 4).value, 1000)
+
+    def test_overlap_export_contains_canonical_slot_pair(self):
+        workbook = self._get_workbook(
+            "/admin-export-overlaps?year=2026&month=7",
+            "app.main.get_intersections_rows",
+            [{
+                "visit_date": date(2026, 7, 10), "point_code": "101",
+                "fio1": "А", "tu1": "ТУ-1", "slot1": "MORNING",
+                "fio2": "Б", "tu2": "ТУ-2", "slot2": "MORNING",
+            }],
+        )
+        sheet = workbook["Пересечения"]
+        self.assertEqual(sheet.max_row, 2)
+        self.assertEqual(sheet.cell(2, 5).value, "MORNING")
+        self.assertEqual(sheet.cell(2, 8).value, "MORNING")
 
 
 class MappingResult:

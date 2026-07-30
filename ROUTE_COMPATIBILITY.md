@@ -13,6 +13,7 @@ redirects; the same paths now also accept protected POST forms.
 | `GET /debug/merchants-columns` | preserved | — | n/a | route inventory |
 | `POST /login` | preserved | — | n/a | authentication rules |
 | `GET, POST /login-page` | preserved | signed merchant session added | n/a | login tests |
+| `GET /merchant-logout` | new | clears the signed merchant cookie | n/a | logout test |
 | `GET /menu-page` | preserved | session-bound FIO | n/a | identity test |
 | `GET, POST /point-page` | preserved | session-bound FIO | n/a | route inventory |
 | `GET /calendar-page` | preserved | explicit slots and DB calendar | n/a | calendar/slot tests |
@@ -38,15 +39,18 @@ redirects; the same paths now also accept protected POST forms.
 | `GET /admin-logout` | preserved | — | n/a | route inventory |
 | `GET /admin-report` | preserved | slot-aware intersections | n/a | slot tests |
 | `GET /admin-data` | preserved | calendar upload UI added | n/a | route inventory |
-| `POST /admin-upload-supplies` | preserved | rollback on error | n/a | 900-point import test |
-| `POST /admin-upload-rates` | preserved | validate-all / one transaction | n/a | rate import tests |
+| `POST /admin-upload-supplies` | preserved | rollback on error | required | 900-point import test |
+| `POST /admin-upload-rates` | preserved | validate-all / one transaction | required | rate import tests |
 | `POST /admin-upload-merchants` | preserved | validate-all / one transaction | n/a | merchant import tests |
 | `POST /admin-add-merchant` | preserved | — | n/a | import/auth tests |
-| `POST /admin-clear-month` | preserved | — | n/a | route inventory |
+| `POST /admin-clear-month` | preserved | rollback and friendly error | required | route inventory |
 | `POST /admin-clear-merchants` | preserved | — | n/a | route inventory |
-| `POST /admin-add-special-inventory-day` | preserved | independent from calendar | n/a | route inventory |
-| `POST /admin-delete-special-inventory-day` | preserved | independent from calendar | n/a | route inventory |
-| `POST /admin-upload-production-calendar` | new | managed calendar updates | n/a | calendar import test |
+| `POST /admin-add-special-inventory-day` | preserved | independent from calendar | required | route inventory |
+| `POST /admin-delete-special-inventory-day` | preserved | independent from calendar | required | route inventory |
+| `POST /admin-upload-production-calendar` | new | emergency manual calendar updates | required | calendar import test |
+| `POST /admin-sync-production-calendar` | new | background approved official sync | required | calendar route tests |
+| `POST /admin-calendar-override` | new | manual date override | required | calendar sync tests |
+| `POST /admin-calendar-reset` | new | restore official date value | required | calendar sync tests |
 | `GET /admin-export-check` | preserved | complete filtered dataset | n/a | export inventory |
 | `GET /admin-export-payroll` | preserved | complete filtered dataset | n/a | export inventory |
 | `GET /admin-export-overlaps` | preserved | MORNING/EVENING only, no A/B duplicates | n/a | intersection tests |

@@ -5,6 +5,7 @@ import uuid
 import hashlib
 import hmac
 import logging
+import threading
 from datetime import date, datetime
 from io import BytesIO
 from html import escape
@@ -70,8 +71,13 @@ from app.services import (
 )
 from app.production_calendar import (
     calendar_day_off,
+    ensure_production_calendar_table,
+    get_calendar_status,
     get_calendar_overrides,
     import_calendar_xlsx,
+    reset_manual_calendar_override,
+    set_manual_calendar_override,
+    sync_approved_calendars,
 )
 from app.merchant_admin import (
     MERCHANT_SORTS,
@@ -160,9 +166,37 @@ def ensure_admin_schema_on_startup():
     db = SessionLocal()
     try:
         ensure_merchant_admin_schema(db)
+        ensure_production_calendar_table(db)
     except Exception:
         db.rollback()
         raise
+    finally:
+        db.close()
+    if (
+        os.getenv("ENVIRONMENT", "").lower() != "test"
+        and os.getenv("AUTO_SYNC_PRODUCTION_CALENDAR", "1") == "1"
+    ):
+        threading.Thread(
+            target=_sync_calendar_background,
+            kwargs={"years": None},
+            name="production-calendar-sync",
+            daemon=True,
+        ).start()
+
+
+def _sync_calendar_background(years: list[int] | None) -> None:
+    db = SessionLocal()
+    try:
+        result = sync_approved_calendars(db, years)
+        logger.info(
+            "production_calendar_sync_complete years=%s rows=%s unavailable=%s",
+            result["synced_years"],
+            result["loaded_rows"],
+            result["unavailable_years"],
+        )
+    except Exception:
+        db.rollback()
+        logger.exception("production_calendar_sync_failed")
     finally:
         db.close()
 
@@ -1199,6 +1233,13 @@ def login_submit(
     return response
 
 
+@app.get("/merchant-logout")
+def merchant_logout():
+    response = RedirectResponse(url="/login-page", status_code=303)
+    response.delete_cookie(MERCHANT_COOKIE)
+    return response
+
+
 @app.get("/menu-page", response_class=HTMLResponse)
 def menu_page(fio: str = "", db: Session = Depends(get_db)):
     period = get_active_period()
@@ -1232,6 +1273,7 @@ def menu_page(fio: str = "", db: Session = Depends(get_db)):
             <a class="btn" href="/point-page?fio={escape(fio)}">Заполнить сверку</a>
             <a class="btn btn-secondary" href="/summary-page?fio={escape(fio)}">Моя сумма</a>
             <a class="btn btn-secondary" href="/monthly-submit-page?fio={escape(fio)}">Отправить сверку за месяц</a>
+            <a class="btn btn-secondary" href="/merchant-logout">Выйти</a>
         </div>
     </div>
 </body>
@@ -3463,12 +3505,28 @@ def admin_data_page(
         for inv_day in special_inventory_days:
             rows.append(f"""<form method='post' action='/admin-delete-special-inventory-day' style='margin-top:10px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;'>
                 <input type='hidden' name='inv_date' value='{inv_day.isoformat()}' />
+                <input type='hidden' name='csrf_token' value='{admin_csrf}' />
                 <div class='mini-pill'>{inv_day.strftime('%d.%m.%Y')}</div>
                 <button class='btn btn-danger btn-inline' type='submit'>Удалить</button>
             </form>""")
         special_inventory_html = ''.join(rows)
     else:
         special_inventory_html = "<div class='hint' style='margin-top:14px;'>Специальные даты пока не добавлены.</div>"
+
+    calendar_status = get_calendar_status(db)
+    if calendar_status:
+        calendar_status_html = "".join(
+            f"<div class='hint'><strong>{row['year']}</strong>: "
+            f"{row['row_count']} дат, последнее обновление "
+            f"{escape(str(row['last_success_at'] or '—'))}; "
+            f"{escape(str(row['message'] or ''))}</div>"
+            for row in calendar_status
+        )
+    else:
+        calendar_status_html = (
+            "<div class='error-box'>Официальный календарь ещё не синхронизирован. "
+            "До синхронизации используется безопасное правило субботы/воскресенья.</div>"
+        )
 
     return f"""
 <!DOCTYPE html>
@@ -3501,6 +3559,7 @@ def admin_data_page(
                 <div class="detail-card">
                     <div class="detail-title">Загрузка поставок</div>
                     <form method="post" action="/admin-upload-supplies" enctype="multipart/form-data">
+                        <input type="hidden" name="csrf_token" value="{admin_csrf}" />
                         <label for="supplies_file">Файл поставок</label>
                         <input id="supplies_file" name="file" type="file" accept=".xlsx" required />
                         <button class="btn" type="submit">Загрузить поставки</button>
@@ -3510,6 +3569,7 @@ def admin_data_page(
                 <div class="detail-card">
                     <div class="detail-title">Загрузка ставок</div>
                     <form method="post" action="/admin-upload-rates" enctype="multipart/form-data">
+                        <input type="hidden" name="csrf_token" value="{admin_csrf}" />
                         <label for="rates_year">Год</label>
                         <input id="rates_year" name="year" type="number" value="{period["year"]}" required />
 
@@ -3545,7 +3605,8 @@ def admin_data_page(
 
                 <div class="detail-card">
                     <div class="detail-title">Очистка месяца</div>
-                    <form method="post" action="/admin-clear-month">
+                    <form method="post" action="/admin-clear-month" onsubmit="return confirm('Безвозвратно очистить данные только выбранного месяца?');">
+                        <input type="hidden" name="csrf_token" value="{admin_csrf}" />
                         <label for="clear_year">Год</label>
                         <input id="clear_year" name="year" type="number" value="{period["year"]}" required />
 
@@ -3572,6 +3633,7 @@ def admin_data_page(
                 <div class="detail-card">
                     <div class="detail-title">Специальные даты для инвента</div>
                     <form method="post" action="/admin-add-special-inventory-day">
+                        <input type="hidden" name="csrf_token" value="{admin_csrf}" />
                         <label for="special_inventory_date">Дата</label>
                         <input id="special_inventory_date" name="inv_date" type="date" required />
                         <button class="btn" type="submit">Добавить дату</button>
@@ -3583,12 +3645,44 @@ def admin_data_page(
                 </div>
                 <div class="detail-card">
                     <div class="detail-title">Производственный календарь РФ</div>
+                    {calendar_status_html}
+                    <form method="post" action="/admin-sync-production-calendar" style="margin-top:14px;">
+                        <input type="hidden" name="csrf_token" value="{admin_csrf}" />
+                        <label for="calendar_sync_year">Утверждённый год (пусто — текущий и следующий)</label>
+                        <input id="calendar_sync_year" name="year" type="number" min="2025" placeholder="Например: 2026" />
+                        <button class="btn" type="submit">Обновить производственный календарь</button>
+                    </form>
+                    <div class="hint">Обновление запускается в фоне из проверенного официального набора и не блокирует страницу.</div>
+
+                    <form method="post" action="/admin-calendar-override" style="margin-top:18px;">
+                        <input type="hidden" name="csrf_token" value="{admin_csrf}" />
+                        <label for="calendar_override_date">Ручная корректировка даты</label>
+                        <input id="calendar_override_date" name="calendar_date_value" type="date" required />
+                        <label for="calendar_override_kind">Статус дня</label>
+                        <select id="calendar_override_kind" name="is_day_off" required>
+                            <option value="1">Нерабочий</option>
+                            <option value="0">Рабочий</option>
+                        </select>
+                        <label for="calendar_override_title">Название</label>
+                        <input id="calendar_override_title" name="title" type="text" />
+                        <label for="calendar_override_comment">Обязательный комментарий</label>
+                        <input id="calendar_override_comment" name="comment" type="text" required />
+                        <button class="btn btn-secondary" type="submit">Сохранить ручную корректировку</button>
+                    </form>
+                    <form method="post" action="/admin-calendar-reset" style="margin-top:14px;" onsubmit="return confirm('Вернуть официальное значение этой даты?');">
+                        <input type="hidden" name="csrf_token" value="{admin_csrf}" />
+                        <label for="calendar_reset_date">Вернуть к официальному значению</label>
+                        <input id="calendar_reset_date" name="calendar_date_value" type="date" required />
+                        <button class="btn btn-secondary" type="submit">Вернуть официальное значение</button>
+                    </form>
+
                     <form method="post" action="/admin-upload-production-calendar" enctype="multipart/form-data">
+                        <input type="hidden" name="csrf_token" value="{admin_csrf}" />
                         <label for="calendar_file">XLSX: дата, выходной день, название, источник, комментарий</label>
                         <input id="calendar_file" name="file" type="file" accept=".xlsx" required />
-                        <button class="btn" type="submit">Загрузить календарь</button>
+                        <button class="btn btn-secondary" type="submit">Аварийный XLSX-импорт</button>
                     </form>
-                    <div class="hint">Явная запись рабочего дня переопределяет обычное правило субботы/воскресенья.</div>
+                    <div class="hint">Ручная корректировка имеет приоритет и не затирается следующей официальной синхронизацией.</div>
                 </div>
             </div>
         </div>
@@ -3601,11 +3695,14 @@ def admin_data_page(
 @app.post("/admin-upload-supplies")
 async def admin_upload_supplies(
     file: UploadFile = File(...),
+    csrf_token: str = Form(""),
     admin_auth: Optional[str] = Cookie(default=None),
     db: Session = Depends(get_db)
 ):
     if not is_admin_authenticated(admin_auth):
         return RedirectResponse(url="/admin-login", status_code=303)
+    if not verify_admin_csrf(admin_auth, csrf_token):
+        raise HTTPException(status_code=403, detail="Недействительный CSRF-токен")
 
     try:
         result = import_supplies_xlsx(db, file.file)
@@ -3616,14 +3713,103 @@ async def admin_upload_supplies(
         return RedirectResponse(url=f"/admin-data?error={str(e)}", status_code=303)
 
 
-@app.post("/admin-upload-production-calendar")
-async def admin_upload_production_calendar(
-    file: UploadFile = File(...),
+@app.post("/admin-sync-production-calendar")
+def admin_sync_production_calendar(
+    year: int | None = Form(None),
+    csrf_token: str = Form(""),
+    admin_auth: Optional[str] = Cookie(default=None),
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+    if not verify_admin_csrf(admin_auth, csrf_token):
+        raise HTTPException(status_code=403, detail="Недействительный CSRF-токен")
+    years = [year] if year is not None else None
+    threading.Thread(
+        target=_sync_calendar_background,
+        kwargs={"years": years},
+        name="production-calendar-admin-sync",
+        daemon=True,
+    ).start()
+    return RedirectResponse(
+        url="/admin-data?success=Обновление производственного календаря запущено в фоне.",
+        status_code=303,
+    )
+
+
+@app.post("/admin-calendar-override")
+def admin_calendar_override(
+    calendar_date_value: str = Form(...),
+    is_day_off: str = Form(...),
+    title: str = Form(""),
+    comment: str = Form(...),
+    csrf_token: str = Form(""),
     admin_auth: Optional[str] = Cookie(default=None),
     db: Session = Depends(get_db),
 ):
     if not is_admin_authenticated(admin_auth):
         return RedirectResponse(url="/admin-login", status_code=303)
+    if not verify_admin_csrf(admin_auth, csrf_token):
+        raise HTTPException(status_code=403, detail="Недействительный CSRF-токен")
+    try:
+        parsed = date.fromisoformat(calendar_date_value)
+        if is_day_off not in {"0", "1"}:
+            raise ValueError("Некорректный статус дня")
+        set_manual_calendar_override(
+            db,
+            parsed,
+            is_day_off == "1",
+            title,
+            comment,
+            actor=ADMIN_LOGIN,
+        )
+        return RedirectResponse(
+            url="/admin-data?success=Ручная корректировка календаря сохранена.",
+            status_code=303,
+        )
+    except ValueError as exc:
+        db.rollback()
+        message = urlencode({"error": str(exc)}).split("=", 1)[1]
+        return RedirectResponse(url=f"/admin-data?error={message}", status_code=303)
+
+
+@app.post("/admin-calendar-reset")
+def admin_calendar_reset(
+    calendar_date_value: str = Form(...),
+    csrf_token: str = Form(""),
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db),
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+    if not verify_admin_csrf(admin_auth, csrf_token):
+        raise HTTPException(status_code=403, detail="Недействительный CSRF-токен")
+    try:
+        reset_manual_calendar_override(
+            db,
+            date.fromisoformat(calendar_date_value),
+            actor=ADMIN_LOGIN,
+        )
+        return RedirectResponse(
+            url="/admin-data?success=Восстановлено официальное значение календаря.",
+            status_code=303,
+        )
+    except ValueError as exc:
+        db.rollback()
+        message = urlencode({"error": str(exc)}).split("=", 1)[1]
+        return RedirectResponse(url=f"/admin-data?error={message}", status_code=303)
+
+
+@app.post("/admin-upload-production-calendar")
+async def admin_upload_production_calendar(
+    file: UploadFile = File(...),
+    csrf_token: str = Form(""),
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db),
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+    if not verify_admin_csrf(admin_auth, csrf_token):
+        raise HTTPException(status_code=403, detail="Недействительный CSRF-токен")
     try:
         result = import_calendar_xlsx(db, file.file)
         msg = f"Производственный календарь загружен: строк {result['loaded_rows']}."
@@ -3638,11 +3824,14 @@ async def admin_upload_rates(
     year: int = Form(...),
     month: int = Form(...),
     file: UploadFile = File(...),
+    csrf_token: str = Form(""),
     admin_auth: Optional[str] = Cookie(default=None),
     db: Session = Depends(get_db)
 ):
     if not is_admin_authenticated(admin_auth):
         return RedirectResponse(url="/admin-login", status_code=303)
+    if not verify_admin_csrf(admin_auth, csrf_token):
+        raise HTTPException(status_code=403, detail="Недействительный CSRF-токен")
 
     try:
         result = import_rates_xlsx(db, file.file, year, month)
@@ -3771,19 +3960,30 @@ def admin_add_merchant(
 def admin_clear_month(
     year: int = Form(...),
     month: int = Form(...),
+    csrf_token: str = Form(""),
     admin_auth: Optional[str] = Cookie(default=None),
     db: Session = Depends(get_db)
 ):
     if not is_admin_authenticated(admin_auth):
         return RedirectResponse(url="/admin-login", status_code=303)
+    if not verify_admin_csrf(admin_auth, csrf_token):
+        raise HTTPException(status_code=403, detail="Недействительный CSRF-токен")
 
-    result = clear_month_data(db, year, month)
-    msg = (
-        f"Месяц очищен. Визиты: {result['deleted_visits']}, "
-        f"поставки: {result['deleted_supplies']}, ставки: {result['deleted_rates']}, "
-        f"месячные сверки: {result['deleted_monthly']}, корректировки по точкам: {result.get('deleted_point_adjustments', 0)}."
-    )
-    return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
+    try:
+        result = clear_month_data(db, year, month)
+        msg = (
+            f"Месяц очищен. Визиты: {result['deleted_visits']}, "
+            f"поставки: {result['deleted_supplies']}, ставки: {result['deleted_rates']}, "
+            f"месячные сверки: {result['deleted_monthly']}, корректировки по точкам: {result.get('deleted_point_adjustments', 0)}."
+        )
+        return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
+    except Exception as exc:
+        db.rollback()
+        log_redacted_exception("admin_clear_month_failed", exc)
+        return RedirectResponse(
+            url="/admin-data?error=Не удалось очистить месяц. Изменения отменены.",
+            status_code=303,
+        )
 
 
 @app.post("/admin-clear-merchants")
@@ -3806,11 +4006,14 @@ def admin_clear_merchants(
 @app.post("/admin-add-special-inventory-day")
 def admin_add_special_inventory_day(
     inv_date: str = Form(...),
+    csrf_token: str = Form(""),
     admin_auth: Optional[str] = Cookie(default=None),
     db: Session = Depends(get_db)
 ):
     if not is_admin_authenticated(admin_auth):
         return RedirectResponse(url="/admin-login", status_code=303)
+    if not verify_admin_csrf(admin_auth, csrf_token):
+        raise HTTPException(status_code=403, detail="Недействительный CSRF-токен")
 
     try:
         parsed_date = datetime.strptime(inv_date, "%Y-%m-%d").date()
@@ -3824,11 +4027,14 @@ def admin_add_special_inventory_day(
 @app.post("/admin-delete-special-inventory-day")
 def admin_delete_special_inventory_day(
     inv_date: str = Form(...),
+    csrf_token: str = Form(""),
     admin_auth: Optional[str] = Cookie(default=None),
     db: Session = Depends(get_db)
 ):
     if not is_admin_authenticated(admin_auth):
         return RedirectResponse(url="/admin-login", status_code=303)
+    if not verify_admin_csrf(admin_auth, csrf_token):
+        raise HTTPException(status_code=403, detail="Недействительный CSRF-токен")
 
     try:
         parsed_date = datetime.strptime(inv_date, "%Y-%m-%d").date()

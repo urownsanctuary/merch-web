@@ -19,10 +19,12 @@ tag exists.
   Existing rows remain `DAY`; new user selections are morning/evening.
 - Intersections require identical point/date/MORNING-or-EVENING and different
   merchants. SQL and the overlap export use one canonical A/B ordering.
-- PostgreSQL-backed production calendar with explicit working-day overrides,
-  administrative XLSX import, and weekend fallback when a date is absent.
-  A parser-verified workbook with synthetic examples and instructions is kept
-  at `docs/production-calendar-template.xlsx`.
+- PostgreSQL-backed production calendar with complete validated official
+  2025/2026 datasets based on Government resolutions № 1335 and № 1466.
+  Startup and administrative background synchronization are idempotent and
+  transactional. Manual date overrides survive later official synchronization
+  and can be reset to the stored official value. XLSX remains an emergency
+  fallback; missing years use a weekend fallback without failing page render.
 - Full-file validation before writes for rates and merchants, one commit after
   all rows, rollback on errors, and retention of existing data on invalid input.
 - Controlled `python -m app.legacy_migration --dry-run|--apply`; application
