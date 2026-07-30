@@ -69,6 +69,14 @@ remained; normalized tables contained exactly 3 notes, 2 reimbursements, and
 reimbursements 425). The deliberately damaged/ambiguous row was reported and
 did not crash the migration. Re-apply created no duplicates.
 
+After browser smoke added compatible aggregate UI data, a redeploy against the
+same schema found 4 aggregate rows. Its dry run identified only the newly added
+material; apply migrated 2 notes, 1 reimbursement, and 3 receipts while skipping
+7 existing normalized items. The immediate re-apply migrated zero items and
+skipped 13. Final counts were 5 normalized notes, 3 reimbursements, and 5
+receipts. This both confirms PostgreSQL durability across deployment and
+idempotency after incremental UI changes.
+
 ## Manual browser smoke on PostgreSQL
 
 The following was exercised through the deployed UI:
@@ -83,7 +91,8 @@ The following was exercised through the deployed UI:
 - Two reimbursements, multiple PDF receipts, deletion of one reimbursement,
   preservation of the other and correct totals.
 - A point with no visits but with note/reimbursement data.
-- Monthly submission and read-only lock after submission.
+- Monthly submission and read-only lock after submission, including direct
+  mutation endpoints.
 - Receipt opening by owner and administrator; HTTP 403 for another merchant
   and for an anonymous request.
 - Administrator login, filters, report, data-management page, special inventory
@@ -109,7 +118,7 @@ uvicorn app.main:app
 HTTP GET /db-check and login/admin smoke
 ```
 
-The test suite covers imports and rollback, legacy dry/apply/reapply,
+The 66-test suite covers imports and rollback, legacy dry/apply/reapply,
 authorization, file validation, every original route, CSRF/session behavior,
 calendar overrides, supply policy, explicit slots, overlap rules, canonical
 A/B ordering, and all three exports.

@@ -38,9 +38,11 @@ Baseline: `origin/main@87fd984`
 
 ## Replaced
 
-- Aggregate-only legacy note/reimbursement text is replaced for new writes by
-  normalized item rows. The controlled migration copies legacy values without
-  deleting or rewriting the old fields.
+- The migration-only view of aggregate legacy note/reimbursement text is
+  supplemented by normalized item rows. The compatible UI continues updating
+  `point_adjustments` and preserves multiple entries as independently removable
+  lines; the controlled migration copies those values without deleting or
+  rewriting the aggregate fields.
 - Startup financial backfill is replaced by the explicit
   `python -m app.legacy_migration --dry-run|--apply` command.
 - Volatile/static receipt serving is replaced by database-backed private

@@ -83,6 +83,12 @@ from app.security import (
 app = FastAPI()
 
 
+def require_draft_month(db: Session, merchant_id: int, period: dict) -> None:
+    overall = compute_overall_total(db, merchant_id, period["year"], period["month"])
+    if overall["submission_status"] == "submitted":
+        raise HTTPException(status_code=409, detail="Reconciliation is submitted")
+
+
 @app.middleware("http")
 async def reject_cross_site_mutations(request: Request, call_next):
     if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path not in {
@@ -1494,6 +1500,7 @@ def point_note_page(
     merchant = get_merchant_by_fio(db, fio)
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
+    require_draft_month(db, merchant["id"], period)
 
     point_code_clean = normalize_point_code(point_code)
     point_total = compute_point_total(db, merchant["id"], point_code_clean, period["year"], period["month"])
@@ -1578,8 +1585,9 @@ def point_note_page(
         supply_days = filter_unadjusted_supply_days(supply_days, existing_note_comment)
         adjustment = get_supply_adjustment_amount(db, point_code_clean, period["year"], period["month"])
         options = "".join([f"<option value='{d.day}'>{d.strftime('%d.%m.%Y')}</option>" for d in supply_days])
+        disabled = "" if supply_days else " disabled"
         if not options:
-            options = "<option value=''>Нет дней с поставкой</option>"
+            options = "<option value='' selected>Нет дней с поставкой</option>"
 
         return f"""
 <!DOCTYPE html>
@@ -1604,7 +1612,7 @@ def point_note_page(
                 <input type="hidden" name="point_code" value="{escape(point_code_clean)}" />
 
                 <label for="supply_day">День с поставкой</label>
-                <select id="supply_day" name="supply_day" required>
+                <select id="supply_day" name="supply_day" required{disabled}>
                     {options}
                 </select>
 
@@ -1616,7 +1624,7 @@ def point_note_page(
                 <label for="comment">Комментарий</label>
                 <input id="comment" name="comment" type="text" placeholder="Не принимал поставку" />
 
-                <button class="btn" type="submit">Сохранить примечание</button>
+                <button class="btn" type="submit"{disabled}>Сохранить примечание</button>
             </form>
 
             <a class="back" href="/point-note-page?fio={escape(fio)}&point_code={escape(point_code_clean)}">← Назад</a>
@@ -1641,6 +1649,7 @@ def save_point_note_normal(
     merchant = get_merchant_by_fio(db, fio)
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
+    require_draft_month(db, merchant["id"], period)
 
     point_code_clean = normalize_point_code(point_code)
     note_amount_value = int(note_amount or 0)
@@ -1701,6 +1710,7 @@ def save_point_note_no_supply(
     merchant = get_merchant_by_fio(db, fio)
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
+    require_draft_month(db, merchant["id"], period)
 
     point_code_clean = normalize_point_code(point_code)
     supply_date = date(period["year"], period["month"], int(supply_day))
@@ -1746,6 +1756,7 @@ def point_reimbursement_page(
     merchant = get_merchant_by_fio(db, fio)
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
+    require_draft_month(db, merchant["id"], period)
 
     point_code_clean = normalize_point_code(point_code)
     point_total = compute_point_total(db, merchant["id"], point_code_clean, period["year"], period["month"])
@@ -1807,6 +1818,7 @@ async def save_point_reimbursement(
     merchant = get_merchant_by_fio(db, fio)
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
+    require_draft_month(db, merchant["id"], period)
 
     point_code_clean = normalize_point_code(point_code)
     reimb_amount_value = int(reimb_amount or 0)
@@ -1879,6 +1891,7 @@ async def save_point_adjustment(
     merchant = get_merchant_by_fio(db, fio)
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
+    require_draft_month(db, merchant["id"], period)
     point_code_clean = normalize_point_code(point_code)
     existing = get_point_adjustment(db, merchant["id"], point_code_clean, period["year"], period["month"]) or {}
     # Старый маршрут оставлен только для совместимости со старыми версиями формы.
@@ -2833,7 +2846,7 @@ def admin_data_page(
                 <div class="detail-card">
                     <div class="detail-title">Производственный календарь РФ</div>
                     <form method="post" action="/admin-upload-production-calendar" enctype="multipart/form-data">
-                        <label for="calendar_file">XLSX: дата, выходной, название, источник</label>
+                        <label for="calendar_file">XLSX: дата, выходной день, название, источник, комментарий</label>
                         <input id="calendar_file" name="file" type="file" accept=".xlsx" required />
                         <button class="btn" type="submit">Загрузить календарь</button>
                     </form>

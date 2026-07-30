@@ -10,6 +10,7 @@ os.environ.setdefault("ADMIN_LOGIN", "admin")
 os.environ.setdefault("ADMIN_PASSWORD", "strong-password")
 os.environ.setdefault("ENVIRONMENT", "test")
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
@@ -17,7 +18,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.db import engine
 from app.legacy_migration import build_migration_plan, run_migration
-from app.main import app, get_admin_cookie_value, get_db
+from app.main import app, get_admin_cookie_value, get_db, require_draft_month
 from app.security import create_merchant_session, reset_request_merchant, set_request_merchant
 from app.services import fio_norm, get_merchant_by_fio, hash_last4
 
@@ -102,6 +103,15 @@ class RouteTests(unittest.TestCase):
                 data={"fio": "Иванов Иван", "point_code": "P1", "note_amount": "1", "note_comment": "x"},
             )
         self.assertEqual(response.status_code, 403)
+
+    def test_submitted_month_rejects_direct_edit(self):
+        with patch(
+            "app.main.compute_overall_total",
+            return_value={"submission_status": "submitted"},
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                require_draft_month(None, 1, {"year": 2026, "month": 7})
+        self.assertEqual(raised.exception.status_code, 409)
 
     def test_original_route_inventory_is_preserved(self):
         paths = {route.path for route in app.routes}
