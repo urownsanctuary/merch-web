@@ -1547,6 +1547,8 @@ def calendar_page(
     fio: str,
     point_code: str,
     saved: str = "",
+    visit_error: str = "",
+    inventory_date: str = "",
     db: Session = Depends(get_db)
 ):
     period = get_active_period()
@@ -1589,6 +1591,19 @@ def calendar_page(
     info_box = ""
     if saved == "1":
         info_box = "<div class=\"success-box\">Данные по точке сохранены.</div>"
+    if visit_error == "inventory_week":
+        try:
+            first_inventory_date = date.fromisoformat(inventory_date)
+        except ValueError:
+            first_inventory_date = None
+        if first_inventory_date:
+            info_box += (
+                '<div class="error-box">'
+                "На этой точке уже отмечен полный инвент на этой неделе: "
+                f"{first_inventory_date.strftime('%d.%m.%Y')}. "
+                "Разрешён только один полный инвент в неделю."
+                "</div>"
+            )
 
     point_receipt_links = render_receipt_links(point_total.get("reimb_receipt"))
     point_receipt_link = ""
@@ -1647,6 +1662,12 @@ def calendar_page(
         if (savedY) {{
             window.scrollTo(0, parseInt(savedY, 10));
             sessionStorage.removeItem('calendarScrollY');
+        }}
+        const cleanUrl = new URL(window.location.href);
+        if (cleanUrl.searchParams.has('visit_error')) {{
+            cleanUrl.searchParams.delete('visit_error');
+            cleanUrl.searchParams.delete('inventory_date');
+            window.history.replaceState({{}}, '', cleanUrl.toString());
         }}
         document.querySelectorAll('a.day').forEach(el => {{
             el.addEventListener('click', function() {{
@@ -2715,11 +2736,19 @@ def toggle_day_post(
 
     try:
         toggle_day_visit(db, merchant["id"], point_code, period["year"], period["month"], day, normalized_slot)
-    except InventoryWeekLimitError:
+    except InventoryWeekLimitError as exc:
         db.rollback()
-        return HTMLResponse(
-            "На одной точке разрешён только один полный инвент на мерчендайзера в одну ISO-неделю.",
-            status_code=409,
+        query = urlencode(
+            {
+                "fio": fio,
+                "point_code": point_code,
+                "visit_error": "inventory_week",
+                "inventory_date": exc.existing_date.isoformat(),
+            }
+        )
+        return RedirectResponse(
+            url=f"/calendar-page?{query}",
+            status_code=303,
         )
     except ValueError:
         db.rollback()
@@ -2809,11 +2838,19 @@ def toggle_inventory_post(
             day,
             special_inventory=special_inventory,
         )
-    except InventoryWeekLimitError:
+    except InventoryWeekLimitError as exc:
         db.rollback()
-        return HTMLResponse(
-            "На одной точке разрешён только один полный инвент на мерчендайзера в одну ISO-неделю.",
-            status_code=409,
+        query = urlencode(
+            {
+                "fio": fio,
+                "point_code": point_code,
+                "visit_error": "inventory_week",
+                "inventory_date": exc.existing_date.isoformat(),
+            }
+        )
+        return RedirectResponse(
+            url=f"/calendar-page?{query}",
+            status_code=303,
         )
     except ValueError:
         db.rollback()

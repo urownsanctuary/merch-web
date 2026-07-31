@@ -42,6 +42,10 @@ DEFAULT_RATE_COFFEE = 100
 class InventoryWeekLimitError(ValueError):
     """Raised when a point already has a full inventory in the same ISO week."""
 
+    def __init__(self, existing_date: date):
+        self.existing_date = existing_date
+        super().__init__("Full inventory already exists in this ISO week")
+
 
 def fio_norm(s: str) -> str:
     s = (s or "").strip().lower()
@@ -379,12 +383,12 @@ def allowed_visit_slots(visit_date: date, *, special_inventory: bool = False) ->
     return frozenset(slots)
 
 
-def inventory_exists_in_iso_week(
+def inventory_date_in_iso_week(
     db: Session,
     merchant_id: int,
     point_code: str,
     visit_date: date,
-) -> bool:
+) -> date | None:
     week_start = visit_date - timedelta(days=visit_date.isoweekday() - 1)
     week_end = week_start + timedelta(days=7)
     if getattr(db.get_bind().dialect, "name", "") == "postgresql":
@@ -396,16 +400,17 @@ def inventory_exists_in_iso_week(
                 )
             },
         )
-    return db.execute(
+    row = db.execute(
         text(
             """
-            SELECT 1
+            SELECT visit_date
             FROM visits
             WHERE merchant_id = :merchant_id
               AND point_code = :point_code
               AND visit_date >= :week_start
               AND visit_date < :week_end
               AND slot IN (:slot_evening, :slot_full_invent)
+            ORDER BY visit_date
             LIMIT 1
             """
         ),
@@ -417,7 +422,13 @@ def inventory_exists_in_iso_week(
             "slot_evening": SLOT_EVENING,
             "slot_full_invent": SLOT_FULL_INVENT,
         },
-    ).first() is not None
+    ).first()
+    if not row:
+        return None
+    existing_date = row[0]
+    if isinstance(existing_date, str):
+        existing_date = date.fromisoformat(existing_date)
+    return existing_date
 
 
 def toggle_day_visit(
@@ -458,12 +469,12 @@ def toggle_day_visit(
 
     if slot not in allowed_visit_slots(visit_date):
         raise ValueError("Visit slot is not allowed for this date")
-    if slot == SLOT_EVENING and inventory_exists_in_iso_week(
-        db, merchant_id, point_code, visit_date
-    ):
-        raise InventoryWeekLimitError(
-            "Only one full inventory is allowed per merchant, point, and ISO week"
+    if slot == SLOT_EVENING:
+        existing_inventory_date = inventory_date_in_iso_week(
+            db, merchant_id, point_code, visit_date
         )
+        if existing_inventory_date:
+            raise InventoryWeekLimitError(existing_inventory_date)
 
     db.execute(
         text(
@@ -524,10 +535,11 @@ def toggle_inventory_visit(
         db.commit()
         return "removed"
 
-    if inventory_exists_in_iso_week(db, merchant_id, point_code, visit_date):
-        raise InventoryWeekLimitError(
-            "Only one full inventory is allowed per merchant, point, and ISO week"
-        )
+    existing_inventory_date = inventory_date_in_iso_week(
+        db, merchant_id, point_code, visit_date
+    )
+    if existing_inventory_date:
+        raise InventoryWeekLimitError(existing_inventory_date)
 
     db.execute(
         text(
