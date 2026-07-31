@@ -616,6 +616,12 @@ class MerchantAdminTests(unittest.TestCase):
     def test_import_reactivates_exact_identity_and_leaves_absent_inactive(self):
         matched = self.create("Иванов Иван", "1234", "Старый ТУ")
         absent = self.create("Отсутствует В Файле", "9999", "Старый ТУ")
+        with self.factory() as db:
+            db.execute(
+                text("UPDATE merchants SET last4=NULL WHERE id=:id"),
+                {"id": matched["id"]},
+            )
+            db.commit()
         deactivated = self.client.post(
             "/admin-clear-merchants",
             data={"csrf_token": self.csrf},
@@ -672,6 +678,15 @@ class MerchantAdminTests(unittest.TestCase):
                     db,
                     merchant_workbook(
                         [["Иванов Иван", "1234"], ["Петров Пётр", "56-78"]]
+                    ),
+                    "ТУ-1",
+                )
+            self.assertEqual(db.execute(text("SELECT COUNT(*) FROM merchants")).scalar(), 0)
+            with self.assertRaisesRegex(ValueError, "точный дубль строк 2 и 3"):
+                import_merchants_xlsx(
+                    db,
+                    merchant_workbook(
+                        [["Иванов Иван", "1234"], [" ИВАНОВ  ИВАН ", "1234"]]
                     ),
                     "ТУ-1",
                 )

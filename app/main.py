@@ -4278,7 +4278,10 @@ def admin_clear_merchants(
             deactivated = clear_merchants_by_tu(db, tu, actor=ADMIN_LOGIN)
         else:
             deactivated = clear_all_merchants(db, actor=ADMIN_LOGIN)
-        msg = f"Деактивировано мерчендайзеров: {deactivated}."
+        msg = (
+            f"Деактивировано мерчендайзеров: {deactivated}. "
+            "Можно загружать новый список"
+        )
         return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
     except Exception as exc:
         db.rollback()
