@@ -13,6 +13,7 @@ os.environ.setdefault("ENVIRONMENT", "test")
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
 
 from app.main import app, build_calendar_html, get_db
 from app.security import create_merchant_session, read_merchant_session
@@ -119,6 +120,7 @@ class SlotHotfixTests(unittest.TestCase):
                     wednesday = client.get(
                         "/day-action-page",
                         params={"fio": "Тестовый Мерч", "point_code": "2674", "day": 15},
+                        follow_redirects=False,
                     )
                     friday = client.get(
                         "/day-action-page",
@@ -128,9 +130,8 @@ class SlotHotfixTests(unittest.TestCase):
                         "/day-action-page",
                         params={"fio": "Тестовый Мерч", "point_code": "2674", "day": 18},
                     )
-            self.assertIn("Добавить выход", wednesday.text)
-            self.assertNotIn("утренний", wednesday.text.lower())
-            self.assertNotIn("вечерний", wednesday.text.lower())
+            self.assertEqual(wednesday.status_code, 303)
+            self.assertIn("/calendar-page", wednesday.headers["location"])
             for response in (friday, saturday):
                 self.assertIn("Добавить утренний выход", response.text)
                 self.assertIn("Добавить вечерний полный инвент", response.text)
@@ -165,6 +166,7 @@ class SlotHotfixTests(unittest.TestCase):
                             "point_code": "2674",
                             "day": 19,
                         },
+                        follow_redirects=False,
                     )
                     rejected = client.post(
                         "/toggle-day",
@@ -188,12 +190,189 @@ class SlotHotfixTests(unittest.TestCase):
                         },
                         follow_redirects=False,
                     )
-            self.assertEqual(page.status_code, 200)
-            self.assertIn('name="confirm_non_working"', page.text)
-            self.assertIn("официальный производственный выходной", page.text)
+            self.assertEqual(page.status_code, 303)
+            self.assertIn("/calendar-page", page.headers["location"])
             self.assertEqual(rejected.status_code, 409)
+            self.assertIn(
+                "Это выходной или праздничный день по производственному календарю.",
+                rejected.text,
+            )
             self.assertEqual(accepted.status_code, 303)
             toggle.assert_called_once()
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_calendar_direct_toggle_and_choice_links(self):
+        html = build_calendar_html(
+            fio="Тестовый Мерч",
+            point_code="2674",
+            y=2026,
+            m=7,
+            boxes_map={},
+            visits={},
+            is_submitted=False,
+            special_inventory_days=set(),
+            calendar_overrides={},
+            csrf_token="csrf-value",
+        )
+        self.assertIn('class="direct-day-form"', html)
+        self.assertIn('name="day" value="1"', html)
+        self.assertIn('name="slot" value="DAY"', html)
+        self.assertIn('name="csrf_token" value="csrf-value"', html)
+        self.assertIn(
+            "/day-action-page?fio=Тестовый Мерч&point_code=2674&day=3",
+            html,
+        )
+        self.assertIn(
+            "/day-action-page?fio=Тестовый Мерч&point_code=2674&day=4",
+            html,
+        )
+        self.assertIn(
+            "Это выходной или праздничный день по производственному календарю. "
+            "Вы действительно работали в этот день?",
+            html,
+        )
+        submitted = build_calendar_html(
+            fio="Тестовый Мерч",
+            point_code="2674",
+            y=2026,
+            m=7,
+            boxes_map={},
+            visits={},
+            is_submitted=True,
+            special_inventory_days=set(),
+            calendar_overrides={},
+            csrf_token="csrf-value",
+        )
+        self.assertNotIn('class="direct-day-form"', submitted)
+
+    def test_ordinary_post_adds_then_removes_and_redirects_to_calendar(self):
+        engine = create_engine(
+            "sqlite+pysqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE TABLE visits (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "merchant_id INTEGER NOT NULL, point_code TEXT NOT NULL, "
+                "visit_date DATE NOT NULL, slot TEXT NOT NULL, "
+                "UNIQUE (merchant_id, point_code, visit_date, slot))"
+            )
+        db = Session(engine)
+        app.dependency_overrides[get_db] = lambda: db
+        token = create_merchant_session("Тестовый Мерч")
+        csrf = read_merchant_session(token)["csrf"]
+        try:
+            with patch.multiple(
+                "app.main",
+                get_active_period=MagicMock(return_value=FIXED_PERIOD),
+                get_merchant_by_fio=MagicMock(return_value=MERCHANT),
+                compute_overall_total=MagicMock(
+                    return_value={"submission_status": "draft"}
+                ),
+                get_visits_for_month=MagicMock(
+                    side_effect=[{}, {1: {SLOT_DAY}}]
+                ),
+                get_calendar_overrides=MagicMock(return_value={}),
+            ):
+                with TestClient(app) as client:
+                    client.cookies.set("merchant_session", token)
+                    payload = {
+                        "fio": "Тестовый Мерч",
+                        "point_code": "2674",
+                        "day": "1",
+                        "slot": SLOT_DAY,
+                        "csrf_token": csrf,
+                    }
+                    added = client.post(
+                        "/toggle-day", data=payload, follow_redirects=False
+                    )
+                    count_after_add = db.execute(
+                        text("SELECT COUNT(*) FROM visits")
+                    ).scalar_one()
+                    removed = client.post(
+                        "/toggle-day", data=payload, follow_redirects=False
+                    )
+                    count_after_remove = db.execute(
+                        text("SELECT COUNT(*) FROM visits")
+                    ).scalar_one()
+            self.assertEqual(added.status_code, 303)
+            self.assertIn("/calendar-page", added.headers["location"])
+            self.assertEqual(count_after_add, 1)
+            self.assertEqual(removed.status_code, 303)
+            self.assertEqual(count_after_remove, 0)
+        finally:
+            db.close()
+            app.dependency_overrides.clear()
+
+    def test_database_error_rolls_back_without_http_500(self):
+        db = MagicMock()
+        app.dependency_overrides[get_db] = lambda: db
+        token = create_merchant_session("Тестовый Мерч")
+        csrf = read_merchant_session(token)["csrf"]
+        try:
+            with patch.multiple(
+                "app.main",
+                get_active_period=MagicMock(return_value=FIXED_PERIOD),
+                get_merchant_by_fio=MagicMock(return_value=MERCHANT),
+                compute_overall_total=MagicMock(
+                    return_value={"submission_status": "draft"}
+                ),
+                get_visits_for_month=MagicMock(return_value={}),
+                get_calendar_overrides=MagicMock(return_value={}),
+                toggle_day_visit=MagicMock(
+                    side_effect=RuntimeError("database unavailable")
+                ),
+            ):
+                with TestClient(app) as client:
+                    client.cookies.set("merchant_session", token)
+                    response = client.post(
+                        "/toggle-day",
+                        data={
+                            "fio": "Тестовый Мерч",
+                            "point_code": "2674",
+                            "day": "1",
+                            "slot": SLOT_DAY,
+                            "csrf_token": csrf,
+                        },
+                    )
+            self.assertEqual(response.status_code, 503)
+            self.assertNotEqual(response.status_code, 500)
+            db.rollback.assert_called_once()
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_submitted_reconciliation_blocks_direct_calendar_toggle(self):
+        db = MagicMock()
+        app.dependency_overrides[get_db] = lambda: db
+        token = create_merchant_session("Тестовый Мерч")
+        csrf = read_merchant_session(token)["csrf"]
+        toggle = MagicMock()
+        try:
+            with patch.multiple(
+                "app.main",
+                get_active_period=MagicMock(return_value=FIXED_PERIOD),
+                get_merchant_by_fio=MagicMock(return_value=MERCHANT),
+                compute_overall_total=MagicMock(
+                    return_value={"submission_status": "submitted"}
+                ),
+                toggle_day_visit=toggle,
+            ):
+                with TestClient(app) as client:
+                    client.cookies.set("merchant_session", token)
+                    response = client.post(
+                        "/toggle-day",
+                        data={
+                            "fio": "Тестовый Мерч",
+                            "point_code": "2674",
+                            "day": "1",
+                            "slot": SLOT_DAY,
+                            "csrf_token": csrf,
+                        },
+                    )
+            self.assertEqual(response.status_code, 409)
+            toggle.assert_not_called()
         finally:
             app.dependency_overrides.clear()
 

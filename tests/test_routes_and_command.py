@@ -95,7 +95,7 @@ class RouteTests(unittest.TestCase):
                 follow_redirects=False,
             )
         self.assertEqual(response.status_code, 303)
-        self.assertIn("/day-action-page", response.headers["location"])
+        self.assertIn("/calendar-page", response.headers["location"])
 
     def test_post_toggle_requires_csrf(self):
         with TestClient(app) as client:
