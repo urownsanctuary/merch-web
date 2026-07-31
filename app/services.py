@@ -1806,18 +1806,24 @@ def import_merchants_xlsx(
     if not tu:
         raise ValueError("ТУ обязателен")
     parsed: list[dict[str, str]] = []
+    seen_identities: dict[tuple[str, str], int] = {}
     for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
         if not any(value not in (None, "") for value in row):
             continue
         try:
-            parsed.append(
-                validate_merchant_values(
-                    row[0] if row else "",
-                    row[1] if len(row) > 1 else "",
-                    tu,
-                    fio_normalizer=fio_norm,
-                )
+            values = validate_merchant_values(
+                row[0] if row else "",
+                row[1] if len(row) > 1 else "",
+                tu,
+                fio_normalizer=fio_norm,
             )
+            identity = (values["fio_norm"], values["last4"])
+            if identity in seen_identities:
+                raise ValueError(
+                    f"точный дубль строк {seen_identities[identity]} и {row_idx}"
+                )
+            seen_identities[identity] = row_idx
+            parsed.append(values)
         except ValueError as exc:
             raise ValueError(
                 f"Ошибка в строке мерчендайзеров {row_idx}: {exc}"

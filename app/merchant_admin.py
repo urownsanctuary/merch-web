@@ -450,17 +450,26 @@ def import_or_reactivate_merchant(
     values = validate_merchant_values(
         fio, last4, tu, fio_normalizer=fio_normalizer
     )
+    password_hash = last4_hasher(values["last4"])
     existing_id = db.execute(
         text(
             """
             SELECT id
             FROM merchants
-            WHERE fio_norm = :fio_norm AND last4 = :last4
-            ORDER BY id
+            WHERE fio_norm = :fio_norm
+              AND (
+                  last4 = :last4
+                  OR (last4 IS NULL AND pass_hash = :pass_hash)
+              )
+            ORDER BY CASE WHEN last4 = :last4 THEN 0 ELSE 1 END, id
             LIMIT 1
             """
         ),
-        {"fio_norm": values["fio_norm"], "last4": values["last4"]},
+        {
+            "fio_norm": values["fio_norm"],
+            "last4": values["last4"],
+            "pass_hash": password_hash,
+        },
     ).scalar()
     if existing_id is None:
         created = create_merchant(
