@@ -411,6 +411,140 @@ class MerchantAdminTests(unittest.TestCase):
         self.assertEqual(response.status_code, 303)
         self.assertEqual(response.headers["location"], "/admin-login")
 
+    def test_admin_data_shows_safe_deactivate_all_button(self):
+        with patch("app.main.get_active_period", return_value={"year": 2026, "month": 7}), patch(
+            "app.main.get_all_tu_values", return_value=["ТУ-1"]
+        ), patch("app.main.get_special_inventory_days", return_value=[]), patch(
+            "app.main.get_calendar_status", return_value=[]
+        ):
+            response = self.client.get("/admin-data")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Очистить список мерчендайзеров", response.text)
+        self.assertIn('action="/admin-clear-merchants"', response.text)
+        self.assertIn(
+            "Все текущие мерчендайзеры будут деактивированы. "
+            "История сверок и отчётов сохранится. Продолжить?",
+            response.text,
+        )
+
+    def test_deactivate_all_requires_admin_and_csrf(self):
+        merchant = self.create()
+        self.client.cookies.clear()
+        unauthorized = self.client.post(
+            "/admin-clear-merchants",
+            data={"csrf_token": self.csrf},
+            follow_redirects=False,
+        )
+        self.assertEqual(unauthorized.status_code, 303)
+        self.assertEqual(unauthorized.headers["location"], "/admin-login")
+
+        self.client.cookies.set("admin_auth", self.admin_cookie)
+        forbidden = self.client.post(
+            "/admin-clear-merchants",
+            data={"csrf_token": ""},
+            follow_redirects=False,
+        )
+        self.assertEqual(forbidden.status_code, 403)
+        with self.factory() as db:
+            self.assertTrue(
+                db.execute(
+                    text("SELECT is_active FROM merchants WHERE id=:id"),
+                    {"id": merchant["id"]},
+                ).scalar()
+            )
+
+    def test_deactivate_all_preserves_history_and_is_idempotent(self):
+        first = self.create("Иванов Иван", "1234")
+        second = self.create("Петров Пётр", "5678")
+        history_tables = (
+            "monthly_submissions",
+            "point_adjustments",
+            "point_notes",
+            "point_reimbursements",
+            "reimbursement_receipts",
+            "receipt_files",
+        )
+        with self.engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO visits (merchant_id, point_code, visit_date, slot) "
+                    "VALUES (:id, 'P1', '2026-07-01', 'DAY')"
+                ),
+                {"id": first["id"]},
+            )
+            for table_name in history_tables:
+                connection.exec_driver_sql(
+                    f"CREATE TABLE {table_name} "
+                    "(id INTEGER PRIMARY KEY AUTOINCREMENT, merchant_id INTEGER NOT NULL)"
+                )
+                connection.execute(
+                    text(f"INSERT INTO {table_name} (merchant_id) VALUES (:id)"),
+                    {"id": first["id"]},
+                )
+
+        first_run = self.client.post(
+            "/admin-clear-merchants",
+            data={"csrf_token": self.csrf},
+            follow_redirects=False,
+        )
+        self.assertEqual(first_run.status_code, 303)
+        self.assertIn("2", first_run.headers["location"])
+        second_run = self.client.post(
+            "/admin-clear-merchants",
+            data={"csrf_token": self.csrf},
+            follow_redirects=False,
+        )
+        self.assertEqual(second_run.status_code, 303)
+        self.assertIn("0", second_run.headers["location"])
+
+        with self.factory() as db:
+            statuses = db.execute(
+                text("SELECT id, is_active FROM merchants ORDER BY id")
+            ).all()
+            self.assertEqual(statuses, [(first["id"], 0), (second["id"], 0)])
+            self.assertEqual(
+                db.execute(text("SELECT merchant_id FROM visits")).scalar(),
+                first["id"],
+            )
+            for table_name in history_tables:
+                self.assertEqual(
+                    db.execute(
+                        text(f"SELECT merchant_id FROM {table_name}")
+                    ).scalar(),
+                    first["id"],
+                )
+
+    def test_deactivate_all_database_error_rolls_back_without_500(self):
+        merchant = self.create()
+
+        def deactivate_then_fail(db, **_kwargs):
+            db.execute(
+                text("UPDATE merchants SET is_active=FALSE WHERE id=:id"),
+                {"id": merchant["id"]},
+            )
+            sensitive_error_detail = "synthetic secret database detail"
+            raise RuntimeError(sensitive_error_detail)
+
+        with patch("app.main.clear_all_merchants", side_effect=deactivate_then_fail):
+            with self.assertLogs("app.main", level="ERROR") as captured:
+                response = self.client.post(
+                    "/admin-clear-merchants",
+                    data={"csrf_token": self.csrf},
+                    follow_redirects=False,
+                )
+        self.assertEqual(response.status_code, 303)
+        self.assertNotEqual(response.status_code, 500)
+        self.assertIn("error=", response.headers["location"])
+        self.assertNotIn("secret", response.headers["location"])
+        self.assertNotIn("secret", "\n".join(captured.output))
+        with self.factory() as db:
+            self.assertTrue(
+                db.execute(
+                    text("SELECT is_active FROM merchants WHERE id=:id"),
+                    {"id": merchant["id"]},
+                ).scalar()
+            )
+
     def test_xss_values_are_escaped_in_list(self):
         self.create("Иванов <script>alert(1)</script>", "1234", '<img src=x onerror="x">')
         response = self.client.get("/admin-merchants")
@@ -465,18 +599,71 @@ class MerchantAdminTests(unittest.TestCase):
             self.assertNotIn("9876", serialized)
             self.assertNotIn(hash_last4("9876"), serialized)
 
-    def test_import_uses_same_duplicate_rules_and_rolls_back(self):
+    def test_import_reuses_exact_identity_and_creates_new(self):
         self.create("Иванов Иван", "1234")
         with self.factory() as db:
-            with self.assertRaises(MerchantInputError):
-                import_merchants_xlsx(
-                    db,
-                    merchant_workbook(
-                        [["Петров Пётр", "5678"], ["ИВАНОВ ИВАН", "1234"]]
+            result = import_merchants_xlsx(
+                db,
+                merchant_workbook(
+                    [["Петров Пётр", "5678"], ["ИВАНОВ ИВАН", "1234"]]
+                ),
+                "ТУ-1",
+            )
+            self.assertEqual(result["created"], 1)
+            self.assertEqual(result["reactivated"], 0)
+            self.assertEqual(db.execute(text("SELECT COUNT(*) FROM merchants")).scalar(), 2)
+
+    def test_import_reactivates_exact_identity_and_leaves_absent_inactive(self):
+        matched = self.create("Иванов Иван", "1234", "Старый ТУ")
+        absent = self.create("Отсутствует В Файле", "9999", "Старый ТУ")
+        deactivated = self.client.post(
+            "/admin-clear-merchants",
+            data={"csrf_token": self.csrf},
+            follow_redirects=False,
+        )
+        self.assertEqual(deactivated.status_code, 303)
+
+        with self.factory() as db:
+            result = import_merchants_xlsx(
+                db,
+                merchant_workbook(
+                    [
+                        ["  ИВАНОВ   ИВАН  ", "1234"],
+                        ["Иванов Иван", "5678"],
+                        ["Новый Сотрудник", "4321"],
+                    ]
+                ),
+                "Новый ТУ",
+            )
+            self.assertEqual(result, {"loaded_rows": 3, "created": 2, "reactivated": 1})
+            matched_after = db.execute(
+                text(
+                    "SELECT id, is_active, tu FROM merchants "
+                    "WHERE fio_norm=:fio_norm AND last4='1234'"
+                ),
+                {"fio_norm": fio_norm("Иванов Иван")},
+            ).one()
+            self.assertEqual(matched_after, (matched["id"], 1, "Новый ТУ"))
+            self.assertEqual(
+                db.execute(
+                    text("SELECT is_active FROM merchants WHERE id=:id"),
+                    {"id": absent["id"]},
+                ).scalar(),
+                0,
+            )
+            self.assertEqual(
+                db.execute(
+                    text(
+                        "SELECT COUNT(*) FROM merchants "
+                        "WHERE fio_norm=:fio_norm"
                     ),
-                    "ТУ-1",
-                )
-            self.assertEqual(db.execute(text("SELECT COUNT(*) FROM merchants")).scalar(), 1)
+                    {"fio_norm": fio_norm("Иванов Иван")},
+                ).scalar(),
+                2,
+            )
+            self.assertIsNotNone(login_user(db, "Иванов Иван", "1234"))
+            self.assertIsNotNone(login_user(db, "Новый Сотрудник", "4321"))
+            self.assertIsNone(login_user(db, "Отсутствует В Файле", "9999"))
 
     def test_import_rejects_phone_symbols_before_any_write(self):
         with self.factory() as db:

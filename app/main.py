@@ -52,6 +52,7 @@ from app.services import (
     import_rates_xlsx,
     import_merchants_xlsx,
     clear_month_data,
+    clear_all_merchants,
     clear_merchants_by_tu,
     get_point_adjustment,
     upsert_point_adjustment,
@@ -3771,12 +3772,7 @@ def admin_data_page(
         return RedirectResponse(url="/admin-login", status_code=303)
 
     period = get_active_period()
-    tu_values = get_all_tu_values(db)
     admin_csrf = get_admin_csrf_token(str(admin_auth))
-
-    tu_options = ""
-    for item in tu_values:
-        tu_options += f"<option value='{escape(item)}'>{escape(item)}</option>"
 
     info_box = ""
     if success:
@@ -3880,6 +3876,10 @@ def admin_data_page(
 
                         <button class="btn" type="submit">Загрузить мерчей</button>
                     </form>
+                    <form method="post" action="/admin-clear-merchants" style="margin-top:18px;" onsubmit="return confirm('Все текущие мерчендайзеры будут деактивированы. История сверок и отчётов сохранится. Продолжить?');">
+                        <input type="hidden" name="csrf_token" value="{admin_csrf}" />
+                        <button class="btn btn-danger" type="submit">Очистить список мерчендайзеров</button>
+                    </form>
                 </div>
 
                 <div class="detail-card">
@@ -3899,19 +3899,6 @@ def admin_data_page(
                         <input id="clear_month" name="month" type="number" value="{period["month"]}" min="1" max="12" required />
 
                         <button class="btn btn-danger" type="submit">Очистить данные месяца</button>
-                    </form>
-                </div>
-
-                <div class="detail-card">
-                    <div class="detail-title">Деактивация мерчей по ТУ</div>
-                    <form method="post" action="/admin-clear-merchants" onsubmit="return confirm('Деактивировать всех активных сотрудников выбранного ТУ? История сохранится.');">
-                        <input type="hidden" name="csrf_token" value="{admin_csrf}" />
-                        <label for="clear_tu">Территориальный управляющий</label>
-                        <select id="clear_tu" name="tu" required>
-                            {tu_options}
-                        </select>
-
-                        <button class="btn btn-danger" type="submit">Деактивировать мерчей этого ТУ</button>
                     </form>
                 </div>
 
@@ -4142,7 +4129,10 @@ async def admin_upload_merchants(
 
     try:
         result = import_merchants_xlsx(db, file.file, tu, actor=ADMIN_LOGIN)
-        msg = f"Мерчендайзеры загружены: строк {result['loaded_rows']}."
+        msg = (
+            f"Мерчендайзеры загружены: строк {result['loaded_rows']}, "
+            f"создано {result['created']}, повторно активировано {result['reactivated']}."
+        )
         return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
     except ValueError as exc:
         db.rollback()
@@ -4273,7 +4263,7 @@ def admin_clear_month(
 
 @app.post("/admin-clear-merchants")
 def admin_clear_merchants(
-    tu: str = Form(...),
+    tu: str = Form(""),
     csrf_token: str = Form(""),
     admin_auth: Optional[str] = Cookie(default=None),
     db: Session = Depends(get_db)
@@ -4283,9 +4273,20 @@ def admin_clear_merchants(
     if not verify_admin_csrf(admin_auth, csrf_token):
         raise HTTPException(status_code=403, detail="Недействительный CSRF-токен")
 
-    deleted = clear_merchants_by_tu(db, tu, actor=ADMIN_LOGIN)
-    msg = f"Деактивировано мерчендайзеров ТУ {tu}: {deleted}."
-    return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
+    try:
+        if tu.strip():
+            deactivated = clear_merchants_by_tu(db, tu, actor=ADMIN_LOGIN)
+        else:
+            deactivated = clear_all_merchants(db, actor=ADMIN_LOGIN)
+        msg = f"Деактивировано мерчендайзеров: {deactivated}."
+        return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
+    except Exception as exc:
+        db.rollback()
+        log_redacted_exception("admin_clear_merchants_failed", exc)
+        return RedirectResponse(
+            url="/admin-data?error=Не удалось деактивировать мерчендайзеров. Изменения отменены.",
+            status_code=303,
+        )
 
 
 @app.post("/admin-add-special-inventory-day")

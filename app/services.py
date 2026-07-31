@@ -10,7 +10,9 @@ from openpyxl import load_workbook
 from app.security import request_merchant_matches
 from app.merchant_admin import (
     create_merchant,
+    deactivate_all_merchants,
     deactivate_merchants_by_tu,
+    import_or_reactivate_merchant,
     validate_merchant_values,
 )
 
@@ -1823,8 +1825,10 @@ def import_merchants_xlsx(
     if not parsed:
         raise ValueError("В файле мерчендайзеров нет данных")
     try:
+        created = 0
+        reactivated = 0
         for values in parsed:
-            create_merchant(
+            imported = import_or_reactivate_merchant(
                 db,
                 values["fio"],
                 values["last4"],
@@ -1833,11 +1837,17 @@ def import_merchants_xlsx(
                 fio_normalizer=fio_norm,
                 last4_hasher=hash_last4,
             )
+            created += int(imported["created"])
+            reactivated += int(imported["reactivated"])
         db.commit()
     except Exception:
         db.rollback()
         raise
-    return {"loaded_rows": len(parsed)}
+    return {
+        "loaded_rows": len(parsed),
+        "created": created,
+        "reactivated": reactivated,
+    }
 
 
 def clear_month_data(db: Session, year: int, month: int) -> dict:
@@ -1874,4 +1884,15 @@ def clear_merchants_by_tu(
     deleted = deactivate_merchants_by_tu(db, tu, actor=actor)
     db.commit()
     return deleted
+
+
+def clear_all_merchants(
+    db: Session,
+    *,
+    actor: str = "admin",
+) -> int:
+    """Deactivate every active merchant while preserving all linked history."""
+    deactivated = deactivate_all_merchants(db, actor=actor)
+    db.commit()
+    return deactivated
 
