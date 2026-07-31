@@ -5,7 +5,7 @@ import hashlib
 import hmac
 from datetime import date, datetime, timedelta
 from sqlalchemy.orm import Session
-from sqlalchemy import text, bindparam
+from sqlalchemy import text, bindparam, inspect
 from openpyxl import load_workbook
 from app.security import request_merchant_matches
 from app.merchant_admin import (
@@ -25,6 +25,13 @@ SLOT_FULL_INVENT = "FULL_INVENT"
 VISIT_SLOTS = frozenset({SLOT_MORNING, SLOT_EVENING, SLOT_DAY})
 OVERLAP_SLOTS = frozenset({SLOT_MORNING, SLOT_EVENING})
 ALL_SLOTS = frozenset({*VISIT_SLOTS, SLOT_FULL_INVENT})
+REGULAR_PAY_SLOTS = frozenset({SLOT_DAY, SLOT_MORNING})
+INVENTORY_PAY_SLOTS = frozenset({SLOT_EVENING, SLOT_FULL_INVENT})
+NORMALIZED_ADJUSTMENT_TABLES = (
+    "point_notes",
+    "point_reimbursements",
+    "reimbursement_receipts",
+)
 
 DEFAULT_RATE_SUPPLY = 800
 DEFAULT_RATE_NO_SUPPLY = 400
@@ -353,6 +360,21 @@ def normalize_visit_slot(slot: str | None, *, allow_legacy_day: bool = True) -> 
     return normalized
 
 
+def allowed_visit_slots(visit_date: date, *, special_inventory: bool = False) -> frozenset[str]:
+    """Return user-selectable work slots for a calendar date.
+
+    Friday and Saturday support a morning visit or an evening full inventory.
+    Every other weekday uses the original single DAY visit. FULL_INVENT remains
+    a separate special-inventory action and is intentionally not returned here.
+    """
+    if visit_date.weekday() in (4, 5):
+        return OVERLAP_SLOTS
+    slots = {SLOT_DAY}
+    if special_inventory:
+        slots.add(SLOT_FULL_INVENT)
+    return frozenset(slots)
+
+
 def toggle_day_visit(
     db: Session,
     merchant_id: int,
@@ -389,6 +411,9 @@ def toggle_day_visit(
         db.commit()
         return "removed"
 
+    if slot not in allowed_visit_slots(visit_date):
+        raise ValueError("Visit slot is not allowed for this date")
+
     db.execute(
         text(
             """
@@ -408,8 +433,21 @@ def toggle_day_visit(
     return "added"
 
 
-def toggle_inventory_visit(db: Session, merchant_id: int, point_code: str, y: int, m: int, day: int):
+def toggle_inventory_visit(
+    db: Session,
+    merchant_id: int,
+    point_code: str,
+    y: int,
+    m: int,
+    day: int,
+    *,
+    special_inventory: bool = False,
+):
     visit_date = date(y, m, day)
+    if SLOT_FULL_INVENT not in allowed_visit_slots(
+        visit_date, special_inventory=special_inventory
+    ):
+        raise ValueError("Full inventory is not allowed for this date")
     existing = db.execute(
         text(
             """
@@ -610,6 +648,39 @@ def get_points_for_month(db: Session, merchant_id: int, y: int, m: int) -> list[
     ensure_point_adjustments_table(db)
     start = month_start(y, m)
     end = month_end_exclusive(y, m)
+    if normalized_adjustments_available(db):
+        rows = db.execute(text("""
+            SELECT DISTINCT point_code
+            FROM (
+                SELECT point_code
+                FROM visits
+                WHERE merchant_id=:merchant_id
+                  AND visit_date >= :start_date
+                  AND visit_date < :end_date
+
+                UNION
+
+                SELECT point_code
+                FROM point_notes
+                WHERE merchant_id=:merchant_id
+                  AND month_key=:month_key
+
+                UNION
+
+                SELECT point_code
+                FROM point_reimbursements
+                WHERE merchant_id=:merchant_id
+                  AND month_key=:month_key
+            ) points
+            ORDER BY point_code
+        """), {
+            "merchant_id": merchant_id,
+            "start_date": start,
+            "end_date": end,
+            "month_key": start,
+        }).all()
+        return [r[0] for r in rows if r and r[0]]
+
     rows = db.execute(text("""
         SELECT DISTINCT point_code
         FROM (
@@ -643,6 +714,15 @@ def get_points_for_month(db: Session, merchant_id: int, y: int, m: int) -> list[
     return [r[0] for r in rows if r and r[0]]
 
 
+def normalized_adjustments_available(db: Session) -> bool:
+    """Check the optional migrated storage without creating any table."""
+    try:
+        db_inspector = inspect(db.get_bind())
+        return all(db_inspector.has_table(name) for name in NORMALIZED_ADJUSTMENT_TABLES)
+    except Exception:
+        return False
+
+
 def ensure_point_adjustments_table(db: Session):
     db.execute(text("""
         CREATE TABLE IF NOT EXISTS point_adjustments (
@@ -666,6 +746,80 @@ def ensure_point_adjustments_table(db: Session):
 def get_point_adjustment(db: Session, merchant_id: int, point_code: str, y: int, m: int):
     ensure_point_adjustments_table(db)
     mk = month_start(y, m)
+    if normalized_adjustments_available(db):
+        notes = db.execute(
+            text(
+                """
+                SELECT amount, comment
+                FROM point_notes
+                WHERE merchant_id = :merchant_id
+                  AND point_code = :point_code
+                  AND month_key = :month_key
+                ORDER BY created_at, id
+                """
+            ),
+            {
+                "merchant_id": merchant_id,
+                "point_code": point_code,
+                "month_key": mk,
+            },
+        ).mappings().all()
+        reimbursements = db.execute(
+            text(
+                """
+                SELECT id, amount, comment
+                FROM point_reimbursements
+                WHERE merchant_id = :merchant_id
+                  AND point_code = :point_code
+                  AND month_key = :month_key
+                ORDER BY created_at, id
+                """
+            ),
+            {
+                "merchant_id": merchant_id,
+                "point_code": point_code,
+                "month_key": mk,
+            },
+        ).mappings().all()
+        receipt_rows = db.execute(
+            text(
+                """
+                SELECT rr.legacy_path
+                FROM reimbursement_receipts rr
+                JOIN point_reimbursements pr ON pr.id = rr.reimbursement_id
+                WHERE pr.merchant_id = :merchant_id
+                  AND pr.point_code = :point_code
+                  AND pr.month_key = :month_key
+                ORDER BY rr.created_at, rr.id
+                """
+            ),
+            {
+                "merchant_id": merchant_id,
+                "point_code": point_code,
+                "month_key": mk,
+            },
+        ).all()
+        if not notes and not reimbursements and not receipt_rows:
+            return None
+        return {
+            "merchant_id": merchant_id,
+            "point_code": point_code,
+            "month_key": mk,
+            "note_amount": sum(int(row["amount"]) for row in notes),
+            "note_comment": "\n".join(
+                f"{int(row['amount'])} ₽ — {row['comment']}" for row in notes
+            ),
+            "reimb_amount": sum(int(row["amount"]) for row in reimbursements),
+            "reimb_comment": "\n".join(
+                f"{int(row['amount'])} ₽ — {row['comment']}"
+                for row in reimbursements
+            ),
+            "reimb_receipt": "|".join(
+                str(row[0]) for row in receipt_rows if row and row[0]
+            )
+            or None,
+        }
+
     row = db.execute(text("""
         SELECT *
         FROM point_adjustments
@@ -758,7 +912,7 @@ def compute_point_total(db: Session, merchant_id: int, point_code: str, y: int, 
     sum_inventory = 0
 
     for day, slots in visits.items():
-        for work_slot in slots.intersection(VISIT_SLOTS):
+        for work_slot in slots.intersection(REGULAR_PAY_SLOTS):
             cnt_day_total += 1
             boxes = boxes_map.get(day, 0)
             if effective_has_supply(boxes, rates["pay_lt5"]):
@@ -770,7 +924,7 @@ def compute_point_total(db: Session, merchant_id: int, point_code: str, y: int, 
                 total += rates["rate_no_supply"]
                 sum_no_supply += rates["rate_no_supply"]
 
-        if SLOT_FULL_INVENT in slots:
+        if slots.intersection(INVENTORY_PAY_SLOTS):
             cnt_full_inv += 1
             total += rates["rate_inventory"]
             sum_inventory += rates["rate_inventory"]
@@ -898,8 +1052,75 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
         tu_sql = " AND m.tu = :tu"
         params["tu"] = tu
 
+    if normalized_adjustments_available(db):
+        adjustment_ctes = """
+        note_agg AS (
+            SELECT merchant_id, point_code, month_key,
+                   SUM(amount) AS note_amount,
+                   STRING_AGG(
+                       CAST(amount AS TEXT) || ' ₽ — ' || comment,
+                       CHR(10) ORDER BY created_at, id
+                   ) AS note_comment
+            FROM point_notes
+            GROUP BY merchant_id, point_code, month_key
+        ),
+        reimb_agg AS (
+            SELECT merchant_id, point_code, month_key,
+                   SUM(amount) AS reimb_amount,
+                   STRING_AGG(
+                       CAST(amount AS TEXT) || ' ₽ — ' || comment,
+                       CHR(10) ORDER BY created_at, id
+                   ) AS reimb_comment
+            FROM point_reimbursements
+            GROUP BY merchant_id, point_code, month_key
+        ),
+        receipt_agg AS (
+            SELECT pr.merchant_id, pr.point_code, pr.month_key,
+                   STRING_AGG(rr.legacy_path, '|' ORDER BY rr.created_at, rr.id) AS reimb_receipt
+            FROM point_reimbursements pr
+            JOIN reimbursement_receipts rr ON rr.reimbursement_id = pr.id
+            GROUP BY pr.merchant_id, pr.point_code, pr.month_key
+        ),
+        adjustment_keys AS (
+            SELECT merchant_id, point_code, month_key FROM point_notes
+            UNION
+            SELECT merchant_id, point_code, month_key FROM point_reimbursements
+        ),
+        adjustment_source AS (
+            SELECT k.merchant_id, k.point_code, k.month_key,
+                   COALESCE(n.note_amount, 0) AS note_amount,
+                   COALESCE(n.note_comment, '') AS note_comment,
+                   COALESCE(r.reimb_amount, 0) AS reimb_amount,
+                   COALESCE(r.reimb_comment, '') AS reimb_comment,
+                   x.reimb_receipt
+            FROM adjustment_keys k
+            LEFT JOIN note_agg n
+              ON n.merchant_id = k.merchant_id
+             AND n.point_code = k.point_code
+             AND n.month_key = k.month_key
+            LEFT JOIN reimb_agg r
+              ON r.merchant_id = k.merchant_id
+             AND r.point_code = k.point_code
+             AND r.month_key = k.month_key
+            LEFT JOIN receipt_agg x
+              ON x.merchant_id = k.merchant_id
+             AND x.point_code = k.point_code
+             AND x.month_key = k.month_key
+        )
+        """
+    else:
+        adjustment_ctes = """
+        adjustment_source AS (
+            SELECT merchant_id, point_code, month_key,
+                   note_amount, note_comment,
+                   reimb_amount, reimb_comment, reimb_receipt
+            FROM point_adjustments
+        )
+        """
+
     sql = f"""
-        WITH base_points AS (
+        WITH {adjustment_ctes},
+        base_points AS (
             SELECT DISTINCT merchant_id, point_code
             FROM visits
             WHERE visit_date >= :start_date
@@ -908,7 +1129,7 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
             UNION
 
             SELECT DISTINCT merchant_id, point_code
-            FROM point_adjustments
+            FROM adjustment_source
             WHERE month_key = :month_key
               AND (
                     COALESCE(note_amount, 0) <> 0
@@ -918,35 +1139,43 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
                  OR COALESCE(TRIM(reimb_receipt), '') <> ''
               )
         ),
+        visit_by_day AS (
+            SELECT
+                merchant_id,
+                point_code,
+                visit_date,
+                SUM(CASE WHEN slot IN (:slot_day, :slot_morning) THEN 1 ELSE 0 END) AS cnt_regular,
+                MAX(CASE WHEN slot IN (:slot_evening, :slot_full_invent) THEN 1 ELSE 0 END) AS cnt_full_inv
+            FROM visits
+            WHERE visit_date >= :start_date
+              AND visit_date < :end_date
+            GROUP BY merchant_id, point_code, visit_date
+        ),
         visit_agg AS (
             SELECT
                 v.merchant_id,
                 v.point_code,
                 SUM(CASE
-                    WHEN v.slot IN (:slot_day, :slot_morning, :slot_evening)
-                     AND COALESCE(s.boxes, 0) > 0
+                    WHEN COALESCE(s.boxes, 0) > 0
                      AND (COALESCE(pr.pay_lt5, FALSE) = TRUE OR COALESCE(s.boxes, 0) >= 5)
-                    THEN 1 ELSE 0 END) AS cnt_supply,
+                    THEN v.cnt_regular ELSE 0 END) AS cnt_supply,
 
                 SUM(CASE
-                    WHEN v.slot IN (:slot_day, :slot_morning, :slot_evening)
-                     AND NOT (
+                    WHEN NOT (
                         COALESCE(s.boxes, 0) > 0
                         AND (COALESCE(pr.pay_lt5, FALSE) = TRUE OR COALESCE(s.boxes, 0) >= 5)
                      )
-                    THEN 1 ELSE 0 END) AS cnt_no_supply,
+                    THEN v.cnt_regular ELSE 0 END) AS cnt_no_supply,
 
-                SUM(CASE WHEN v.slot = :slot_full_invent THEN 1 ELSE 0 END) AS cnt_full_inv,
-                SUM(CASE WHEN v.slot IN (:slot_day, :slot_morning, :slot_evening) THEN 1 ELSE 0 END) AS cnt_day_total
-            FROM visits v
+                SUM(v.cnt_full_inv) AS cnt_full_inv,
+                SUM(v.cnt_regular) AS cnt_day_total
+            FROM visit_by_day v
             LEFT JOIN supplies s
               ON s.point_code = v.point_code
              AND s.supply_date = v.visit_date
             LEFT JOIN point_rates pr
               ON pr.point_code = v.point_code
              AND pr.month_key = :month_key
-            WHERE v.visit_date >= :start_date
-              AND v.visit_date < :end_date
             GROUP BY v.merchant_id, v.point_code
         ),
         overlap_rows AS (
@@ -997,7 +1226,7 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
         LEFT JOIN point_rates pr
           ON pr.point_code = bp.point_code
          AND pr.month_key = :month_key
-        LEFT JOIN point_adjustments pa
+        LEFT JOIN adjustment_source pa
           ON pa.merchant_id = bp.merchant_id
          AND pa.point_code = bp.point_code
          AND pa.month_key = :month_key

@@ -65,8 +65,11 @@ from app.services import (
     filter_unadjusted_supply_days,
     get_point_rates,
     effective_has_supply,
+    allowed_visit_slots,
+    SLOT_DAY,
     SLOT_MORNING,
     SLOT_EVENING,
+    SLOT_FULL_INVENT,
     normalize_visit_slot,
 )
 from app.production_calendar import (
@@ -1459,13 +1462,9 @@ def build_calendar_html(
         badges = ""
         if effective_has_supply(boxes, pay_lt5):
             badges += '<span class="badge badge-supply">П</span>'
-        if "DAY" in day_visits:
+        if day_visits.intersection({"DAY", "MORNING"}):
             badges += '<span class="badge badge-day">В</span>'
-        if "MORNING" in day_visits:
-            badges += '<span class="badge badge-day">У</span>'
-        if "EVENING" in day_visits:
-            badges += '<span class="badge badge-day">Вч</span>'
-        if "FULL_INVENT" in day_visits:
+        if day_visits.intersection({"EVENING", "FULL_INVENT"}):
             badges += '<span class="badge badge-inv">И</span>'
 
         current_date = date(y, m, day)
@@ -1661,8 +1660,8 @@ def calendar_page(
             </div>
 
             <div class="calendar-note">
-                Нажмите на день и выберите утренний или вечерний выход.
-                В пятницу, субботу и специальные даты также доступен полный инвент.
+                В обычные дни отмечается один выход. В пятницу и субботу можно отдельно
+                отметить утренний выход и вечерний полный инвент.
             </div>
 
             <div class="calendar-note">
@@ -2242,6 +2241,9 @@ def monthly_submit_page(
     merchant = get_merchant_by_fio(db, fio)
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
+    session = read_merchant_session(request.cookies.get(MERCHANT_COOKIE))
+    if not session:
+        return RedirectResponse(url="/login-page", status_code=303)
 
     overall = compute_overall_total(db, merchant["id"], y, m)
     monthly_submitted = overall["submission_status"] == "submitted"
@@ -2358,7 +2360,20 @@ async def submit_monthly_submission_route(
     if not merchant:
         return RedirectResponse(url="/login-page", status_code=303)
 
-    submit_monthly_submission(db, merchant["id"], period["year"], period["month"])
+    try:
+        submit_monthly_submission(db, merchant["id"], period["year"], period["month"])
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "monthly_submission_failed merchant_id=%s year=%s month=%s",
+            merchant["id"],
+            period["year"],
+            period["month"],
+        )
+        return HTMLResponse(
+            "Не удалось отправить сверку. Данные не изменены; попробуйте ещё раз.",
+            status_code=503,
+        )
 
     return RedirectResponse(
         url=f"/monthly-submit-page?fio={escape(fio)}&submitted=1",
@@ -2420,14 +2435,73 @@ def day_action_page(
     day_visits = visits.get(day, set())
 
     current_date = date(y, m, day)
-    inventory_allowed = is_inventory_allowed_date(db, current_date)
+    special_inventory = current_date in set(get_special_inventory_days(db))
+    allowed_slots = allowed_visit_slots(
+        current_date, special_inventory=special_inventory
+    )
     session = read_merchant_session(request.cookies.get(MERCHANT_COOKIE))
     if not session:
         return RedirectResponse(url="/login-page", status_code=303)
 
-    morning_btn_text = "Убрать утренний выход" if "MORNING" in day_visits else "Добавить утренний выход"
-    evening_btn_text = "Убрать вечерний выход" if "EVENING" in day_visits else "Добавить вечерний выход"
-    inv_btn_text = "Убрать полный инвент" if "FULL_INVENT" in day_visits else "Добавить полный инвент"
+    action_forms = []
+
+    def visit_form(slot: str, button_text: str, *, inventory: bool = False) -> str:
+        action = "/toggle-inventory" if inventory else "/toggle-day"
+        slot_input = "" if inventory else f'<input type="hidden" name="slot" value="{slot}" />'
+        button_class = "btn btn-secondary btn-small" if inventory else "btn btn-small"
+        return f"""
+            <form method="post" action="{action}">
+                <input type="hidden" name="fio" value="{escape(fio)}" />
+                <input type="hidden" name="point_code" value="{escape(point_code)}" />
+                <input type="hidden" name="day" value="{day}" />
+                {slot_input}
+                <input type="hidden" name="csrf_token" value="{escape(session["csrf"])}" />
+                <button class="{button_class}" type="submit">{button_text}</button>
+            </form>
+        """
+
+    if SLOT_DAY in allowed_slots:
+        action_forms.append(
+            visit_form(
+                SLOT_DAY,
+                "Убрать выход" if SLOT_DAY in day_visits else "Добавить выход",
+            )
+        )
+    if SLOT_MORNING in allowed_slots:
+        action_forms.append(
+            visit_form(
+                SLOT_MORNING,
+                "Убрать утренний выход"
+                if SLOT_MORNING in day_visits
+                else "Добавить утренний выход",
+            )
+        )
+    if SLOT_EVENING in allowed_slots:
+        action_forms.append(
+            visit_form(
+                SLOT_EVENING,
+                "Убрать вечерний полный инвент"
+                if SLOT_EVENING in day_visits
+                else "Добавить вечерний полный инвент",
+            )
+        )
+    if SLOT_FULL_INVENT in allowed_slots:
+        action_forms.append(
+            visit_form(
+                SLOT_FULL_INVENT,
+                "Убрать полный инвент"
+                if SLOT_FULL_INVENT in day_visits
+                else "Добавить полный инвент",
+                inventory=True,
+            )
+        )
+    if SLOT_DAY in day_visits and SLOT_DAY not in allowed_slots:
+        action_forms.append(
+            visit_form(SLOT_DAY, "Убрать ранее отмеченный выход")
+        )
+
+    action_title = "Выбор действия" if len(action_forms) > 1 else "Отметить выход"
+    action_forms_html = "".join(action_forms)
 
     return f"""
 <!DOCTYPE html>
@@ -2442,44 +2516,13 @@ def day_action_page(
     <div class="page">
         <div class="card">
             <div class="brand">ВкусВилл</div>
-            <h1>Выбор действия</h1>
+            <h1>{action_title}</h1>
             <div class="subtitle">
                 Точка: {escape(point_code)}<br>
                 Дата: {day:02d}.{m:02d}.{y}
             </div>
 
-            <form method="post" action="/toggle-day">
-                <input type="hidden" name="fio" value="{escape(fio)}" />
-                <input type="hidden" name="point_code" value="{escape(point_code)}" />
-                <input type="hidden" name="day" value="{day}" />
-                <input type="hidden" name="slot" value="MORNING" />
-                <input type="hidden" name="csrf_token" value="{escape(session["csrf"])}" />
-                <button class="btn btn-small" type="submit">{morning_btn_text}</button>
-            </form>
-            <form method="post" action="/toggle-day">
-                <input type="hidden" name="fio" value="{escape(fio)}" />
-                <input type="hidden" name="point_code" value="{escape(point_code)}" />
-                <input type="hidden" name="day" value="{day}" />
-                <input type="hidden" name="slot" value="EVENING" />
-                <input type="hidden" name="csrf_token" value="{escape(session["csrf"])}" />
-                <button class="btn btn-small" type="submit">{evening_btn_text}</button>
-            </form>
-            {f'''<form method="post" action="/toggle-day">
-                <input type="hidden" name="fio" value="{escape(fio)}" />
-                <input type="hidden" name="point_code" value="{escape(point_code)}" />
-                <input type="hidden" name="day" value="{day}" />
-                <input type="hidden" name="slot" value="DAY" />
-                <input type="hidden" name="csrf_token" value="{escape(session["csrf"])}" />
-                <button class="btn btn-secondary btn-small" type="submit">Убрать старый выход без слота</button>
-            </form>''' if "DAY" in day_visits else ''}
-
-            {f'''<form method="post" action="/toggle-inventory">
-                <input type="hidden" name="fio" value="{escape(fio)}" />
-                <input type="hidden" name="point_code" value="{escape(point_code)}" />
-                <input type="hidden" name="day" value="{day}" />
-                <input type="hidden" name="csrf_token" value="{escape(session["csrf"])}" />
-                <button class="btn btn-secondary btn-small" type="submit">{inv_btn_text}</button>
-            </form>''' if inventory_allowed else ''}
+            {action_forms_html}
 
             <a class="back" href="/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}">← Назад к календарю</a>
         </div>
@@ -2524,17 +2567,41 @@ def toggle_day_post(
         return RedirectResponse(url="/login-page", status_code=303)
     if compute_overall_total(db, merchant["id"], period["year"], period["month"])["submission_status"] == "submitted":
         raise HTTPException(status_code=409, detail="Reconciliation is submitted")
-    if str(slot).upper() == "DAY":
-        existing = get_visits_for_month(
-            db, merchant["id"], point_code, period["year"], period["month"]
-        ).get(day, set())
-        if "DAY" not in existing:
-            raise HTTPException(status_code=422, detail="Legacy DAY may only be removed")
-        normalized_slot = "DAY"
-    else:
-        normalized_slot = normalize_visit_slot(slot, allow_legacy_day=False)
-    if 1 <= day <= days_in_month(period["year"], period["month"]):
+    if not 1 <= day <= days_in_month(period["year"], period["month"]):
+        db.rollback()
+        return HTMLResponse("Некорректная дата выхода.", status_code=400)
+
+    current_date = date(period["year"], period["month"], day)
+    try:
+        normalized_slot = normalize_visit_slot(slot)
+    except ValueError:
+        db.rollback()
+        return HTMLResponse("Неизвестный тип выхода.", status_code=400)
+
+    allowed_slots = allowed_visit_slots(current_date)
+    existing = get_visits_for_month(
+        db, merchant["id"], point_code, period["year"], period["month"]
+    ).get(day, set())
+    removing_legacy_day = (
+        normalized_slot == SLOT_DAY
+        and SLOT_DAY in existing
+        and SLOT_DAY not in allowed_slots
+    )
+    if normalized_slot not in allowed_slots and not removing_legacy_day:
+        db.rollback()
+        return HTMLResponse(
+            "Для этой даты выбранный тип выхода недоступен. Вернитесь в календарь.",
+            status_code=409,
+        )
+
+    try:
         toggle_day_visit(db, merchant["id"], point_code, period["year"], period["month"], day, normalized_slot)
+    except ValueError:
+        db.rollback()
+        return HTMLResponse(
+            "Для этой даты выбранный тип выхода недоступен. Вернитесь в календарь.",
+            status_code=409,
+        )
     return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}", status_code=303)
 
 
@@ -2569,10 +2636,36 @@ def toggle_inventory_post(
         return RedirectResponse(url="/login-page", status_code=303)
     if compute_overall_total(db, merchant["id"], period["year"], period["month"])["submission_status"] == "submitted":
         raise HTTPException(status_code=409, detail="Reconciliation is submitted")
-    if 1 <= day <= days_in_month(period["year"], period["month"]):
-        current_date = date(period["year"], period["month"], day)
-        if is_inventory_allowed_date(db, current_date):
-            toggle_inventory_visit(db, merchant["id"], point_code, period["year"], period["month"], day)
+    if not 1 <= day <= days_in_month(period["year"], period["month"]):
+        db.rollback()
+        return HTMLResponse("Некорректная дата полного инвента.", status_code=400)
+
+    current_date = date(period["year"], period["month"], day)
+    special_inventory = current_date in set(get_special_inventory_days(db))
+    if SLOT_FULL_INVENT not in allowed_visit_slots(
+        current_date, special_inventory=special_inventory
+    ):
+        db.rollback()
+        return HTMLResponse(
+            "Полный инвент недоступен для этой даты. Вернитесь в календарь.",
+            status_code=409,
+        )
+    try:
+        toggle_inventory_visit(
+            db,
+            merchant["id"],
+            point_code,
+            period["year"],
+            period["month"],
+            day,
+            special_inventory=special_inventory,
+        )
+    except ValueError:
+        db.rollback()
+        return HTMLResponse(
+            "Полный инвент недоступен для этой даты. Вернитесь в календарь.",
+            status_code=409,
+        )
     return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}", status_code=303)
 
 
