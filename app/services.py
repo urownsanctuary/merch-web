@@ -39,6 +39,10 @@ DEFAULT_RATE_INVENTORY = 400
 DEFAULT_RATE_COFFEE = 100
 
 
+class InventoryWeekLimitError(ValueError):
+    """Raised when a point already has a full inventory in the same ISO week."""
+
+
 def fio_norm(s: str) -> str:
     s = (s or "").strip().lower()
     s = s.replace("ё", "е")
@@ -375,6 +379,47 @@ def allowed_visit_slots(visit_date: date, *, special_inventory: bool = False) ->
     return frozenset(slots)
 
 
+def inventory_exists_in_iso_week(
+    db: Session,
+    merchant_id: int,
+    point_code: str,
+    visit_date: date,
+) -> bool:
+    week_start = visit_date - timedelta(days=visit_date.isoweekday() - 1)
+    week_end = week_start + timedelta(days=7)
+    if getattr(db.get_bind().dialect, "name", "") == "postgresql":
+        db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+            {
+                "lock_key": (
+                    f"full-inventory:{merchant_id}:{point_code}:{week_start.isoformat()}"
+                )
+            },
+        )
+    return db.execute(
+        text(
+            """
+            SELECT 1
+            FROM visits
+            WHERE merchant_id = :merchant_id
+              AND point_code = :point_code
+              AND visit_date >= :week_start
+              AND visit_date < :week_end
+              AND slot IN (:slot_evening, :slot_full_invent)
+            LIMIT 1
+            """
+        ),
+        {
+            "merchant_id": merchant_id,
+            "point_code": point_code,
+            "week_start": week_start,
+            "week_end": week_end,
+            "slot_evening": SLOT_EVENING,
+            "slot_full_invent": SLOT_FULL_INVENT,
+        },
+    ).first() is not None
+
+
 def toggle_day_visit(
     db: Session,
     merchant_id: int,
@@ -413,6 +458,12 @@ def toggle_day_visit(
 
     if slot not in allowed_visit_slots(visit_date):
         raise ValueError("Visit slot is not allowed for this date")
+    if slot == SLOT_EVENING and inventory_exists_in_iso_week(
+        db, merchant_id, point_code, visit_date
+    ):
+        raise InventoryWeekLimitError(
+            "Only one full inventory is allowed per merchant, point, and ISO week"
+        )
 
     db.execute(
         text(
@@ -472,6 +523,11 @@ def toggle_inventory_visit(
         db.execute(text("DELETE FROM visits WHERE id = :id"), {"id": existing})
         db.commit()
         return "removed"
+
+    if inventory_exists_in_iso_week(db, merchant_id, point_code, visit_date):
+        raise InventoryWeekLimitError(
+            "Only one full inventory is allowed per merchant, point, and ISO week"
+        )
 
     db.execute(
         text(
@@ -1242,6 +1298,11 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
     """
 
     rows = db.execute(text(sql), params).mappings().all()
+    valid_overlap_keys: set[tuple[int, str]] = set()
+    for overlap in _valid_intersection_candidates(db, y, m, tu):
+        point_code = str(overlap["point_code"])
+        valid_overlap_keys.add((int(overlap["merchant_id1"]), point_code))
+        valid_overlap_keys.add((int(overlap["merchant_id2"]), point_code))
     result = []
     for row in rows:
         status_value = row["status"] or "не отправлено"
@@ -1293,7 +1354,9 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
             "coffee_cnt": coffee_cnt,
             "coffee_rate": coffee_rate,
             "coffee_sum": coffee_sum,
-            "has_overlap": bool(row["has_overlap"]),
+            "has_overlap": (
+                int(row["merchant_id"]), str(row["point_code"])
+            ) in valid_overlap_keys,
             "point_total": point_total,
         })
     return result
@@ -1324,11 +1387,15 @@ def get_admin_payroll_rows(db: Session, y: int, m: int, tu: str | None = None, s
     return result
 
 
-def get_intersections_rows(db: Session, y: int, m: int, tu: str | None = None):
+def _valid_intersection_candidates(
+    db: Session, y: int, m: int, tu: str | None = None
+) -> list[dict]:
     start = month_start(y, m)
     end = month_end_exclusive(y, m)
     sql = """
-        SELECT v1.visit_date, v1.point_code,
+        SELECT v1.merchant_id AS merchant_id1,
+               v2.merchant_id AS merchant_id2,
+               v1.visit_date, v1.point_code,
                m1.fio AS fio1, m1.tu AS tu1,
                m2.fio AS fio2, m2.tu AS tu2,
                v1.slot AS slot1, v2.slot AS slot2
@@ -1350,6 +1417,69 @@ def get_intersections_rows(db: Session, y: int, m: int, tu: str | None = None):
         params["tu"] = tu
     sql += " ORDER BY v1.visit_date, v1.point_code, v1.slot, m1.fio, m2.fio"
     rows = db.execute(text(sql), params).mappings().all()
+    adjustment_cache: dict[tuple[int, str], dict] = {}
+    result = []
+    for raw_row in rows:
+        row = dict(raw_row)
+        visit_date = row["visit_date"]
+        if isinstance(visit_date, str):
+            visit_date = date.fromisoformat(visit_date)
+        marker = no_supply_adjustment_marker(visit_date)
+        suppressed = False
+        for merchant_id in (row["merchant_id1"], row["merchant_id2"]):
+            key = (int(merchant_id), str(row["point_code"]))
+            if key not in adjustment_cache:
+                if normalized_adjustments_available(db):
+                    note_rows = db.execute(
+                        text(
+                            """
+                            SELECT comment
+                            FROM point_notes
+                            WHERE merchant_id = :merchant_id
+                              AND point_code = :point_code
+                              AND month_key = :month_key
+                            """
+                        ),
+                        {
+                            "merchant_id": key[0],
+                            "point_code": key[1],
+                            "month_key": start,
+                        },
+                    ).all()
+                    adjustment_cache[key] = {
+                        "note_comment": "\n".join(
+                            str(note[0] or "") for note in note_rows
+                        )
+                    }
+                else:
+                    adjustment = db.execute(
+                        text(
+                            """
+                            SELECT note_comment
+                            FROM point_adjustments
+                            WHERE merchant_id = :merchant_id
+                              AND point_code = :point_code
+                              AND month_key = :month_key
+                            LIMIT 1
+                            """
+                        ),
+                        {
+                            "merchant_id": key[0],
+                            "point_code": key[1],
+                            "month_key": start,
+                        },
+                    ).mappings().first()
+                    adjustment_cache[key] = dict(adjustment) if adjustment else {}
+            if marker in str(adjustment_cache[key].get("note_comment") or ""):
+                suppressed = True
+                break
+        if not suppressed:
+            result.append(row)
+    return result
+
+
+def get_intersections_rows(db: Session, y: int, m: int, tu: str | None = None):
+    rows = _valid_intersection_candidates(db, y, m, tu)
     return [{
         "visit_date": str(r["visit_date"]),
         "point_code": r["point_code"],

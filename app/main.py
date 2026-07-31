@@ -66,6 +66,7 @@ from app.services import (
     get_point_rates,
     effective_has_supply,
     allowed_visit_slots,
+    InventoryWeekLimitError,
     SLOT_DAY,
     SLOT_MORNING,
     SLOT_EVENING,
@@ -2436,6 +2437,8 @@ def day_action_page(
 
     current_date = date(y, m, day)
     special_inventory = current_date in set(get_special_inventory_days(db))
+    calendar_overrides = get_calendar_overrides(db, y, m)
+    non_working_day = is_calendar_red_day(current_date, calendar_overrides)
     allowed_slots = allowed_visit_slots(
         current_date, special_inventory=special_inventory
     )
@@ -2449,6 +2452,15 @@ def day_action_page(
         action = "/toggle-inventory" if inventory else "/toggle-day"
         slot_input = "" if inventory else f'<input type="hidden" name="slot" value="{slot}" />'
         button_class = "btn btn-secondary btn-small" if inventory else "btn btn-small"
+        adding = slot not in day_visits
+        confirmation = ""
+        if non_working_day and adding:
+            confirmation = """
+                <label style="display:block;margin:12px 0;">
+                    <input type="checkbox" name="confirm_non_working" value="1" required />
+                    Подтверждаю выход в официальный производственный выходной или праздник.
+                </label>
+            """
         return f"""
             <form method="post" action="{action}">
                 <input type="hidden" name="fio" value="{escape(fio)}" />
@@ -2456,6 +2468,7 @@ def day_action_page(
                 <input type="hidden" name="day" value="{day}" />
                 {slot_input}
                 <input type="hidden" name="csrf_token" value="{escape(session["csrf"])}" />
+                {confirmation}
                 <button class="{button_class}" type="submit">{button_text}</button>
             </form>
         """
@@ -2553,6 +2566,7 @@ def toggle_day_post(
     day: int = Form(...),
     slot: str = Form(...),
     csrf_token: str = Form(...),
+    confirm_non_working: str = Form(""),
     db: Session = Depends(get_db),
 ):
     session = read_merchant_session(request.cookies.get(MERCHANT_COOKIE))
@@ -2593,9 +2607,28 @@ def toggle_day_post(
             "Для этой даты выбранный тип выхода недоступен. Вернитесь в календарь.",
             status_code=409,
         )
+    if (
+        normalized_slot not in existing
+        and is_calendar_red_day(
+            current_date,
+            get_calendar_overrides(db, period["year"], period["month"]),
+        )
+        and confirm_non_working != "1"
+    ):
+        db.rollback()
+        return HTMLResponse(
+            "Подтвердите выход в официальный производственный выходной или праздник.",
+            status_code=409,
+        )
 
     try:
         toggle_day_visit(db, merchant["id"], point_code, period["year"], period["month"], day, normalized_slot)
+    except InventoryWeekLimitError:
+        db.rollback()
+        return HTMLResponse(
+            "На одной точке разрешён только один полный инвент на мерчендайзера в одну ISO-неделю.",
+            status_code=409,
+        )
     except ValueError:
         db.rollback()
         return HTMLResponse(
@@ -2625,6 +2658,7 @@ def toggle_inventory_post(
     point_code: str = Form(...),
     day: int = Form(...),
     csrf_token: str = Form(...),
+    confirm_non_working: str = Form(""),
     db: Session = Depends(get_db),
 ):
     session = read_merchant_session(request.cookies.get(MERCHANT_COOKIE))
@@ -2650,6 +2684,22 @@ def toggle_inventory_post(
             "Полный инвент недоступен для этой даты. Вернитесь в календарь.",
             status_code=409,
         )
+    existing = get_visits_for_month(
+        db, merchant["id"], point_code, period["year"], period["month"]
+    ).get(day, set())
+    if (
+        SLOT_FULL_INVENT not in existing
+        and is_calendar_red_day(
+            current_date,
+            get_calendar_overrides(db, period["year"], period["month"]),
+        )
+        and confirm_non_working != "1"
+    ):
+        db.rollback()
+        return HTMLResponse(
+            "Подтвердите выход в официальный производственный выходной или праздник.",
+            status_code=409,
+        )
     try:
         toggle_inventory_visit(
             db,
@@ -2659,6 +2709,12 @@ def toggle_inventory_post(
             period["month"],
             day,
             special_inventory=special_inventory,
+        )
+    except InventoryWeekLimitError:
+        db.rollback()
+        return HTMLResponse(
+            "На одной точке разрешён только один полный инвент на мерчендайзера в одну ISO-неделю.",
+            status_code=409,
         )
     except ValueError:
         db.rollback()
