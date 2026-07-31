@@ -201,6 +201,12 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Anonymized legacy-migration snapshots and atomic temporary files
+legacy-snapshots/
+legacy-migration-snapshot*.sql
+merch-web-legacy-snapshot*.sql
+.legacy-snapshot-*.tmp
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
