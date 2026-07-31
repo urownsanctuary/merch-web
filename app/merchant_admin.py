@@ -416,6 +416,87 @@ def deactivate_merchants_by_tu(
     return len(rows)
 
 
+def deactivate_all_merchants(
+    db: Session,
+    *,
+    actor: str,
+) -> int:
+    rows = db.execute(
+        text(
+            """
+            SELECT id
+            FROM merchants
+            WHERE COALESCE(is_active, TRUE) = TRUE
+            ORDER BY id
+            """
+        )
+    ).all()
+    for row in rows:
+        set_merchant_active(db, int(row[0]), False, actor=actor)
+    return len(rows)
+
+
+def import_or_reactivate_merchant(
+    db: Session,
+    fio: Any,
+    last4: Any,
+    tu: Any,
+    *,
+    actor: str,
+    fio_normalizer,
+    last4_hasher,
+) -> dict[str, Any]:
+    """Match imports only by normalized FIO plus last4, preserving merchant_id."""
+    values = validate_merchant_values(
+        fio, last4, tu, fio_normalizer=fio_normalizer
+    )
+    existing_id = db.execute(
+        text(
+            """
+            SELECT id
+            FROM merchants
+            WHERE fio_norm = :fio_norm AND last4 = :last4
+            ORDER BY id
+            LIMIT 1
+            """
+        ),
+        {"fio_norm": values["fio_norm"], "last4": values["last4"]},
+    ).scalar()
+    if existing_id is None:
+        created = create_merchant(
+            db,
+            values["fio"],
+            values["last4"],
+            values["tu"],
+            actor=actor,
+            fio_normalizer=fio_normalizer,
+            last4_hasher=last4_hasher,
+            confirm_same_name=True,
+        )
+        return {**created, "created": True, "reactivated": False}
+
+    existing = get_merchant_for_admin(db, int(existing_id))
+    update_merchant(
+        db,
+        int(existing_id),
+        values["fio"],
+        values["last4"],
+        values["tu"],
+        "active",
+        actor=actor,
+        fio_normalizer=fio_normalizer,
+        last4_hasher=last4_hasher,
+        confirm_same_name=True,
+    )
+    return {
+        "id": int(existing_id),
+        **values,
+        "status": "active",
+        "created": False,
+        "reactivated": not bool(existing and existing.get("is_active")),
+    }
+
+
 def list_merchants(
     db: Session,
     *,
