@@ -13,10 +13,12 @@ os.environ.setdefault("ENVIRONMENT", "test")
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
 
 from app.main import app, build_calendar_html, get_db
 from app.security import create_merchant_session, read_merchant_session
 from app.services import (
+    InventoryWeekLimitError,
     SLOT_DAY,
     SLOT_EVENING,
     SLOT_FULL_INVENT,
@@ -24,7 +26,11 @@ from app.services import (
     allowed_visit_slots,
     compute_overall_total,
     compute_point_total,
+    get_intersections_rows,
     get_point_adjustment,
+    no_supply_adjustment_marker,
+    toggle_day_visit,
+    toggle_inventory_visit,
 )
 
 
@@ -106,6 +112,7 @@ class SlotHotfixTests(unittest.TestCase):
                 "compute_overall_total": MagicMock(return_value={"submission_status": "draft"}),
                 "get_visits_for_month": MagicMock(return_value={}),
                 "get_special_inventory_days": MagicMock(return_value=[]),
+                "get_calendar_overrides": MagicMock(return_value={}),
             }
             with patch.multiple("app.main", **common):
                 with TestClient(app) as client:
@@ -113,6 +120,7 @@ class SlotHotfixTests(unittest.TestCase):
                     wednesday = client.get(
                         "/day-action-page",
                         params={"fio": "Тестовый Мерч", "point_code": "2674", "day": 15},
+                        follow_redirects=False,
                     )
                     friday = client.get(
                         "/day-action-page",
@@ -122,14 +130,329 @@ class SlotHotfixTests(unittest.TestCase):
                         "/day-action-page",
                         params={"fio": "Тестовый Мерч", "point_code": "2674", "day": 18},
                     )
-            self.assertIn("Добавить выход", wednesday.text)
-            self.assertNotIn("утренний", wednesday.text.lower())
-            self.assertNotIn("вечерний", wednesday.text.lower())
+            self.assertEqual(wednesday.status_code, 303)
+            self.assertIn("/calendar-page", wednesday.headers["location"])
             for response in (friday, saturday):
                 self.assertIn("Добавить утренний выход", response.text)
                 self.assertIn("Добавить вечерний полный инвент", response.text)
         finally:
             app.dependency_overrides.clear()
+
+    def test_non_working_day_requires_explicit_confirmation(self):
+        db = MagicMock()
+        app.dependency_overrides[get_db] = lambda: db
+        token = create_merchant_session("Тестовый Мерч")
+        csrf = read_merchant_session(token)["csrf"]
+        toggle = MagicMock()
+        common = {
+            "get_active_period": MagicMock(return_value=FIXED_PERIOD),
+            "get_merchant_by_fio": MagicMock(return_value=MERCHANT),
+            "compute_overall_total": MagicMock(return_value={"submission_status": "draft"}),
+            "get_visits_for_month": MagicMock(return_value={}),
+            "get_special_inventory_days": MagicMock(return_value=[]),
+            "get_calendar_overrides": MagicMock(
+                return_value={date(2026, 7, 19): True}
+            ),
+            "toggle_day_visit": toggle,
+        }
+        try:
+            with patch.multiple("app.main", **common):
+                with TestClient(app) as client:
+                    client.cookies.set("merchant_session", token)
+                    page = client.get(
+                        "/day-action-page",
+                        params={
+                            "fio": "Тестовый Мерч",
+                            "point_code": "2674",
+                            "day": 19,
+                        },
+                        follow_redirects=False,
+                    )
+                    rejected = client.post(
+                        "/toggle-day",
+                        data={
+                            "fio": "Тестовый Мерч",
+                            "point_code": "2674",
+                            "day": 19,
+                            "slot": SLOT_DAY,
+                            "csrf_token": csrf,
+                        },
+                    )
+                    accepted = client.post(
+                        "/toggle-day",
+                        data={
+                            "fio": "Тестовый Мерч",
+                            "point_code": "2674",
+                            "day": 19,
+                            "slot": SLOT_DAY,
+                            "csrf_token": csrf,
+                            "confirm_non_working": "1",
+                        },
+                        follow_redirects=False,
+                    )
+            self.assertEqual(page.status_code, 303)
+            self.assertIn("/calendar-page", page.headers["location"])
+            self.assertEqual(rejected.status_code, 409)
+            self.assertIn(
+                "Это выходной или праздничный день по производственному календарю.",
+                rejected.text,
+            )
+            self.assertEqual(accepted.status_code, 303)
+            toggle.assert_called_once()
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_calendar_direct_toggle_and_choice_links(self):
+        html = build_calendar_html(
+            fio="Тестовый Мерч",
+            point_code="2674",
+            y=2026,
+            m=7,
+            boxes_map={},
+            visits={},
+            is_submitted=False,
+            special_inventory_days=set(),
+            calendar_overrides={},
+            csrf_token="csrf-value",
+        )
+        self.assertIn('class="direct-day-form"', html)
+        self.assertIn('name="day" value="1"', html)
+        self.assertIn('name="slot" value="DAY"', html)
+        self.assertIn('name="csrf_token" value="csrf-value"', html)
+        self.assertIn(
+            "/day-action-page?fio=Тестовый Мерч&point_code=2674&day=3",
+            html,
+        )
+        self.assertIn(
+            "/day-action-page?fio=Тестовый Мерч&point_code=2674&day=4",
+            html,
+        )
+        self.assertIn(
+            "Это выходной или праздничный день по производственному календарю. "
+            "Вы действительно работали в этот день?",
+            html,
+        )
+        submitted = build_calendar_html(
+            fio="Тестовый Мерч",
+            point_code="2674",
+            y=2026,
+            m=7,
+            boxes_map={},
+            visits={},
+            is_submitted=True,
+            special_inventory_days=set(),
+            calendar_overrides={},
+            csrf_token="csrf-value",
+        )
+        self.assertNotIn('class="direct-day-form"', submitted)
+
+    def test_ordinary_post_adds_then_removes_and_redirects_to_calendar(self):
+        engine = create_engine(
+            "sqlite+pysqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE TABLE visits (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "merchant_id INTEGER NOT NULL, point_code TEXT NOT NULL, "
+                "visit_date DATE NOT NULL, slot TEXT NOT NULL, "
+                "UNIQUE (merchant_id, point_code, visit_date, slot))"
+            )
+        db = Session(engine)
+        app.dependency_overrides[get_db] = lambda: db
+        token = create_merchant_session("Тестовый Мерч")
+        csrf = read_merchant_session(token)["csrf"]
+        try:
+            with patch.multiple(
+                "app.main",
+                get_active_period=MagicMock(return_value=FIXED_PERIOD),
+                get_merchant_by_fio=MagicMock(return_value=MERCHANT),
+                compute_overall_total=MagicMock(
+                    return_value={"submission_status": "draft"}
+                ),
+                get_visits_for_month=MagicMock(
+                    side_effect=[{}, {1: {SLOT_DAY}}]
+                ),
+                get_calendar_overrides=MagicMock(return_value={}),
+            ):
+                with TestClient(app) as client:
+                    client.cookies.set("merchant_session", token)
+                    payload = {
+                        "fio": "Тестовый Мерч",
+                        "point_code": "2674",
+                        "day": "1",
+                        "slot": SLOT_DAY,
+                        "csrf_token": csrf,
+                    }
+                    added = client.post(
+                        "/toggle-day", data=payload, follow_redirects=False
+                    )
+                    count_after_add = db.execute(
+                        text("SELECT COUNT(*) FROM visits")
+                    ).scalar_one()
+                    removed = client.post(
+                        "/toggle-day", data=payload, follow_redirects=False
+                    )
+                    count_after_remove = db.execute(
+                        text("SELECT COUNT(*) FROM visits")
+                    ).scalar_one()
+            self.assertEqual(added.status_code, 303)
+            self.assertIn("/calendar-page", added.headers["location"])
+            self.assertEqual(count_after_add, 1)
+            self.assertEqual(removed.status_code, 303)
+            self.assertEqual(count_after_remove, 0)
+        finally:
+            db.close()
+            app.dependency_overrides.clear()
+
+    def test_database_error_rolls_back_without_http_500(self):
+        db = MagicMock()
+        app.dependency_overrides[get_db] = lambda: db
+        token = create_merchant_session("Тестовый Мерч")
+        csrf = read_merchant_session(token)["csrf"]
+        try:
+            with patch.multiple(
+                "app.main",
+                get_active_period=MagicMock(return_value=FIXED_PERIOD),
+                get_merchant_by_fio=MagicMock(return_value=MERCHANT),
+                compute_overall_total=MagicMock(
+                    return_value={"submission_status": "draft"}
+                ),
+                get_visits_for_month=MagicMock(return_value={}),
+                get_calendar_overrides=MagicMock(return_value={}),
+                toggle_day_visit=MagicMock(
+                    side_effect=RuntimeError("database unavailable")
+                ),
+            ):
+                with TestClient(app) as client:
+                    client.cookies.set("merchant_session", token)
+                    response = client.post(
+                        "/toggle-day",
+                        data={
+                            "fio": "Тестовый Мерч",
+                            "point_code": "2674",
+                            "day": "1",
+                            "slot": SLOT_DAY,
+                            "csrf_token": csrf,
+                        },
+                    )
+            self.assertEqual(response.status_code, 503)
+            self.assertNotEqual(response.status_code, 500)
+            db.rollback.assert_called_once()
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_submitted_reconciliation_blocks_direct_calendar_toggle(self):
+        db = MagicMock()
+        app.dependency_overrides[get_db] = lambda: db
+        token = create_merchant_session("Тестовый Мерч")
+        csrf = read_merchant_session(token)["csrf"]
+        toggle = MagicMock()
+        try:
+            with patch.multiple(
+                "app.main",
+                get_active_period=MagicMock(return_value=FIXED_PERIOD),
+                get_merchant_by_fio=MagicMock(return_value=MERCHANT),
+                compute_overall_total=MagicMock(
+                    return_value={"submission_status": "submitted"}
+                ),
+                toggle_day_visit=toggle,
+            ):
+                with TestClient(app) as client:
+                    client.cookies.set("merchant_session", token)
+                    response = client.post(
+                        "/toggle-day",
+                        data={
+                            "fio": "Тестовый Мерч",
+                            "point_code": "2674",
+                            "day": "1",
+                            "slot": SLOT_DAY,
+                            "csrf_token": csrf,
+                        },
+                    )
+            self.assertEqual(response.status_code, 409)
+            toggle.assert_not_called()
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_only_one_full_inventory_per_point_and_iso_week(self):
+        engine = create_engine("sqlite+pysqlite:///:memory:")
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE TABLE visits (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "merchant_id INTEGER NOT NULL, point_code TEXT NOT NULL, "
+                "visit_date DATE NOT NULL, slot TEXT NOT NULL, "
+                "UNIQUE (merchant_id, point_code, visit_date, slot))"
+            )
+        with Session(engine) as db:
+            self.assertEqual(
+                toggle_day_visit(db, 1, "2674", 2026, 7, 17, SLOT_EVENING),
+                "added",
+            )
+            with self.assertRaises(InventoryWeekLimitError):
+                toggle_day_visit(db, 1, "2674", 2026, 7, 18, SLOT_EVENING)
+            db.rollback()
+            with self.assertRaises(InventoryWeekLimitError):
+                toggle_inventory_visit(
+                    db, 1, "2674", 2026, 7, 15, special_inventory=True
+                )
+            db.rollback()
+            self.assertEqual(
+                toggle_day_visit(db, 1, "2674", 2026, 7, 24, SLOT_EVENING),
+                "added",
+            )
+
+    def test_structured_no_supply_adjustment_suppresses_overlap(self):
+        engine = create_engine("sqlite+pysqlite:///:memory:")
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE TABLE merchants (id INTEGER PRIMARY KEY, fio TEXT, tu TEXT)"
+            )
+            connection.exec_driver_sql(
+                "CREATE TABLE visits (id INTEGER PRIMARY KEY, merchant_id INTEGER, "
+                "point_code TEXT, visit_date DATE, slot TEXT)"
+            )
+            connection.exec_driver_sql(
+                "CREATE TABLE point_adjustments (id INTEGER PRIMARY KEY, "
+                "merchant_id INTEGER, point_code TEXT, month_key DATE, "
+                "note_amount INTEGER DEFAULT 0, note_comment TEXT, "
+                "reimb_amount INTEGER DEFAULT 0, reimb_comment TEXT, "
+                "reimb_receipt TEXT, UNIQUE (merchant_id, point_code, month_key))"
+            )
+            connection.exec_driver_sql(
+                "CREATE TABLE point_notes (id TEXT PRIMARY KEY, merchant_id INTEGER, "
+                "point_code TEXT, month_key DATE, amount INTEGER, comment TEXT)"
+            )
+            connection.exec_driver_sql(
+                "CREATE TABLE point_reimbursements (id TEXT PRIMARY KEY, "
+                "merchant_id INTEGER, point_code TEXT, month_key DATE)"
+            )
+            connection.exec_driver_sql(
+                "CREATE TABLE reimbursement_receipts (id TEXT PRIMARY KEY, "
+                "reimbursement_id TEXT)"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO merchants VALUES (1, 'Первый', 'ТУ-1'), "
+                "(2, 'Второй', 'ТУ-2')"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO visits VALUES "
+                "(1, 1, '2674', '2026-07-17', 'MORNING'), "
+                "(2, 2, '2674', '2026-07-17', 'MORNING')"
+            )
+        with Session(engine) as db:
+            self.assertEqual(len(get_intersections_rows(db, 2026, 7)), 1)
+            db.execute(
+                text(
+                    "INSERT INTO point_notes "
+                    "(id, merchant_id, point_code, month_key, amount, comment) "
+                    "VALUES ('note-1', 1, '2674', '2026-07-01', 0, :comment)"
+                ),
+                {"comment": no_supply_adjustment_marker(date(2026, 7, 17))},
+            )
+            db.commit()
+            self.assertEqual(get_intersections_rows(db, 2026, 7), [])
 
     def test_direct_invalid_slots_roll_back_without_write(self):
         db = MagicMock()

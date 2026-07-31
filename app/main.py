@@ -66,6 +66,7 @@ from app.services import (
     get_point_rates,
     effective_has_supply,
     allowed_visit_slots,
+    InventoryWeekLimitError,
     SLOT_DAY,
     SLOT_MORNING,
     SLOT_EVENING,
@@ -154,6 +155,10 @@ ADMIN_LOGIN = os.getenv("ADMIN_LOGIN", "")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 SECRET_SALT = os.getenv("SECRET_SALT", "")
 MAX_RECEIPT_BYTES = int(os.getenv("MAX_RECEIPT_BYTES", str(5 * 1024 * 1024)))
+NON_WORKING_CONFIRM_MESSAGE = (
+    "Это выходной или праздничный день по производственному календарю. "
+    "Вы действительно работали в этот день?"
+)
 
 
 def get_db():
@@ -791,6 +796,18 @@ def base_css():
             text-decoration: none;
             color: inherit;
             cursor: pointer;
+            font: inherit;
+            text-align: left;
+        }
+
+        .direct-day-form {
+            margin: 0;
+            min-width: 0;
+        }
+
+        .direct-day-form .day {
+            width: 100%;
+            height: 100%;
         }
 
         .day:hover {
@@ -1439,7 +1456,8 @@ def build_calendar_html(
     is_submitted: bool,
     special_inventory_days: set[date],
     calendar_overrides: dict[date, bool],
-    pay_lt5: bool = False
+    pay_lt5: bool = False,
+    csrf_token: str = "",
 ) -> str:
     dim = days_in_month(y, m)
     first_wd = weekday_of(y, m, 1)
@@ -1469,20 +1487,55 @@ def build_calendar_html(
 
         current_date = date(y, m, day)
         inventory_allowed = current_date.weekday() in (4, 5) or current_date in special_inventory_days
-        href = build_day_href(fio, point_code, y, m, day, is_submitted, inventory_allowed)
+        allowed_slots = allowed_visit_slots(
+            current_date,
+            special_inventory=current_date in special_inventory_days,
+        )
+        direct_day_toggle = allowed_slots == {SLOT_DAY}
         cls_parts = ["day"]
-        if is_calendar_red_day(current_date, calendar_overrides):
+        non_working_day = is_calendar_red_day(current_date, calendar_overrides)
+        if non_working_day:
             cls_parts.append("day-red")
         if is_submitted:
             cls_parts.append("day-disabled")
         cls = " ".join(cls_parts)
 
-        html += f"""
-        <a class="{cls}" href="{href}">
+        day_content = f"""
             <div class="day-number">{day}</div>
             <div class="day-badges">{badges}</div>
-        </a>
         """
+        if direct_day_toggle and not is_submitted:
+            adding_day = SLOT_DAY not in day_visits
+            confirmation_input = (
+                '<input type="hidden" name="confirm_non_working" value="1" />'
+                if non_working_day and adding_day
+                else ""
+            )
+            confirmation_attr = (
+                f' data-confirm="{escape(NON_WORKING_CONFIRM_MESSAGE)}"'
+                if non_working_day and adding_day
+                else ""
+            )
+            html += f"""
+            <form class="direct-day-form" method="post" action="/toggle-day"{confirmation_attr}>
+                <input type="hidden" name="fio" value="{escape(fio)}" />
+                <input type="hidden" name="point_code" value="{escape(point_code)}" />
+                <input type="hidden" name="day" value="{day}" />
+                <input type="hidden" name="slot" value="{SLOT_DAY}" />
+                <input type="hidden" name="csrf_token" value="{escape(csrf_token)}" />
+                {confirmation_input}
+                <button class="{cls}" type="submit">{day_content}</button>
+            </form>
+            """
+        else:
+            href = build_day_href(
+                fio, point_code, y, m, day, is_submitted, inventory_allowed
+            )
+            html += f"""
+            <a class="{cls}" href="{href}">
+                {day_content}
+            </a>
+            """
 
     html += '</div>'
     return html
@@ -1490,6 +1543,7 @@ def build_calendar_html(
 
 @app.get("/calendar-page", response_class=HTMLResponse)
 def calendar_page(
+    request: Request,
     fio: str,
     point_code: str,
     saved: str = "",
@@ -1501,6 +1555,9 @@ def calendar_page(
 
     merchant = get_merchant_by_fio(db, fio)
     if not merchant:
+        return RedirectResponse(url="/login-page", status_code=303)
+    session = read_merchant_session(request.cookies.get(MERCHANT_COOKIE))
+    if not session:
         return RedirectResponse(url="/login-page", status_code=303)
 
     point_code = normalize_point_code(point_code)
@@ -1525,7 +1582,8 @@ def calendar_page(
         is_submitted=monthly_submitted,
         special_inventory_days=special_inventory_days,
         calendar_overrides=calendar_overrides,
-        pay_lt5=bool(point_total.get("pay_lt5"))
+        pay_lt5=bool(point_total.get("pay_lt5")),
+        csrf_token=session["csrf"],
     )
 
     info_box = ""
@@ -1590,9 +1648,38 @@ def calendar_page(
             window.scrollTo(0, parseInt(savedY, 10));
             sessionStorage.removeItem('calendarScrollY');
         }}
-        document.querySelectorAll('.day').forEach(el => {{
+        document.querySelectorAll('a.day').forEach(el => {{
             el.addEventListener('click', function() {{
                 sessionStorage.setItem('calendarScrollY', String(window.scrollY));
+            }});
+        }});
+        document.querySelectorAll('.direct-day-form').forEach(form => {{
+            form.addEventListener('submit', async function(event) {{
+                event.preventDefault();
+                const confirmation = form.dataset.confirm;
+                if (confirmation && !window.confirm(confirmation)) {{
+                    return;
+                }}
+                sessionStorage.setItem('calendarScrollY', String(window.scrollY));
+                const button = form.querySelector('button[type="submit"]');
+                button.disabled = true;
+                try {{
+                    const response = await fetch(form.action, {{
+                        method: 'POST',
+                        body: new FormData(form),
+                        credentials: 'same-origin',
+                    }});
+                    if (!response.ok) {{
+                        const message = await response.text();
+                        window.alert(message || 'Не удалось сохранить выход. Попробуйте ещё раз.');
+                        button.disabled = false;
+                        return;
+                    }}
+                    window.location.assign(response.url);
+                }} catch (error) {{
+                    window.alert('Не удалось сохранить выход. Проверьте соединение и попробуйте ещё раз.');
+                    button.disabled = false;
+                }}
             }});
         }});
     }});
@@ -2436,12 +2523,19 @@ def day_action_page(
 
     current_date = date(y, m, day)
     special_inventory = current_date in set(get_special_inventory_days(db))
+    calendar_overrides = get_calendar_overrides(db, y, m)
+    non_working_day = is_calendar_red_day(current_date, calendar_overrides)
     allowed_slots = allowed_visit_slots(
         current_date, special_inventory=special_inventory
     )
     session = read_merchant_session(request.cookies.get(MERCHANT_COOKIE))
     if not session:
         return RedirectResponse(url="/login-page", status_code=303)
+    if allowed_slots == {SLOT_DAY}:
+        return RedirectResponse(
+            url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}",
+            status_code=303,
+        )
 
     action_forms = []
 
@@ -2449,13 +2543,24 @@ def day_action_page(
         action = "/toggle-inventory" if inventory else "/toggle-day"
         slot_input = "" if inventory else f'<input type="hidden" name="slot" value="{slot}" />'
         button_class = "btn btn-secondary btn-small" if inventory else "btn btn-small"
+        adding = slot not in day_visits
+        confirmation = ""
+        confirmation_attr = ""
+        if non_working_day and adding:
+            confirmation = '<input type="hidden" name="confirm_non_working" value="1" />'
+            confirmation_attr = (
+                f' onsubmit="return window.confirm('
+                f"'{escape(NON_WORKING_CONFIRM_MESSAGE)}'"
+                f');"'
+            )
         return f"""
-            <form method="post" action="{action}">
+            <form method="post" action="{action}"{confirmation_attr}>
                 <input type="hidden" name="fio" value="{escape(fio)}" />
                 <input type="hidden" name="point_code" value="{escape(point_code)}" />
                 <input type="hidden" name="day" value="{day}" />
                 {slot_input}
                 <input type="hidden" name="csrf_token" value="{escape(session["csrf"])}" />
+                {confirmation}
                 <button class="{button_class}" type="submit">{button_text}</button>
             </form>
         """
@@ -2540,7 +2645,7 @@ def toggle_day(
     db: Session = Depends(get_db)
 ):
     return RedirectResponse(
-        url=f"/day-action-page?fio={escape(fio)}&point_code={escape(point_code)}&day={day}",
+        url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}",
         status_code=303,
     )
 
@@ -2553,6 +2658,7 @@ def toggle_day_post(
     day: int = Form(...),
     slot: str = Form(...),
     csrf_token: str = Form(...),
+    confirm_non_working: str = Form(""),
     db: Session = Depends(get_db),
 ):
     session = read_merchant_session(request.cookies.get(MERCHANT_COOKIE))
@@ -2593,14 +2699,40 @@ def toggle_day_post(
             "Для этой даты выбранный тип выхода недоступен. Вернитесь в календарь.",
             status_code=409,
         )
+    if (
+        normalized_slot not in existing
+        and is_calendar_red_day(
+            current_date,
+            get_calendar_overrides(db, period["year"], period["month"]),
+        )
+        and confirm_non_working != "1"
+    ):
+        db.rollback()
+        return HTMLResponse(
+            NON_WORKING_CONFIRM_MESSAGE,
+            status_code=409,
+        )
 
     try:
         toggle_day_visit(db, merchant["id"], point_code, period["year"], period["month"], day, normalized_slot)
+    except InventoryWeekLimitError:
+        db.rollback()
+        return HTMLResponse(
+            "На одной точке разрешён только один полный инвент на мерчендайзера в одну ISO-неделю.",
+            status_code=409,
+        )
     except ValueError:
         db.rollback()
         return HTMLResponse(
             "Для этой даты выбранный тип выхода недоступен. Вернитесь в календарь.",
             status_code=409,
+        )
+    except Exception as exc:
+        db.rollback()
+        log_redacted_exception("toggle_day_failed", exc)
+        return HTMLResponse(
+            "Не удалось сохранить выход из-за временной ошибки. Попробуйте ещё раз.",
+            status_code=503,
         )
     return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code)}", status_code=303)
 
@@ -2625,6 +2757,7 @@ def toggle_inventory_post(
     point_code: str = Form(...),
     day: int = Form(...),
     csrf_token: str = Form(...),
+    confirm_non_working: str = Form(""),
     db: Session = Depends(get_db),
 ):
     session = read_merchant_session(request.cookies.get(MERCHANT_COOKIE))
@@ -2650,6 +2783,22 @@ def toggle_inventory_post(
             "Полный инвент недоступен для этой даты. Вернитесь в календарь.",
             status_code=409,
         )
+    existing = get_visits_for_month(
+        db, merchant["id"], point_code, period["year"], period["month"]
+    ).get(day, set())
+    if (
+        SLOT_FULL_INVENT not in existing
+        and is_calendar_red_day(
+            current_date,
+            get_calendar_overrides(db, period["year"], period["month"]),
+        )
+        and confirm_non_working != "1"
+    ):
+        db.rollback()
+        return HTMLResponse(
+            NON_WORKING_CONFIRM_MESSAGE,
+            status_code=409,
+        )
     try:
         toggle_inventory_visit(
             db,
@@ -2659,6 +2808,12 @@ def toggle_inventory_post(
             period["month"],
             day,
             special_inventory=special_inventory,
+        )
+    except InventoryWeekLimitError:
+        db.rollback()
+        return HTMLResponse(
+            "На одной точке разрешён только один полный инвент на мерчендайзера в одну ISO-неделю.",
+            status_code=409,
         )
     except ValueError:
         db.rollback()
