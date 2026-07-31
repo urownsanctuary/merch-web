@@ -8,7 +8,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import inspect, text
+from sqlalchemy import bindparam, inspect, text
 from sqlalchemy.orm import Session
 
 
@@ -22,6 +22,19 @@ MERCHANT_SORTS = {
     "updated_asc": "updated_at ASC, id ASC",
     "tu_asc": "tu ASC, fio_norm ASC, id ASC",
 }
+
+DELETE_ALL_CONFIRMATION = "УДАЛИТЬ ВСЕХ МЕРЧЕНДАЙЗЕРОВ"
+MERCHANT_OWNED_TABLES = (
+    "reimbursement_receipts",
+    "receipt_files",
+    "point_notes",
+    "point_reimbursements",
+    "point_adjustments",
+    "monthly_submissions",
+    "visits",
+    "merchant_audit_log",
+    "merchants",
+)
 
 
 @dataclass
@@ -434,6 +447,200 @@ def deactivate_all_merchants(
     for row in rows:
         set_merchant_active(db, int(row[0]), False, actor=actor)
     return len(rows)
+
+
+def _existing_merchant_owned_tables(db: Session) -> dict[str, set[str]]:
+    inspector = inspect(db.get_bind())
+    tables = set(inspector.get_table_names())
+    known = {
+        table_name: {column["name"] for column in inspector.get_columns(table_name)}
+        for table_name in MERCHANT_OWNED_TABLES
+        if table_name in tables
+    }
+    unknown = []
+    for table_name in sorted(tables - {"merchants"}):
+        columns = {column["name"] for column in inspector.get_columns(table_name)}
+        if "merchant_id" in columns and table_name not in MERCHANT_OWNED_TABLES:
+            unknown.append(table_name)
+    if unknown:
+        raise RuntimeError(
+            "Unknown merchant-owned tables prevent safe deletion: "
+            + ", ".join(unknown)
+        )
+    return known
+
+
+def _merchant_receipt_file_ids(db: Session, tables: dict[str, set[str]]) -> set[str]:
+    file_ids: set[str] = set()
+    path_sources = (
+        ("monthly_submissions", "receipt_path"),
+        ("point_adjustments", "reimb_receipt"),
+    )
+    for table_name, column_name in path_sources:
+        if column_name not in tables.get(table_name, set()):
+            continue
+        rows = db.execute(
+            text(
+                f"""
+                SELECT {column_name}
+                FROM {table_name}
+                WHERE merchant_id IN (SELECT id FROM merchants)
+                """
+            )
+        ).all()
+        for row in rows:
+            for path in str(row[0] or "").split("|"):
+                match = re.search(r"(?:^|/)receipts/([^/]+)/", path.strip())
+                if match:
+                    file_ids.add(match.group(1))
+    return file_ids
+
+
+def _existing_merchant_receipt_file_ids(
+    db: Session, tables: dict[str, set[str]]
+) -> set[str]:
+    if "receipt_files" not in tables:
+        return set()
+    file_ids = _merchant_receipt_file_ids(db, tables)
+    if "merchant_id" in tables["receipt_files"]:
+        direct_ids = db.execute(
+            text(
+                """
+                SELECT file_id
+                FROM receipt_files
+                WHERE merchant_id IN (SELECT id FROM merchants)
+                """
+            )
+        ).scalars()
+        file_ids.update(str(file_id) for file_id in direct_ids)
+    if not file_ids:
+        return set()
+    existing_ids = db.execute(
+        text("SELECT file_id FROM receipt_files WHERE file_id IN :file_ids").bindparams(
+            bindparam("file_ids", expanding=True)
+        ),
+        {"file_ids": sorted(file_ids)},
+    ).scalars()
+    return {str(file_id) for file_id in existing_ids}
+
+
+def count_merchant_owned_rows(db: Session) -> dict[str, int]:
+    """Read-only preview of rows that the destructive admin action will delete."""
+    tables = _existing_merchant_owned_tables(db)
+    counts = {table_name: 0 for table_name in MERCHANT_OWNED_TABLES}
+    if "merchants" not in tables:
+        return counts
+
+    for table_name in (
+        "point_notes",
+        "point_reimbursements",
+        "point_adjustments",
+        "monthly_submissions",
+        "visits",
+        "merchant_audit_log",
+    ):
+        if "merchant_id" in tables.get(table_name, set()):
+            counts[table_name] = int(
+                db.execute(
+                    text(
+                        f"""
+                        SELECT COUNT(*)
+                        FROM {table_name}
+                        WHERE merchant_id IN (SELECT id FROM merchants)
+                        """
+                    )
+                ).scalar()
+                or 0
+            )
+
+    if (
+        "reimbursement_receipts" in tables
+        and "point_reimbursements" in tables
+    ):
+        counts["reimbursement_receipts"] = int(
+            db.execute(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM reimbursement_receipts
+                    WHERE reimbursement_id IN (
+                        SELECT id FROM point_reimbursements
+                        WHERE merchant_id IN (SELECT id FROM merchants)
+                    )
+                    """
+                )
+            ).scalar()
+            or 0
+        )
+
+    counts["receipt_files"] = len(
+        _existing_merchant_receipt_file_ids(db, tables)
+    )
+    counts["merchants"] = int(
+        db.execute(text("SELECT COUNT(*) FROM merchants")).scalar() or 0
+    )
+    return counts
+
+
+def delete_all_merchants_and_data(db: Session) -> dict[str, int]:
+    """Delete all merchant-owned rows. The caller owns commit or rollback."""
+    tables = _existing_merchant_owned_tables(db)
+    counts = count_merchant_owned_rows(db)
+    if "merchants" not in tables:
+        return counts
+
+    receipt_file_ids = _existing_merchant_receipt_file_ids(db, tables)
+    deleted: dict[str, int] = {table_name: 0 for table_name in counts}
+
+    if (
+        "reimbursement_receipts" in tables
+        and "point_reimbursements" in tables
+    ):
+        result = db.execute(
+            text(
+                """
+                DELETE FROM reimbursement_receipts
+                WHERE reimbursement_id IN (
+                    SELECT id FROM point_reimbursements
+                    WHERE merchant_id IN (SELECT id FROM merchants)
+                )
+                """
+            )
+        )
+        deleted["reimbursement_receipts"] = result.rowcount or 0
+    if receipt_file_ids and "receipt_files" in tables:
+        result = db.execute(
+            text("DELETE FROM receipt_files WHERE file_id IN :file_ids").bindparams(
+                bindparam("file_ids", expanding=True)
+            ),
+            {"file_ids": sorted(receipt_file_ids)},
+        )
+        deleted["receipt_files"] = result.rowcount or 0
+
+    for table_name in (
+        "point_notes",
+        "point_reimbursements",
+        "point_adjustments",
+        "monthly_submissions",
+        "visits",
+        "merchant_audit_log",
+    ):
+        if "merchant_id" in tables.get(table_name, set()):
+            result = db.execute(
+                text(
+                    f"""
+                    DELETE FROM {table_name}
+                    WHERE merchant_id IN (SELECT id FROM merchants)
+                    """
+                )
+            )
+            deleted[table_name] = result.rowcount or 0
+    result = db.execute(text("DELETE FROM merchants"))
+    deleted["merchants"] = result.rowcount or 0
+
+    if deleted != counts:
+        raise RuntimeError("Merchant-owned row count changed during deletion")
+    return counts
 
 
 def import_or_reactivate_merchant(
