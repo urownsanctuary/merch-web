@@ -419,7 +419,7 @@ class MerchantAdminTests(unittest.TestCase):
         ):
             response = self.client.get("/admin-data")
         self.assertEqual(response.status_code, 200)
-        self.assertIn("Деактивировать всех мерчендайзеров", response.text)
+        self.assertIn("Очистить список мерчендайзеров", response.text)
         self.assertIn('action="/admin-clear-merchants"', response.text)
         self.assertIn(
             "Все текущие мерчендайзеры будут деактивированы. "

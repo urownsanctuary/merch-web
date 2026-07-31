@@ -3878,7 +3878,7 @@ def admin_data_page(
                     </form>
                     <form method="post" action="/admin-clear-merchants" style="margin-top:18px;" onsubmit="return confirm('Все текущие мерчендайзеры будут деактивированы. История сверок и отчётов сохранится. Продолжить?');">
                         <input type="hidden" name="csrf_token" value="{admin_csrf}" />
-                        <button class="btn btn-danger" type="submit">Деактивировать всех мерчендайзеров</button>
+                        <button class="btn btn-danger" type="submit">Очистить список мерчендайзеров</button>
                     </form>
                 </div>
 
