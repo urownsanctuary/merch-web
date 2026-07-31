@@ -343,6 +343,103 @@ class SlotHotfixTests(unittest.TestCase):
         finally:
             app.dependency_overrides.clear()
 
+    def test_inventory_week_conflict_redirects_to_styled_calendar_warning(self):
+        db = MagicMock()
+        app.dependency_overrides[get_db] = lambda: db
+        token = create_merchant_session("Тестовый Мерч")
+        csrf = read_merchant_session(token)["csrf"]
+        common = {
+            "get_active_period": MagicMock(return_value=FIXED_PERIOD),
+            "get_merchant_by_fio": MagicMock(return_value=MERCHANT),
+            "compute_overall_total": MagicMock(
+                return_value={
+                    "submission_status": "draft",
+                    "total": 0,
+                    "per_point": {},
+                    "per_point_details": {},
+                }
+            ),
+            "get_visits_for_month": MagicMock(return_value={}),
+            "get_calendar_overrides": MagicMock(return_value={}),
+            "toggle_day_visit": MagicMock(
+                side_effect=InventoryWeekLimitError(date(2026, 7, 17))
+            ),
+        }
+        try:
+            with patch.multiple("app.main", **common):
+                with TestClient(app) as client:
+                    client.cookies.set("merchant_session", token)
+                    conflict = client.post(
+                        "/toggle-day",
+                        data={
+                            "fio": "Тестовый Мерч",
+                            "point_code": "2674",
+                            "day": "18",
+                            "slot": SLOT_EVENING,
+                            "csrf_token": csrf,
+                            "confirm_non_working": "1",
+                        },
+                        follow_redirects=False,
+                    )
+            self.assertEqual(conflict.status_code, 303)
+            self.assertIn("/calendar-page?", conflict.headers["location"])
+            self.assertIn("point_code=2674", conflict.headers["location"])
+            self.assertIn("visit_error=inventory_week", conflict.headers["location"])
+            self.assertIn("inventory_date=2026-07-17", conflict.headers["location"])
+            db.rollback.assert_called_once()
+
+            point_total = {
+                "total": 0,
+                "pay_lt5": False,
+                "coffee_enabled": False,
+                "cnt_supply": 0,
+                "rate_supply": 800,
+                "sum_supply": 0,
+                "cnt_no_supply": 0,
+                "rate_no_supply": 400,
+                "sum_no_supply": 0,
+                "cnt_full_inv": 0,
+                "rate_inventory": 400,
+                "sum_inventory": 0,
+                "note_amount": 0,
+                "note_comment": "",
+                "reimb_amount": 0,
+                "reimb_comment": "",
+                "reimb_receipt": None,
+            }
+            calendar_common = dict(common)
+            calendar_common.update(
+                {
+                    "toggle_day_visit": MagicMock(),
+                    "get_supply_boxes_map": MagicMock(return_value={}),
+                    "compute_point_total": MagicMock(return_value=point_total),
+                    "get_point_adjustment": MagicMock(return_value=None),
+                    "get_special_inventory_days": MagicMock(return_value=[]),
+                }
+            )
+            with patch.multiple("app.main", **calendar_common):
+                with TestClient(app) as client:
+                    client.cookies.set("merchant_session", token)
+                    warning = client.get(
+                        "/calendar-page",
+                        params={
+                            "fio": "Тестовый Мерч",
+                            "point_code": "2674",
+                            "visit_error": "inventory_week",
+                            "inventory_date": "2026-07-17",
+                        },
+                    )
+            self.assertEqual(warning.status_code, 200)
+            self.assertIn('class="error-box"', warning.text)
+            self.assertIn(
+                "На этой точке уже отмечен полный инвент на этой неделе: "
+                "17.07.2026. Разрешён только один полный инвент в неделю.",
+                warning.text,
+            )
+            self.assertNotIn("ISO-неделю", warning.text)
+        finally:
+            app.dependency_overrides.clear()
+
     def test_submitted_reconciliation_blocks_direct_calendar_toggle(self):
         db = MagicMock()
         app.dependency_overrides[get_db] = lambda: db
@@ -393,13 +490,34 @@ class SlotHotfixTests(unittest.TestCase):
             with self.assertRaises(InventoryWeekLimitError):
                 toggle_day_visit(db, 1, "2674", 2026, 7, 18, SLOT_EVENING)
             db.rollback()
+            self.assertEqual(
+                db.execute(
+                    text(
+                        "SELECT visit_date FROM visits "
+                        "WHERE merchant_id=1 AND point_code='2674'"
+                    )
+                ).scalar_one(),
+                "2026-07-17",
+            )
             with self.assertRaises(InventoryWeekLimitError):
                 toggle_inventory_visit(
                     db, 1, "2674", 2026, 7, 15, special_inventory=True
                 )
             db.rollback()
             self.assertEqual(
+                toggle_day_visit(db, 1, "OTHER", 2026, 7, 18, SLOT_EVENING),
+                "added",
+            )
+            self.assertEqual(
                 toggle_day_visit(db, 1, "2674", 2026, 7, 24, SLOT_EVENING),
+                "added",
+            )
+            self.assertEqual(
+                toggle_day_visit(db, 1, "2674", 2026, 7, 17, SLOT_EVENING),
+                "removed",
+            )
+            self.assertEqual(
+                toggle_day_visit(db, 1, "2674", 2026, 7, 18, SLOT_EVENING),
                 "added",
             )
 
