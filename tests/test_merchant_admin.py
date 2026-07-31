@@ -411,7 +411,7 @@ class MerchantAdminTests(unittest.TestCase):
         self.assertEqual(response.status_code, 303)
         self.assertEqual(response.headers["location"], "/admin-login")
 
-    def test_admin_data_shows_safe_deactivate_all_button(self):
+    def test_admin_data_shows_protected_delete_all_button_and_counts(self):
         with patch("app.main.get_active_period", return_value={"year": 2026, "month": 7}), patch(
             "app.main.get_all_tu_values", return_value=["ТУ-1"]
         ), patch("app.main.get_special_inventory_days", return_value=[]), patch(
@@ -419,13 +419,193 @@ class MerchantAdminTests(unittest.TestCase):
         ):
             response = self.client.get("/admin-data")
         self.assertEqual(response.status_code, 200)
-        self.assertIn("Очистить список мерчендайзеров", response.text)
-        self.assertIn('action="/admin-clear-merchants"', response.text)
+        self.assertIn("Удалить всех мерчендайзеров и их данные", response.text)
+        self.assertIn('action="/admin-delete-all-merchants"', response.text)
+        self.assertIn("УДАЛИТЬ ВСЕХ МЕРЧЕНДАЙЗЕРОВ", response.text)
         self.assertIn(
-            "Все текущие мерчендайзеры будут деактивированы. "
-            "История сверок и отчётов сохранится. Продолжить?",
+            "Будут безвозвратно удалены все мерчендайзеры и все связанные с ними "
+            "сверки, выходы, примечания, возмещения и чеки. Продолжить?",
             response.text,
         )
+
+    def test_delete_all_requires_admin_csrf_and_exact_confirmation(self):
+        merchant = self.create()
+        self.client.cookies.clear()
+        unauthorized = self.client.post(
+            "/admin-delete-all-merchants",
+            data={
+                "csrf_token": self.csrf,
+                "confirmation": "УДАЛИТЬ ВСЕХ МЕРЧЕНДАЙЗЕРОВ",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(unauthorized.status_code, 303)
+        self.assertEqual(unauthorized.headers["location"], "/admin-login")
+
+        self.client.cookies.set("admin_auth", self.admin_cookie)
+        forbidden = self.client.post(
+            "/admin-delete-all-merchants",
+            data={
+                "csrf_token": "",
+                "confirmation": "УДАЛИТЬ ВСЕХ МЕРЧЕНДАЙЗЕРОВ",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(forbidden.status_code, 403)
+        rejected = self.client.post(
+            "/admin-delete-all-merchants",
+            data={"csrf_token": self.csrf, "confirmation": "удалить"},
+            follow_redirects=False,
+        )
+        self.assertEqual(rejected.status_code, 303)
+        self.assertIn("error=", rejected.headers["location"])
+        with self.factory() as db:
+            self.assertEqual(
+                db.execute(
+                    text("SELECT COUNT(*) FROM merchants WHERE id=:id"),
+                    {"id": merchant["id"]},
+                ).scalar(),
+                1,
+            )
+
+    def test_delete_all_removes_only_merchant_owned_data(self):
+        first = self.create("Иванов Иван", "1234")
+        second = self.create("Петров Пётр", "5678")
+        with self.engine.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE TABLE monthly_submissions "
+                "(id INTEGER PRIMARY KEY, merchant_id INTEGER, receipt_path TEXT)"
+            )
+            connection.exec_driver_sql(
+                "CREATE TABLE point_adjustments "
+                "(id INTEGER PRIMARY KEY, merchant_id INTEGER, reimb_receipt TEXT)"
+            )
+            connection.exec_driver_sql(
+                "CREATE TABLE point_notes "
+                "(id TEXT PRIMARY KEY, merchant_id INTEGER)"
+            )
+            connection.exec_driver_sql(
+                "CREATE TABLE point_reimbursements "
+                "(id TEXT PRIMARY KEY, merchant_id INTEGER)"
+            )
+            connection.exec_driver_sql(
+                "CREATE TABLE reimbursement_receipts "
+                "(id TEXT PRIMARY KEY, reimbursement_id TEXT)"
+            )
+            connection.exec_driver_sql(
+                "CREATE TABLE receipt_files "
+                "(file_id TEXT PRIMARY KEY, merchant_id INTEGER, data BLOB)"
+            )
+            connection.exec_driver_sql(
+                "CREATE TABLE points (point_code TEXT PRIMARY KEY)"
+            )
+            connection.exec_driver_sql(
+                "CREATE TABLE supplies "
+                "(id INTEGER PRIMARY KEY, point_code TEXT)"
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO visits (merchant_id, point_code) VALUES "
+                    "(:first, 'P1'), (:second, 'P2')"
+                ),
+                {"first": first["id"], "second": second["id"]},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO monthly_submissions VALUES "
+                    "(1, :first, 'receipts/file-a/receipt.pdf')"
+                ),
+                {"first": first["id"]},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO point_adjustments VALUES "
+                    "(1, :first, 'receipts/file-b/receipt.png')"
+                ),
+                {"first": first["id"]},
+            )
+            connection.execute(
+                text("INSERT INTO point_notes VALUES ('n1', :first)"),
+                {"first": first["id"]},
+            )
+            connection.execute(
+                text("INSERT INTO point_reimbursements VALUES ('r1', :first)"),
+                {"first": first["id"]},
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO reimbursement_receipts VALUES ('rr1', 'r1')"
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO receipt_files VALUES "
+                    "('file-a', NULL, X'25504446'), "
+                    "('file-b', :first, X'89504E47')"
+                ),
+                {"first": first["id"]},
+            )
+            connection.exec_driver_sql("INSERT INTO points VALUES ('P1')")
+            connection.exec_driver_sql("INSERT INTO supplies VALUES (1, 'P1')")
+
+        response = self.client.post(
+            "/admin-delete-all-merchants",
+            data={
+                "csrf_token": self.csrf,
+                "confirmation": "УДАЛИТЬ ВСЕХ МЕРЧЕНДАЙЗЕРОВ",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(response.status_code, 303)
+        self.assertIn("success=", response.headers["location"])
+        with self.factory() as db:
+            for table_name in (
+                "merchants",
+                "visits",
+                "monthly_submissions",
+                "point_adjustments",
+                "point_notes",
+                "point_reimbursements",
+                "reimbursement_receipts",
+                "receipt_files",
+                "merchant_audit_log",
+            ):
+                self.assertEqual(
+                    db.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar(),
+                    0,
+                    table_name,
+                )
+            self.assertEqual(db.execute(text("SELECT COUNT(*) FROM points")).scalar(), 1)
+            self.assertEqual(db.execute(text("SELECT COUNT(*) FROM supplies")).scalar(), 1)
+
+    def test_delete_all_error_rolls_back_without_500(self):
+        merchant = self.create()
+
+        def delete_then_fail(db):
+            db.execute(text("DELETE FROM merchants"))
+            raise RuntimeError("synthetic secret database detail")
+
+        with patch(
+            "app.main.delete_all_merchants_and_data",
+            side_effect=delete_then_fail,
+        ):
+            response = self.client.post(
+                "/admin-delete-all-merchants",
+                data={
+                    "csrf_token": self.csrf,
+                    "confirmation": "УДАЛИТЬ ВСЕХ МЕРЧЕНДАЙЗЕРОВ",
+                },
+                follow_redirects=False,
+            )
+        self.assertEqual(response.status_code, 303)
+        self.assertNotEqual(response.status_code, 500)
+        self.assertNotIn("secret", response.headers["location"])
+        with self.factory() as db:
+            self.assertEqual(
+                db.execute(
+                    text("SELECT COUNT(*) FROM merchants WHERE id=:id"),
+                    {"id": merchant["id"]},
+                ).scalar(),
+                1,
+            )
 
     def test_deactivate_all_requires_admin_and_csrf(self):
         merchant = self.create()

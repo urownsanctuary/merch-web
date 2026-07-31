@@ -85,9 +85,12 @@ from app.production_calendar import (
     sync_approved_calendars,
 )
 from app.merchant_admin import (
+    DELETE_ALL_CONFIRMATION,
     MERCHANT_SORTS,
     MerchantInputError,
+    count_merchant_owned_rows,
     create_merchant,
+    delete_all_merchants_and_data,
     ensure_merchant_admin_schema,
     get_merchant_for_admin,
     list_merchant_audit,
@@ -3780,6 +3783,35 @@ def admin_data_page(
     if error:
         info_box += f"<div class='error-box'>{escape(error)}</div>"
 
+    try:
+        merchant_delete_counts = count_merchant_owned_rows(db)
+        merchant_delete_count_html = "".join(
+            f"<li>{escape(label)}: <strong>{merchant_delete_counts[key]}</strong></li>"
+            for key, label in (
+                ("merchants", "Мерчендайзеры"),
+                ("visits", "Выходы"),
+                ("monthly_submissions", "Месячные сверки"),
+                ("point_notes", "Примечания"),
+                ("point_reimbursements", "Возмещения"),
+                ("reimbursement_receipts", "Связи чеков возмещений"),
+                ("receipt_files", "Файлы чеков"),
+                ("point_adjustments", "Корректировки"),
+                ("merchant_audit_log", "Audit-записи"),
+            )
+        )
+        merchant_delete_preview = (
+            "<div class='hint' style='margin-top:14px;'>"
+            "Перед удалением будут обработаны:</div>"
+            f"<ul>{merchant_delete_count_html}</ul>"
+        )
+    except Exception as exc:
+        log_redacted_exception("merchant_delete_preview_failed", exc)
+        merchant_delete_preview = (
+            "<div class='error-box' style='margin-top:14px;'>"
+            "Не удалось безопасно посчитать связанные записи. "
+            "Удаление заблокировано.</div>"
+        )
+
     special_inventory_days = get_special_inventory_days(db)
     if special_inventory_days:
         rows = []
@@ -3876,9 +3908,12 @@ def admin_data_page(
 
                         <button class="btn" type="submit">Загрузить мерчей</button>
                     </form>
-                    <form method="post" action="/admin-clear-merchants" style="margin-top:18px;" onsubmit="return confirm('Все текущие мерчендайзеры будут деактивированы. История сверок и отчётов сохранится. Продолжить?');">
+                    {merchant_delete_preview}
+                    <form method="post" action="/admin-delete-all-merchants" style="margin-top:18px;" onsubmit="return confirm('Будут безвозвратно удалены все мерчендайзеры и все связанные с ними сверки, выходы, примечания, возмещения и чеки. Продолжить?');">
                         <input type="hidden" name="csrf_token" value="{admin_csrf}" />
-                        <button class="btn btn-danger" type="submit">Очистить список мерчендайзеров</button>
+                        <label for="delete_all_merchants_confirmation">Для подтверждения введите: <strong>{DELETE_ALL_CONFIRMATION}</strong></label>
+                        <input id="delete_all_merchants_confirmation" name="confirmation" type="text" autocomplete="off" required />
+                        <button class="btn btn-danger" type="submit">Удалить всех мерчендайзеров и их данные</button>
                     </form>
                 </div>
 
@@ -4288,6 +4323,63 @@ def admin_clear_merchants(
         log_redacted_exception("admin_clear_merchants_failed", exc)
         return RedirectResponse(
             url="/admin-data?error=Не удалось деактивировать мерчендайзеров. Изменения отменены.",
+            status_code=303,
+        )
+
+
+@app.post("/admin-delete-all-merchants")
+def admin_delete_all_merchants(
+    confirmation: str = Form(""),
+    csrf_token: str = Form(""),
+    admin_auth: Optional[str] = Cookie(default=None),
+    db: Session = Depends(get_db),
+):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse(url="/admin-login", status_code=303)
+    if not verify_admin_csrf(admin_auth, csrf_token):
+        raise HTTPException(status_code=403, detail="Недействительный CSRF-токен")
+    if confirmation != DELETE_ALL_CONFIRMATION:
+        return RedirectResponse(
+            url="/admin-data?error="
+            + urlencode(
+                {
+                    "error": (
+                        "Удаление не выполнено: введите фразу подтверждения "
+                        "точно так, как она указана."
+                    )
+                }
+            ).split("=", 1)[1],
+            status_code=303,
+        )
+
+    try:
+        deleted = delete_all_merchants_and_data(db)
+        db.commit()
+        summary = ", ".join(
+            f"{key}: {value}" for key, value in deleted.items()
+        )
+        message = (
+            "Все мерчендайзеры и связанные с ними данные удалены. "
+            f"Удалено строк — {summary}."
+        )
+        return RedirectResponse(
+            url="/admin-data?success="
+            + urlencode({"success": message}).split("=", 1)[1],
+            status_code=303,
+        )
+    except Exception as exc:
+        db.rollback()
+        log_redacted_exception("admin_delete_all_merchants_failed", exc)
+        return RedirectResponse(
+            url="/admin-data?error="
+            + urlencode(
+                {
+                    "error": (
+                        "Не удалось удалить мерчендайзеров. "
+                        "Все изменения отменены."
+                    )
+                }
+            ).split("=", 1)[1],
             status_code=303,
         )
 
