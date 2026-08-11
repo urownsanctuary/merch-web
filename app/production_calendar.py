@@ -8,6 +8,8 @@ from openpyxl import load_workbook
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.runtime import maintenance_mode_enabled
+
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +140,8 @@ def _dialect_name(db: Session) -> str:
 
 
 def ensure_production_calendar_table(db: Session, *, commit: bool = True) -> None:
+    if maintenance_mode_enabled():
+        return
     db.execute(text(CALENDAR_DDL))
     dialect = _dialect_name(db)
     if dialect == "postgresql":

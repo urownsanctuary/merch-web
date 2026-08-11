@@ -107,9 +107,38 @@ from app.security import (
     set_request_merchant,
     verify_csrf,
 )
+from app.runtime import maintenance_mode_enabled
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
+
+
+@app.middleware("http")
+async def enforce_maintenance_mode(request: Request, call_next):
+    if maintenance_mode_enabled() and request.method in {
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+    }:
+        return HTMLResponse(
+            """
+            <!doctype html>
+            <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+            <title>Технические работы</title>
+            <style>
+              body{margin:0;background:#f4f6f8;color:#1f2937;font:16px/1.5 Arial,sans-serif}
+              main{max-width:620px;margin:12vh auto;padding:28px;background:#fff;border-radius:14px;box-shadow:0 8px 30px #0001}
+              h1{margin-top:0;font-size:24px} p{margin-bottom:0}
+            </style></head>
+            <body><main><h1>Технические работы</h1>
+            <p>Сервис временно работает только для просмотра. Сохранение изменений отключено. Пожалуйста, повторите попытку позже.</p>
+            </main></body></html>
+            """,
+            status_code=503,
+            headers={"Cache-Control": "no-store", "Retry-After": "300"},
+        )
+    return await call_next(request)
 
 
 def require_draft_month(db: Session, merchant_id: int, period: dict) -> None:
@@ -175,6 +204,9 @@ def get_db():
 
 @app.on_event("startup")
 def ensure_admin_schema_on_startup():
+    if maintenance_mode_enabled():
+        logger.warning("maintenance_mode_enabled startup_writes_and_calendar_sync_disabled")
+        return
     db = SessionLocal()
     try:
         ensure_merchant_admin_schema(db)
@@ -314,6 +346,8 @@ def safe_receipt_filename(filename: str | None) -> str:
 
 
 def ensure_receipt_files_table(db: Session):
+    if maintenance_mode_enabled():
+        return
     db.execute(text("""
         CREATE TABLE IF NOT EXISTS receipt_files (
             file_id TEXT PRIMARY KEY,

@@ -73,6 +73,15 @@ verified image tag and recreating only `app` and `nginx`. Do not use destructive
 database SQL for an application rollback. If schema compatibility is uncertain,
 stop and restore into an isolated database first.
 
+## Read-only maintenance mode
+
+Set `MAINTENANCE_MODE=1` only in the target environment and recreate the app
+container. GET/read routes and `/db-check` remain available; POST, PUT, PATCH,
+and DELETE return a styled HTTP 503 without reaching route handlers. Startup
+schema writes, lazy table creation, and calendar synchronization are disabled.
+Set it back to `0` and recreate the app to leave maintenance mode. Do not enable
+this setting on Render before the separately authorized final cutover.
+
 ## Final HTTPS cutover (not yet authorized)
 
 Before cutover: create and test a fresh backup, verify candidate smoke tests,

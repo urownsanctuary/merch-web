@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text, bindparam, inspect
 from openpyxl import load_workbook
 from app.security import request_merchant_matches
+from app.runtime import maintenance_mode_enabled
 from app.merchant_admin import (
     create_merchant,
     deactivate_all_merchants,
@@ -191,6 +192,8 @@ def weekday_of(y: int, m: int, d: int) -> int:
 
 
 def ensure_special_inventory_days_table(db: Session):
+    if maintenance_mode_enabled():
+        return
     db.execute(text("""
         CREATE TABLE IF NOT EXISTS special_inventory_days (
             id SERIAL PRIMARY KEY,
@@ -604,6 +607,8 @@ def effective_has_supply(boxes: int, pay_lt5: bool) -> bool:
 
 
 def ensure_monthly_submissions_table(db: Session):
+    if maintenance_mode_enabled():
+        return
     db.execute(
         text(
             """
@@ -794,6 +799,8 @@ def normalized_adjustments_available(db: Session) -> bool:
 
 
 def ensure_point_adjustments_table(db: Session):
+    if maintenance_mode_enabled():
+        return
     db.execute(text("""
         CREATE TABLE IF NOT EXISTS point_adjustments (
             id SERIAL PRIMARY KEY,
