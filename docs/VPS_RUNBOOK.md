@@ -48,6 +48,14 @@ Create an atomic custom-format backup:
 /opt/salary-prod/app/deploy/scripts/backup-postgres.sh
 ```
 
+Install a daily user cron entry (02:15 UTC) after the script has passed a
+manual backup and restore drill. The script keeps 14 days by default; override
+with `BACKUP_RETENTION_DAYS` only in the cron environment when required:
+
+```cron
+15 2 * * * /opt/salary-prod/app/deploy/scripts/backup-postgres.sh >>/var/backups/salary-prod/backup.log 2>&1
+```
+
 Verify the emitted SHA-256 and run a restore into the isolated
 `salary_pgdata_restore` volume only:
 
