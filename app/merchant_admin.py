@@ -31,6 +31,9 @@ MERCHANT_OWNED_TABLES = (
     "point_reimbursements",
     "point_adjustments",
     "point_submissions",
+    "coffee_bonus",
+    "reimbursements",
+    "submissions",
     "monthly_submissions",
     "visits",
     "merchant_audit_log",
@@ -495,6 +498,18 @@ def _merchant_receipt_file_ids(db: Session, tables: dict[str, set[str]]) -> set[
                 match = re.search(r"(?:^|/)receipts/([^/]+)/", path.strip())
                 if match:
                     file_ids.add(match.group(1))
+    if "receipt_file_id" in tables.get("reimbursements", set()):
+        rows = db.execute(
+            text(
+                """
+                SELECT receipt_file_id
+                FROM reimbursements
+                WHERE merchant_id IN (SELECT id FROM merchants)
+                  AND receipt_file_id IS NOT NULL
+                """
+            )
+        ).all()
+        file_ids.update(str(row[0]) for row in rows if row[0])
     return file_ids
 
 
@@ -538,6 +553,9 @@ def count_merchant_owned_rows(db: Session) -> dict[str, int]:
         "point_reimbursements",
         "point_adjustments",
         "point_submissions",
+        "coffee_bonus",
+        "reimbursements",
+        "submissions",
         "monthly_submissions",
         "visits",
         "merchant_audit_log",
@@ -625,6 +643,9 @@ def delete_all_merchants_and_data(db: Session) -> dict[str, int]:
         "point_reimbursements",
         "point_adjustments",
         "point_submissions",
+        "coffee_bonus",
+        "reimbursements",
+        "submissions",
         "monthly_submissions",
         "visits",
         "merchant_audit_log",

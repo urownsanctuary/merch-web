@@ -27,6 +27,7 @@ from app.merchant_admin import (
     MerchantInputError,
     count_merchant_owned_rows,
     create_merchant,
+    delete_all_merchants_and_data,
     ensure_merchant_admin_schema,
     get_merchant_for_admin,
     list_merchants,
@@ -429,7 +430,7 @@ class MerchantAdminTests(unittest.TestCase):
             response.text,
         )
 
-    def test_delete_preview_accepts_legacy_point_submissions(self):
+    def test_delete_preview_accepts_legacy_merchant_tables(self):
         merchant = self.create()
         with self.engine.begin() as connection:
             connection.exec_driver_sql(
@@ -448,14 +449,55 @@ class MerchantAdminTests(unittest.TestCase):
                 "CREATE TABLE receipt_files "
                 "(file_id TEXT PRIMARY KEY, merchant_id INTEGER, data BLOB)"
             )
+            for table_name in ("coffee_bonus", "submissions"):
+                connection.exec_driver_sql(
+                    f"CREATE TABLE {table_name} "
+                    "(id INTEGER PRIMARY KEY, merchant_id INTEGER NOT NULL)"
+                )
+                connection.execute(
+                    text(f"INSERT INTO {table_name} VALUES (1, :merchant_id)"),
+                    {"merchant_id": merchant["id"]},
+                )
+            connection.exec_driver_sql(
+                "CREATE TABLE reimbursements "
+                "(id INTEGER PRIMARY KEY, merchant_id INTEGER NOT NULL, receipt_file_id TEXT)"
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO reimbursements "
+                    "(id, merchant_id, receipt_file_id) "
+                    "VALUES (1, :merchant_id, 'direct-file')"
+                ),
+                {"merchant_id": merchant["id"]},
+            )
             connection.exec_driver_sql(
                 "INSERT INTO receipt_files VALUES "
-                "('legacy-file', NULL, X'25504446')"
+                "('legacy-file', NULL, X'25504446'), "
+                "('direct-file', NULL, X'25504446')"
             )
         with self.factory() as db:
             counts = count_merchant_owned_rows(db)
-        self.assertEqual(counts["point_submissions"], 1)
-        self.assertEqual(counts["receipt_files"], 1)
+            self.assertEqual(counts["point_submissions"], 1)
+            self.assertEqual(counts["coffee_bonus"], 1)
+            self.assertEqual(counts["reimbursements"], 1)
+            self.assertEqual(counts["submissions"], 1)
+            self.assertEqual(counts["receipt_files"], 2)
+            deleted = delete_all_merchants_and_data(db)
+            db.commit()
+            self.assertEqual(deleted, counts)
+            for table_name in (
+                "point_submissions",
+                "coffee_bonus",
+                "reimbursements",
+                "submissions",
+                "receipt_files",
+                "merchants",
+            ):
+                self.assertEqual(
+                    db.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar(),
+                    0,
+                    table_name,
+                )
 
     def test_delete_all_requires_admin_csrf_and_exact_confirmation(self):
         merchant = self.create()

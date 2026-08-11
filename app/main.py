@@ -3831,6 +3831,9 @@ def admin_data_page(
                 ("receipt_files", "Файлы чеков"),
                 ("point_adjustments", "Корректировки"),
                 ("point_submissions", "Сверки по точкам"),
+                ("coffee_bonus", "Настройки кофемашин"),
+                ("reimbursements", "Legacy-возмещения"),
+                ("submissions", "Legacy-статусы отправки"),
                 ("merchant_audit_log", "Audit-записи"),
             )
         )
