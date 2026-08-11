@@ -25,6 +25,7 @@ from app.main import (
 )
 from app.merchant_admin import (
     MerchantInputError,
+    count_merchant_owned_rows,
     create_merchant,
     ensure_merchant_admin_schema,
     get_merchant_for_admin,
@@ -427,6 +428,34 @@ class MerchantAdminTests(unittest.TestCase):
             "сверки, выходы, примечания, возмещения и чеки. Продолжить?",
             response.text,
         )
+
+    def test_delete_preview_accepts_legacy_point_submissions(self):
+        merchant = self.create()
+        with self.engine.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE TABLE point_submissions "
+                "(id INTEGER PRIMARY KEY, merchant_id INTEGER NOT NULL, receipt_path TEXT)"
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO point_submissions "
+                    "(id, merchant_id, receipt_path) "
+                    "VALUES (1, :merchant_id, 'receipts/legacy-file/receipt.pdf')"
+                ),
+                {"merchant_id": merchant["id"]},
+            )
+            connection.exec_driver_sql(
+                "CREATE TABLE receipt_files "
+                "(file_id TEXT PRIMARY KEY, merchant_id INTEGER, data BLOB)"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO receipt_files VALUES "
+                "('legacy-file', NULL, X'25504446')"
+            )
+        with self.factory() as db:
+            counts = count_merchant_owned_rows(db)
+        self.assertEqual(counts["point_submissions"], 1)
+        self.assertEqual(counts["receipt_files"], 1)
 
     def test_delete_all_requires_admin_csrf_and_exact_confirmation(self):
         merchant = self.create()

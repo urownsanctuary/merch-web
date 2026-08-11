@@ -30,6 +30,7 @@ MERCHANT_OWNED_TABLES = (
     "point_notes",
     "point_reimbursements",
     "point_adjustments",
+    "point_submissions",
     "monthly_submissions",
     "visits",
     "merchant_audit_log",
@@ -474,6 +475,7 @@ def _merchant_receipt_file_ids(db: Session, tables: dict[str, set[str]]) -> set[
     file_ids: set[str] = set()
     path_sources = (
         ("monthly_submissions", "receipt_path"),
+        ("point_submissions", "receipt_path"),
         ("point_adjustments", "reimb_receipt"),
     )
     for table_name, column_name in path_sources:
@@ -535,6 +537,7 @@ def count_merchant_owned_rows(db: Session) -> dict[str, int]:
         "point_notes",
         "point_reimbursements",
         "point_adjustments",
+        "point_submissions",
         "monthly_submissions",
         "visits",
         "merchant_audit_log",
@@ -621,6 +624,7 @@ def delete_all_merchants_and_data(db: Session) -> dict[str, int]:
         "point_notes",
         "point_reimbursements",
         "point_adjustments",
+        "point_submissions",
         "monthly_submissions",
         "visits",
         "merchant_audit_log",

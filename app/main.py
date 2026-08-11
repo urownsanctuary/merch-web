@@ -3830,6 +3830,7 @@ def admin_data_page(
                 ("reimbursement_receipts", "Связи чеков возмещений"),
                 ("receipt_files", "Файлы чеков"),
                 ("point_adjustments", "Корректировки"),
+                ("point_submissions", "Сверки по точкам"),
                 ("merchant_audit_log", "Audit-записи"),
             )
         )
