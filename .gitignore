@@ -207,6 +207,12 @@ legacy-migration-snapshot*.sql
 merch-web-legacy-snapshot*.sql
 .legacy-snapshot-*.tmp
 
+# Production deployment secrets and database artifacts
+deploy/env/production.env
+*.dump
+*.dump.sha256
+*.backup
+
 # Marimo
 marimo/_static/
 marimo/_lsp/

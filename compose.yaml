@@ -1,0 +1,119 @@
+name: salary-prod
+
+services:
+  postgres:
+    image: postgres:18-bookworm
+    container_name: salary-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+    volumes:
+      - salary_pgdata:/var/lib/postgresql
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    security_opt:
+      - no-new-privileges:true
+
+  app:
+    image: salary-app:${APP_GIT_SHA:?APP_GIT_SHA must be set}
+    build:
+      context: .
+      args:
+        APP_GIT_SHA: ${APP_GIT_SHA}
+    container_name: salary-app
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set}
+      SECRET_SALT: ${SECRET_SALT:?SECRET_SALT must be set}
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET must be set}
+      ADMIN_LOGIN: ${ADMIN_LOGIN:?ADMIN_LOGIN must be set}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD must be set}
+      ENVIRONMENT: production
+      AUTO_SYNC_PRODUCTION_CALENDAR: "0"
+      MAINTENANCE_MODE: ${MAINTENANCE_MODE:-0}
+      MAX_RECEIPT_BYTES: ${MAX_RECEIPT_BYTES:-5242880}
+      APP_GIT_SHA: ${APP_GIT_SHA}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - salary_uploads:/srv/app/uploads
+    networks:
+      - frontend
+      - backend
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/db-check', timeout=3).read()"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
+
+  nginx:
+    image: nginx:1.28-alpine
+    container_name: salary-nginx
+    restart: unless-stopped
+    environment:
+      SERVER_NAME: ${SERVER_NAME:-sverka-mm.ru}
+    depends_on:
+      app:
+        condition: service_healthy
+    ports:
+      - "${HTTP_BIND_IP:-127.0.0.1}:${HTTP_PORT:-8080}:80"
+    volumes:
+      - ./deploy/nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+    networks:
+      - frontend
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
+
+  postgres-restore:
+    image: postgres:18-bookworm
+    container_name: salary-postgres-restore
+    profiles: ["restore"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+    volumes:
+      - salary_pgdata_restore:/var/lib/postgresql
+    networks:
+      - restore
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  frontend:
+    name: salary_frontend
+  backend:
+    name: salary_backend
+    internal: true
+  restore:
+    name: salary_restore
+    internal: true
+
+volumes:
+  salary_pgdata:
+    name: salary_pgdata
+  salary_pgdata_restore:
+    name: salary_pgdata_restore
+  salary_uploads:
+    name: salary_uploads
