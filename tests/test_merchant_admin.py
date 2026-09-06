@@ -421,12 +421,12 @@ class MerchantAdminTests(unittest.TestCase):
         ):
             response = self.client.get("/admin-data")
         self.assertEqual(response.status_code, 200)
-        self.assertIn("Удалить всех мерчендайзеров и их данные", response.text)
+        self.assertIn("Очистить список мерчендайзеров", response.text)
         self.assertIn('action="/admin-delete-all-merchants"', response.text)
         self.assertIn("УДАЛИТЬ ВСЕХ МЕРЧЕНДАЙЗЕРОВ", response.text)
         self.assertIn(
-            "Будут безвозвратно удалены все мерчендайзеры и все связанные с ними "
-            "сверки, выходы, примечания, возмещения и чеки. Продолжить?",
+            "Будут очищены данные входа всех мерчендайзеров. История сверок, "
+            "выходов, примечаний, возмещений и чеков сохранится. Продолжить?",
             response.text,
         )
 
@@ -484,7 +484,7 @@ class MerchantAdminTests(unittest.TestCase):
             self.assertEqual(counts["receipt_files"], 2)
             deleted = delete_all_merchants_and_data(db)
             db.commit()
-            self.assertEqual(deleted, counts)
+            self.assertEqual(deleted, {"merchants": 1})
             for table_name in (
                 "point_submissions",
                 "coffee_bonus",
@@ -495,7 +495,7 @@ class MerchantAdminTests(unittest.TestCase):
             ):
                 self.assertEqual(
                     db.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar(),
-                    0,
+                    counts[table_name],
                     table_name,
                 )
 
@@ -539,7 +539,7 @@ class MerchantAdminTests(unittest.TestCase):
                 1,
             )
 
-    def test_delete_all_removes_only_merchant_owned_data(self):
+    def test_reset_preserves_all_financial_history(self):
         first = self.create("Иванов Иван", "1234")
         second = self.create("Петров Пётр", "5678")
         with self.engine.begin() as connection:
@@ -639,11 +639,21 @@ class MerchantAdminTests(unittest.TestCase):
                 "receipt_files",
                 "merchant_audit_log",
             ):
-                self.assertEqual(
-                    db.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar(),
-                    0,
-                    table_name,
-                )
+                expected = 0 if table_name == "merchant_audit_log" else (2 if table_name in {"merchants", "visits", "receipt_files"} else 1)
+                self.assertEqual(db.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar(), expected, table_name)
+            self.assertEqual(db.execute(text("SELECT COUNT(*) FROM merchants WHERE is_active=TRUE")).scalar(), 0)
+            row = db.execute(text("SELECT * FROM merchants WHERE id=:id"), {"id": first["id"]}).mappings().one()
+            self.assertEqual(row["historical_fio"], "Иванов Иван")
+            self.assertEqual(row["fio"], "")
+            self.assertEqual(row["pass_hash"], "")
+            self.assertIsNone(row["last4"])
+            self.assertEqual(delete_all_merchants_and_data(db), {"merchants": 0})
+            db.commit()
+            imported = import_merchants_xlsx(db, merchant_workbook([("Иванов Иван", "1234")]), "ТУ-1")
+            self.assertEqual(imported["created"], 1)
+            new = login_user(db, "Иванов Иван", "1234")
+            self.assertNotEqual(new["id"], first["id"])
+            self.assertEqual(db.execute(text("SELECT merchant_id FROM visits WHERE point_code='P1'")).scalar(), first["id"])
             self.assertEqual(db.execute(text("SELECT COUNT(*) FROM points")).scalar(), 1)
             self.assertEqual(db.execute(text("SELECT COUNT(*) FROM supplies")).scalar(), 1)
 

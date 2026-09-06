@@ -554,6 +554,8 @@ class SlotHotfixTests(unittest.TestCase):
                 "INSERT INTO merchants VALUES (1, 'Первый', 'ТУ-1'), "
                 "(2, 'Второй', 'ТУ-2')"
             )
+            connection.exec_driver_sql("ALTER TABLE merchants ADD COLUMN historical_fio TEXT")
+            connection.exec_driver_sql("ALTER TABLE merchants ADD COLUMN historical_tu TEXT")
             connection.exec_driver_sql(
                 "INSERT INTO visits VALUES "
                 "(1, 1, '2674', '2026-07-17', 'MORNING'), "

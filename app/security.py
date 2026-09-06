@@ -10,6 +10,7 @@ from contextvars import ContextVar
 
 MERCHANT_COOKIE = "merchant_session"
 _request_merchant: ContextVar[str | None] = ContextVar("request_merchant", default=None)
+_request_session_time: ContextVar[float] = ContextVar("request_session_time", default=float("inf"))
 
 
 def _secret() -> bytes:
@@ -22,6 +23,7 @@ def _secret() -> bytes:
 def create_merchant_session(fio_norm: str) -> str:
     payload = {
         "sub": fio_norm,
+        "iat": time.time(),
         "csrf": secrets.token_urlsafe(24),
         "exp": int(time.time()) + 12 * 60 * 60,
     }
@@ -44,12 +46,17 @@ def read_merchant_session(token: str | None) -> dict | None:
         return None
 
 
-def set_request_merchant(fio_norm: str | None):
-    return _request_merchant.set(fio_norm)
+def set_request_merchant(fio_norm: str | None, issued_at: float = float("inf")):
+    return (_request_merchant.set(fio_norm), _request_session_time.set(issued_at))
 
 
 def reset_request_merchant(token) -> None:
-    _request_merchant.reset(token)
+    _request_merchant.reset(token[0])
+    _request_session_time.reset(token[1])
+
+
+def request_session_issued_at() -> float:
+    return _request_session_time.get()
 
 
 def request_merchant_matches(fio_norm: str) -> bool:

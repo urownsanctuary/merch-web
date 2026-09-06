@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import logging
 import threading
+from functools import wraps
 from datetime import date, datetime
 from io import BytesIO
 from html import escape
@@ -17,11 +18,12 @@ from fastapi import FastAPI, Depends, HTTPException, Form, UploadFile, File, Coo
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
-from sqlalchemy import text
+from sqlalchemy import text, inspect
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 
 from app.db import SessionLocal, engine
+from app.coffee_days import ensure_coffee_days_schema, change_coffee_days
 from app.services import (
     get_active_period,
     fio_norm,
@@ -168,7 +170,10 @@ async def reject_cross_site_mutations(request: Request, call_next):
 @app.middleware("http")
 async def bind_merchant_identity(request: Request, call_next):
     session = read_merchant_session(request.cookies.get(MERCHANT_COOKIE))
-    context_token = set_request_merchant(session.get("sub") if session else None)
+    context_token = set_request_merchant(
+        session.get("sub") if session else None,
+        float(session.get("iat", session.get("exp", 0) - 12 * 60 * 60)) if session else 0,
+    )
     try:
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
@@ -187,7 +192,14 @@ app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 ADMIN_LOGIN = os.getenv("ADMIN_LOGIN", "")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 SECRET_SALT = os.getenv("SECRET_SALT", "")
-MAX_RECEIPT_BYTES = int(os.getenv("MAX_RECEIPT_BYTES", str(5 * 1024 * 1024)))
+MAX_RECEIPT_BYTES = int(os.getenv("MAX_RECEIPT_BYTES", str(15 * 1024 * 1024)))
+UNSUPPORTED_RECEIPT = "Этот формат изображения не поддерживается. Отправьте JPG, PNG, WEBP или PDF."
+
+
+class ReceiptValidationError(ValueError):
+    """Only these bounded, user-facing messages may be returned by upload POSTs."""
+
+
 NON_WORKING_CONFIRM_MESSAGE = (
     "Это выходной или праздничный день по производственному календарю. "
     "Вы действительно работали в этот день?"
@@ -211,6 +223,8 @@ def ensure_admin_schema_on_startup():
     try:
         ensure_merchant_admin_schema(db)
         ensure_production_calendar_table(db)
+        ensure_receipt_files_table(db)
+        ensure_coffee_days_schema(db)
     except Exception:
         db.rollback()
         raise
@@ -355,31 +369,31 @@ def ensure_receipt_files_table(db: Session):
             content_type TEXT,
             data BYTEA NOT NULL,
             merchant_id INTEGER,
-            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
     """))
-    db.execute(text("ALTER TABLE receipt_files ADD COLUMN IF NOT EXISTS merchant_id INTEGER"))
+    if "merchant_id" not in {c["name"] for c in inspect(db.connection()).get_columns("receipt_files")}:
+        db.execute(text("ALTER TABLE receipt_files ADD COLUMN merchant_id INTEGER"))
     db.commit()
 
 
-def validate_receipt(original_filename: str | None, content_type: str | None, content: bytes) -> None:
-    name = Path(original_filename or "").name
-    extension = Path(name).suffix.lower()
-    content_type = str(content_type or "").lower()
-    allowed = {
-        "application/pdf": ({".pdf"}, (b"%PDF-",)),
-        "image/png": ({".png"}, (b"\x89PNG\r\n\x1a\n",)),
-        "image/jpeg": ({".jpg", ".jpeg"}, (b"\xff\xd8\xff",)),
-        "image/webp": ({".webp"}, (b"RIFF",)),
-    }
-    if not content or len(content) > MAX_RECEIPT_BYTES:
-        raise ValueError("Чек пуст или превышает допустимый размер")
-    if content_type not in allowed or extension not in allowed[content_type][0]:
-        raise ValueError("Разрешены только PDF, PNG, JPEG и WEBP с корректным MIME")
-    if not any(content.startswith(signature) for signature in allowed[content_type][1]):
-        raise ValueError("Содержимое чека не соответствует заявленному типу")
-    if content_type == "image/webp" and content[8:12] != b"WEBP":
-        raise ValueError("Некорректный WEBP")
+def validate_receipt(original_filename: str | None, content_type: str | None, content: bytes) -> tuple[str, str]:
+    """Canonical MIME/extension come from bytes, not Android's upload metadata."""
+    if not content:
+        raise ReceiptValidationError("Чек пуст. Выберите другой файл.")
+    if len(content) > MAX_RECEIPT_BYTES:
+        raise ReceiptValidationError(f"Чек превышает допустимый размер {MAX_RECEIPT_BYTES // (1024 * 1024)} МБ. Уменьшите фото и повторите загрузку.")
+    for signature, mime, extension in (
+        (b"%PDF-", "application/pdf", ".pdf"),
+        (b"\x89PNG\r\n\x1a\n", "image/png", ".png"),
+        (b"\xff\xd8\xff", "image/jpeg", ".jpg"),
+    ):
+        if content.startswith(signature):
+            return mime, extension
+    if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+        return "image/webp", ".webp"
+    # HEIC/HEIF decoding is not available in the project's libraries.
+    raise ReceiptValidationError(UNSUPPORTED_RECEIPT)
 
 
 def save_receipt_file_to_db(
@@ -389,21 +403,69 @@ def save_receipt_file_to_db(
     content_type: str | None,
     content: bytes,
 ) -> str:
-    ensure_receipt_files_table(db)
-    validate_receipt(original_filename, content_type, content)
+    content_type, extension = validate_receipt(original_filename, content_type, content)
     file_id = uuid.uuid4().hex
-    display_filename = safe_receipt_filename(original_filename)
+    display_filename = f"receipt{extension}"
     db.execute(text("""
         INSERT INTO receipt_files (file_id, original_filename, content_type, data, merchant_id)
         VALUES (:file_id, :original_filename, :content_type, :data, :merchant_id)
     """), {
         "file_id": file_id,
-        "original_filename": original_filename or display_filename,
-        "content_type": content_type or "application/octet-stream",
+        "original_filename": display_filename,
+        "content_type": content_type,
         "data": content,
         "merchant_id": merchant_id,
     })
     return f"receipts/{file_id}/{display_filename}"
+
+
+def receipt_transaction(handler):
+    """Both receipt POST routes own one transaction; error responses discard it."""
+    @wraps(handler)
+    async def wrapped(*args, **kwargs):
+        db = kwargs["db"]
+        try:
+            response = await handler(*args, **kwargs)
+            if isinstance(response, RedirectResponse) and "saved=1" in response.headers.get("location", ""):
+                db.commit()
+            else:
+                db.rollback()
+            return response
+        except HTTPException:
+            db.rollback()
+            raise
+        except Exception as exc:
+            db.rollback()
+            if isinstance(exc, ReceiptValidationError):
+                message = str(exc)
+            else:
+                log_redacted_exception("receipt_upload_failed", exc)
+                message = "Не удалось сохранить возмещение. Все изменения отменены. Попробуйте ещё раз."
+            back = "/point-reimbursement-page?" + urlencode({"fio": kwargs.get("fio", ""), "point_code": kwargs.get("point_code", "")})
+            return HTMLResponse(
+                f'<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">{base_css()}</head>'
+                f'<body><div class="page"><div class="card"><h1>Возмещение не сохранено</h1><div class="error-box">{escape(message)}</div>'
+                f'<a class="back" href="{escape(back)}">Вернуться к возмещению</a></div></div></body></html>',
+                status_code=400,
+            )
+    return wrapped
+
+
+async def prepare_receipts(uploads: list[UploadFile]) -> list[tuple[str, str, bytes]]:
+    if len(uploads) > 10:
+        raise ReceiptValidationError("За один раз можно загрузить не более 10 чеков.")
+    prepared = []
+    total = 0
+    for upload in uploads:
+        if not upload or not upload.filename:
+            continue
+        content = await upload.read(MAX_RECEIPT_BYTES + 1)
+        mime, extension = validate_receipt(upload.filename, upload.content_type, content)
+        total += len(content)
+        if total > 24 * 1024 * 1024:
+            raise ReceiptValidationError("Общий размер чеков не должен превышать 24 МБ.")
+        prepared.append((f"receipt{extension}", mime, content))
+    return prepared
 
 
 def render_receipt_links(value: str | None, text: str = "Открыть") -> str:
@@ -1144,7 +1206,6 @@ def receipt_file(
     admin_auth: Optional[str] = Cookie(default=None),
     db: Session = Depends(get_db),
 ):
-    ensure_receipt_files_table(db)
     row = db.execute(text("""
         SELECT rf.original_filename, rf.content_type, rf.data, rf.merchant_id, m.fio_norm
         FROM receipt_files rf
@@ -1587,6 +1648,7 @@ def calendar_page(
     saved: str = "",
     visit_error: str = "",
     inventory_date: str = "",
+    coffee_error: str = "",
     db: Session = Depends(get_db)
 ):
     period = get_active_period()
@@ -1627,6 +1689,8 @@ def calendar_page(
     )
 
     info_box = ""
+    if coffee_error:
+        info_box = '<div class="error-box">Не удалось изменить дни кофемашины. Проверьте количество выходов и статус сверки.</div>'
     if saved == "1":
         info_box = "<div class=\"success-box\">Данные по точке сохранены.</div>"
     if visit_error == "inventory_week":
@@ -1658,6 +1722,16 @@ def calendar_page(
             f'<div class="detail-line">{point_total["coffee_cnt"]} × {point_total["coffee_rate"]} ₽ = {point_total["coffee_sum"]} ₽</div>'
             '</div>'
         )
+        if not monthly_submitted:
+            coffee_card_html += f"""
+            <form method="post" action="/coffee-days" class="detail-card">
+                <input type="hidden" name="fio" value="{escape(fio)}" />
+                <input type="hidden" name="point_code" value="{escape(point_code)}" />
+                <input type="hidden" name="csrf_token" value="{escape(session['csrf'])}" />
+                <div class="detail-title">Дни с кофемашиной: {point_total['coffee_cnt']}</div>
+                <button class="btn btn-inline" name="delta" value="-1" {'disabled' if point_total['coffee_cnt'] <= 0 else ''}>−</button>
+                <button class="btn btn-inline" name="delta" value="1" {'disabled' if point_total['coffee_cnt'] >= point_total['cnt_day_total'] else ''}>+</button>
+            </form>"""
 
     supply_policy_note = (
         "Для этой точки поставки от 1 коробки оплачиваются по ставке поставки."
@@ -2087,8 +2161,36 @@ def save_point_note_no_supply(
     return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code_clean)}&saved=1", status_code=303)
 
 
+@app.post("/coffee-days")
+def update_coffee_days(
+    request: Request, fio: str = Form(...), point_code: str = Form(...),
+    delta: int = Form(...), csrf_token: str = Form(""), db: Session = Depends(get_db),
+):
+    if not verify_csrf(read_merchant_session(request.cookies.get(MERCHANT_COOKIE)), csrf_token):
+        raise HTTPException(status_code=403, detail="Недействительный CSRF-токен")
+    merchant = get_merchant_by_fio(db, fio)
+    if not merchant:
+        return RedirectResponse("/login-page", status_code=303)
+    period = get_active_period()
+    point_code = normalize_point_code(point_code)
+    params = {"fio": fio, "point_code": point_code}
+    try:
+        total = compute_point_total(db, merchant["id"], point_code, period["year"], period["month"])
+        change_coffee_days(db, merchant["id"], point_code, date(period["year"], period["month"], 1), delta,
+                           total["cnt_day_total"], total["coffee_enabled"])
+        db.commit()
+        params["saved"] = "1"
+    except Exception as exc:
+        db.rollback()
+        if not isinstance(exc, ValueError):
+            log_redacted_exception("coffee_days_failed", exc)
+        params["coffee_error"] = "1"
+    return RedirectResponse("/calendar-page?" + urlencode(params), status_code=303)
+
+
 @app.get("/point-reimbursement-page", response_class=HTMLResponse)
 def point_reimbursement_page(
+    request: Request,
     fio: str,
     point_code: str,
     db: Session = Depends(get_db)
@@ -2120,6 +2222,7 @@ def point_reimbursement_page(
             <div class="subtitle">Точка: {escape(point_code_clean)}</div>
 
             <form method="post" action="/save-point-reimbursement" enctype="multipart/form-data" autocomplete="off">
+                <input type="hidden" name="csrf_token" value="{escape((read_merchant_session(request.cookies.get(MERCHANT_COOKIE)) or {}).get('csrf', ''))}" />
                 <input type="hidden" name="fio" value="{escape(fio)}" />
                 <input type="hidden" name="point_code" value="{escape(point_code_clean)}" />
 
@@ -2130,7 +2233,7 @@ def point_reimbursement_page(
                 <input id="reimb_comment" name="reimb_comment" type="text" value="" placeholder="Например: Покупка пакетов" required />
 
                 <label for="reimb_receipts">Чеки</label>
-                <input id="reimb_receipts" name="reimb_receipts" type="file" accept=".jpg,.jpeg,.png,.pdf,.webp" multiple />
+                <input id="reimb_receipts" name="reimb_receipts" type="file" accept="image/*,application/pdf" multiple />
                 <div class="hint">Если указано возмещение, необходимо прикрепить чек. Можно загрузить несколько чеков.</div>
 
                 <div class="hint" style="margin-top:10px;">Уже загруженные чеки по этой точке:<br>{receipt_links}</div>
@@ -2147,14 +2250,19 @@ def point_reimbursement_page(
 
 
 @app.post("/save-point-reimbursement")
+@receipt_transaction
 async def save_point_reimbursement(
+    request: Request,
     fio: str = Form(...),
     point_code: str = Form(...),
     reimb_amount: int = Form(0),
     reimb_comment: str = Form(""),
     reimb_receipts: List[UploadFile] = File(default=[]),
+    csrf_token: str = Form(""),
     db: Session = Depends(get_db)
 ):
+    if not verify_csrf(read_merchant_session(request.cookies.get(MERCHANT_COOKIE)), csrf_token):
+        raise HTTPException(status_code=403, detail="Недействительный CSRF-токен")
     period = get_active_period()
     merchant = get_merchant_by_fio(db, fio)
     if not merchant:
@@ -2166,12 +2274,11 @@ async def save_point_reimbursement(
     reimb_comment_value = (reimb_comment or "").strip()
     existing = get_point_adjustment(db, merchant["id"], point_code_clean, period["year"], period["month"]) or {}
 
+    prepared = await prepare_receipts(reimb_receipts or [])
     new_paths = []
-    for receipt in reimb_receipts or []:
-        if receipt and receipt.filename:
-            content = await receipt.read()
-            if content:
-                new_paths.append(save_receipt_file_to_db(db, merchant["id"], receipt.filename, receipt.content_type, content))
+    if reimb_amount_value > 0 and reimb_comment_value:
+        for filename, mime, content in prepared:
+            new_paths.append(save_receipt_file_to_db(db, merchant["id"], filename, mime, content))
 
     if reimb_amount_value <= 0 or not reimb_comment_value or not new_paths:
         return HTMLResponse(f"""
@@ -2211,13 +2318,16 @@ async def save_point_reimbursement(
         reimb_amount=existing_reimb_amount + reimb_amount_value,
         reimb_comment=new_reimb_comment,
         reimb_receipt=combined_receipts,
+        commit=False,
     )
 
     return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code_clean)}&saved=1", status_code=303)
 
 
 @app.post("/save-point-adjustment")
+@receipt_transaction
 async def save_point_adjustment(
+    request: Request,
     fio: str = Form(...),
     point_code: str = Form(...),
     note_amount: int = Form(0),
@@ -2225,8 +2335,11 @@ async def save_point_adjustment(
     reimb_amount: int = Form(0),
     reimb_comment: str = Form(""),
     reimb_receipt: UploadFile | None = File(None),
+    csrf_token: str = Form(""),
     db: Session = Depends(get_db)
 ):
+    if not verify_csrf(read_merchant_session(request.cookies.get(MERCHANT_COOKIE)), csrf_token):
+        raise HTTPException(status_code=403, detail="Недействительный CSRF-токен")
     # Compatibility route for old form versions.
     period = get_active_period()
     merchant = get_merchant_by_fio(db, fio)
@@ -2239,11 +2352,9 @@ async def save_point_adjustment(
     # Важно: он НЕ перетирает уже внесённые примечания/возмещения, а добавляет новые значения.
     receipt_path = existing.get("reimb_receipt")
     new_receipt_paths = []
-    if reimb_receipt and reimb_receipt.filename:
-        content = await reimb_receipt.read()
-        if content:
-            new_receipt_paths.append(save_receipt_file_to_db(db, merchant["id"], reimb_receipt.filename, reimb_receipt.content_type, content))
-            receipt_path = append_receipt_paths(receipt_path, new_receipt_paths)
+    for filename, mime, content in await prepare_receipts([reimb_receipt] if reimb_receipt else []):
+        new_receipt_paths.append(save_receipt_file_to_db(db, merchant["id"], filename, mime, content))
+    receipt_path = append_receipt_paths(receipt_path, new_receipt_paths)
 
     add_note_amount = int(note_amount or 0)
     add_note_comment = (note_comment or "").strip()
@@ -2282,6 +2393,7 @@ async def save_point_adjustment(
         reimb_amount=final_reimb_amount,
         reimb_comment=final_reimb_comment,
         reimb_receipt=receipt_path,
+        commit=False,
     )
     return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code_clean)}&saved=1", status_code=303)
 
@@ -3839,7 +3951,7 @@ def admin_data_page(
         )
         merchant_delete_preview = (
             "<div class='hint' style='margin-top:14px;'>"
-            "Перед удалением будут обработаны:</div>"
+            "Исторические записи будут сохранены. Текущее количество:</div>"
             f"<ul>{merchant_delete_count_html}</ul>"
         )
     except Exception as exc:
@@ -3947,11 +4059,11 @@ def admin_data_page(
                         <button class="btn" type="submit">Загрузить мерчей</button>
                     </form>
                     {merchant_delete_preview}
-                    <form method="post" action="/admin-delete-all-merchants" style="margin-top:18px;" onsubmit="return confirm('Будут безвозвратно удалены все мерчендайзеры и все связанные с ними сверки, выходы, примечания, возмещения и чеки. Продолжить?');">
+                    <form method="post" action="/admin-delete-all-merchants" style="margin-top:18px;" onsubmit="return confirm('Будут очищены данные входа всех мерчендайзеров. История сверок, выходов, примечаний, возмещений и чеков сохранится. Продолжить?');">
                         <input type="hidden" name="csrf_token" value="{admin_csrf}" />
                         <label for="delete_all_merchants_confirmation">Для подтверждения введите: <strong>{DELETE_ALL_CONFIRMATION}</strong></label>
                         <input id="delete_all_merchants_confirmation" name="confirmation" type="text" autocomplete="off" required />
-                        <button class="btn btn-danger" type="submit">Удалить всех мерчендайзеров и их данные</button>
+                        <button class="btn btn-danger" type="submit">Очистить список мерчендайзеров</button>
                     </form>
                 </div>
 
@@ -4393,12 +4505,9 @@ def admin_delete_all_merchants(
     try:
         deleted = delete_all_merchants_and_data(db)
         db.commit()
-        summary = ", ".join(
-            f"{key}: {value}" for key, value in deleted.items()
-        )
         message = (
-            "Все мерчендайзеры и связанные с ними данные удалены. "
-            f"Удалено строк — {summary}."
+            f"Очищено мерчендайзеров: {deleted['merchants']}. "
+            "История сохранена. Можно загружать новый список."
         )
         return RedirectResponse(
             url="/admin-data?success="
