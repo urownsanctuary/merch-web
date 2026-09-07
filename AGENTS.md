@@ -1,6 +1,6 @@
 # merch-web production rules
 
-- Work only on `codex/full-production-audit`; never merge or deploy production.
+- Work only on `codex/full-production-audit`, except `codex/hotfix-four-production-fixes` is permitted for the four fixes explicitly authorized by the user. Production merge or deployment is allowed only after the user explicitly confirms it in the current conversation; otherwise, do not change production.
 - Treat `origin/main` as production baseline only after fetching every remote ref.
 - Preserve existing routes, imports, exports, reports, and user data.
 - Schema changes are additive and idempotent. Never delete legacy fields during migration.

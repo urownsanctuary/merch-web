@@ -25,7 +25,9 @@ from app.main import (
 )
 from app.merchant_admin import (
     MerchantInputError,
+    count_merchant_owned_rows,
     create_merchant,
+    delete_all_merchants_and_data,
     ensure_merchant_admin_schema,
     get_merchant_for_admin,
     list_merchants,
@@ -419,14 +421,112 @@ class MerchantAdminTests(unittest.TestCase):
         ):
             response = self.client.get("/admin-data")
         self.assertEqual(response.status_code, 200)
-        self.assertIn("Удалить всех мерчендайзеров и их данные", response.text)
+        self.assertIn("Очистить список мерчендайзеров", response.text)
         self.assertIn('action="/admin-delete-all-merchants"', response.text)
         self.assertIn("УДАЛИТЬ ВСЕХ МЕРЧЕНДАЙЗЕРОВ", response.text)
         self.assertIn(
-            "Будут безвозвратно удалены все мерчендайзеры и все связанные с ними "
-            "сверки, выходы, примечания, возмещения и чеки. Продолжить?",
+            "Будут очищены данные входа всех мерчендайзеров. История сверок, "
+            "выходов, примечаний, возмещений и чеков сохранится. Продолжить?",
             response.text,
         )
+
+    def test_delete_preview_counts_coffee_audit_and_reset_preserves_it(self):
+        merchant = self.create()
+        with self.engine.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE TABLE coffee_days_audit "
+                "(id INTEGER PRIMARY KEY, merchant_id INTEGER NOT NULL)"
+            )
+            connection.execute(
+                text("INSERT INTO coffee_days_audit VALUES (1, :merchant_id)"),
+                {"merchant_id": merchant["id"]},
+            )
+        with self.factory() as db:
+            self.assertEqual(count_merchant_owned_rows(db)["coffee_days_audit"], 1)
+        with patch("app.main.get_active_period", return_value={"year": 2026, "month": 7}), patch(
+            "app.main.get_all_tu_values", return_value=["ТУ-1"]
+        ), patch("app.main.get_special_inventory_days", return_value=[]), patch(
+            "app.main.get_calendar_status", return_value=[]
+        ), patch("app.main.log_redacted_exception") as log_error:
+            response = self.client.get("/admin-data")
+        self.assertEqual(response.status_code, 200)
+        log_error.assert_not_called()
+        with self.factory() as db:
+            self.assertEqual(delete_all_merchants_and_data(db), {"merchants": 1})
+            db.commit()
+            self.assertEqual(
+                db.execute(text("SELECT merchant_id FROM coffee_days_audit")).scalar(),
+                merchant["id"],
+            )
+
+    def test_delete_preview_accepts_legacy_merchant_tables(self):
+        merchant = self.create()
+        with self.engine.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE TABLE point_submissions "
+                "(id INTEGER PRIMARY KEY, merchant_id INTEGER NOT NULL, receipt_path TEXT)"
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO point_submissions "
+                    "(id, merchant_id, receipt_path) "
+                    "VALUES (1, :merchant_id, 'receipts/legacy-file/receipt.pdf')"
+                ),
+                {"merchant_id": merchant["id"]},
+            )
+            connection.exec_driver_sql(
+                "CREATE TABLE receipt_files "
+                "(file_id TEXT PRIMARY KEY, merchant_id INTEGER, data BLOB)"
+            )
+            for table_name in ("coffee_bonus", "submissions"):
+                connection.exec_driver_sql(
+                    f"CREATE TABLE {table_name} "
+                    "(id INTEGER PRIMARY KEY, merchant_id INTEGER NOT NULL)"
+                )
+                connection.execute(
+                    text(f"INSERT INTO {table_name} VALUES (1, :merchant_id)"),
+                    {"merchant_id": merchant["id"]},
+                )
+            connection.exec_driver_sql(
+                "CREATE TABLE reimbursements "
+                "(id INTEGER PRIMARY KEY, merchant_id INTEGER NOT NULL, receipt_file_id TEXT)"
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO reimbursements "
+                    "(id, merchant_id, receipt_file_id) "
+                    "VALUES (1, :merchant_id, 'direct-file')"
+                ),
+                {"merchant_id": merchant["id"]},
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO receipt_files VALUES "
+                "('legacy-file', NULL, X'25504446'), "
+                "('direct-file', NULL, X'25504446')"
+            )
+        with self.factory() as db:
+            counts = count_merchant_owned_rows(db)
+            self.assertEqual(counts["point_submissions"], 1)
+            self.assertEqual(counts["coffee_bonus"], 1)
+            self.assertEqual(counts["reimbursements"], 1)
+            self.assertEqual(counts["submissions"], 1)
+            self.assertEqual(counts["receipt_files"], 2)
+            deleted = delete_all_merchants_and_data(db)
+            db.commit()
+            self.assertEqual(deleted, {"merchants": 1})
+            for table_name in (
+                "point_submissions",
+                "coffee_bonus",
+                "reimbursements",
+                "submissions",
+                "receipt_files",
+                "merchants",
+            ):
+                self.assertEqual(
+                    db.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar(),
+                    counts[table_name],
+                    table_name,
+                )
 
     def test_delete_all_requires_admin_csrf_and_exact_confirmation(self):
         merchant = self.create()
@@ -468,7 +568,7 @@ class MerchantAdminTests(unittest.TestCase):
                 1,
             )
 
-    def test_delete_all_removes_only_merchant_owned_data(self):
+    def test_reset_preserves_all_financial_history(self):
         first = self.create("Иванов Иван", "1234")
         second = self.create("Петров Пётр", "5678")
         with self.engine.begin() as connection:
@@ -568,11 +668,21 @@ class MerchantAdminTests(unittest.TestCase):
                 "receipt_files",
                 "merchant_audit_log",
             ):
-                self.assertEqual(
-                    db.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar(),
-                    0,
-                    table_name,
-                )
+                expected = 0 if table_name == "merchant_audit_log" else (2 if table_name in {"merchants", "visits", "receipt_files"} else 1)
+                self.assertEqual(db.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar(), expected, table_name)
+            self.assertEqual(db.execute(text("SELECT COUNT(*) FROM merchants WHERE is_active=TRUE")).scalar(), 0)
+            row = db.execute(text("SELECT * FROM merchants WHERE id=:id"), {"id": first["id"]}).mappings().one()
+            self.assertEqual(row["historical_fio"], "Иванов Иван")
+            self.assertEqual(row["fio"], "")
+            self.assertEqual(row["pass_hash"], "")
+            self.assertIsNone(row["last4"])
+            self.assertEqual(delete_all_merchants_and_data(db), {"merchants": 0})
+            db.commit()
+            imported = import_merchants_xlsx(db, merchant_workbook([("Иванов Иван", "1234")]), "ТУ-1")
+            self.assertEqual(imported["created"], 1)
+            new = login_user(db, "Иванов Иван", "1234")
+            self.assertNotEqual(new["id"], first["id"])
+            self.assertEqual(db.execute(text("SELECT merchant_id FROM visits WHERE point_code='P1'")).scalar(), first["id"])
             self.assertEqual(db.execute(text("SELECT COUNT(*) FROM points")).scalar(), 1)
             self.assertEqual(db.execute(text("SELECT COUNT(*) FROM supplies")).scalar(), 1)
 

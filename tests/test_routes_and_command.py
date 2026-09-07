@@ -103,7 +103,13 @@ class RouteTests(unittest.TestCase):
                 "/toggle-day",
                 data={"fio": "Иванов Иван", "point_code": "P1", "day": 1, "slot": "MORNING", "csrf_token": ""},
             )
-        self.assertEqual(response.status_code, 403)
+            # FastAPI 0.136 rejects an empty required Form before the handler.
+            self.assertIn(response.status_code, (403, 422))
+            forged = client.post(
+                "/toggle-day",
+                data={"fio": "Иванов Иван", "point_code": "P1", "day": 1, "slot": "MORNING", "csrf_token": "forged"},
+            )
+        self.assertEqual(forged.status_code, 403)
 
     def test_cross_site_mutation_is_rejected_before_route(self):
         with TestClient(app) as client:

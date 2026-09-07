@@ -3,11 +3,13 @@ import re
 import math
 import hashlib
 import hmac
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 from sqlalchemy import text, bindparam, inspect
 from openpyxl import load_workbook
-from app.security import request_merchant_matches
+from app.security import request_merchant_matches, request_session_issued_at
+from app.runtime import maintenance_mode_enabled
+from app.coffee_days import coffee_count
 from app.merchant_admin import (
     create_merchant,
     deactivate_all_merchants,
@@ -148,6 +150,16 @@ def get_merchant_by_fio(db: Session, fio: str):
     fio_n = fio_norm(fio)
     if not request_merchant_matches(fio_n):
         return None
+    # A roster reset invalidates previously issued sessions even if the same
+    # FIO is subsequently imported as a new live identity.
+    cleared_at = db.execute(text("SELECT MAX(credentials_cleared_at) FROM merchants")).scalar()
+    if cleared_at:
+        if isinstance(cleared_at, str):
+            cleared_at = datetime.fromisoformat(cleared_at)
+        if cleared_at.tzinfo is None:
+            cleared_at = cleared_at.replace(tzinfo=timezone.utc)
+        if request_session_issued_at() <= cleared_at.timestamp():
+            return None
     result = db.execute(
         text(
             """
@@ -191,6 +203,8 @@ def weekday_of(y: int, m: int, d: int) -> int:
 
 
 def ensure_special_inventory_days_table(db: Session):
+    if maintenance_mode_enabled():
+        return
     db.execute(text("""
         CREATE TABLE IF NOT EXISTS special_inventory_days (
             id SERIAL PRIMARY KEY,
@@ -604,6 +618,8 @@ def effective_has_supply(boxes: int, pay_lt5: bool) -> bool:
 
 
 def ensure_monthly_submissions_table(db: Session):
+    if maintenance_mode_enabled():
+        return
     db.execute(
         text(
             """
@@ -787,13 +803,15 @@ def get_points_for_month(db: Session, merchant_id: int, y: int, m: int) -> list[
 def normalized_adjustments_available(db: Session) -> bool:
     """Check the optional migrated storage without creating any table."""
     try:
-        db_inspector = inspect(db.get_bind())
+        db_inspector = inspect(db.connection())
         return all(db_inspector.has_table(name) for name in NORMALIZED_ADJUSTMENT_TABLES)
     except Exception:
         return False
 
 
 def ensure_point_adjustments_table(db: Session):
+    if maintenance_mode_enabled():
+        return
     db.execute(text("""
         CREATE TABLE IF NOT EXISTS point_adjustments (
             id SERIAL PRIMARY KEY,
@@ -813,8 +831,9 @@ def ensure_point_adjustments_table(db: Session):
     db.commit()
 
 
-def get_point_adjustment(db: Session, merchant_id: int, point_code: str, y: int, m: int):
-    ensure_point_adjustments_table(db)
+def get_point_adjustment(db: Session, merchant_id: int, point_code: str, y: int, m: int, *, ensure_schema: bool = True):
+    if ensure_schema:
+        ensure_point_adjustments_table(db)
     mk = month_start(y, m)
     if normalized_adjustments_available(db):
         notes = db.execute(
@@ -916,10 +935,13 @@ def upsert_point_adjustment(
     reimb_amount: int,
     reimb_comment: str,
     reimb_receipt: str | None,
+    *,
+    commit: bool = True,
 ):
-    ensure_point_adjustments_table(db)
+    if commit:
+        ensure_point_adjustments_table(db)
     mk = month_start(y, m)
-    existing = get_point_adjustment(db, merchant_id, point_code, y, m)
+    existing = get_point_adjustment(db, merchant_id, point_code, y, m, ensure_schema=commit)
 
     if existing:
         db.execute(text("""
@@ -963,7 +985,8 @@ def upsert_point_adjustment(
             "reimb_receipt": reimb_receipt,
         })
 
-    db.commit()
+    if commit:
+        db.commit()
 
 def compute_point_total(db: Session, merchant_id: int, point_code: str, y: int, m: int):
     ensure_point_adjustments_table(db)
@@ -1002,8 +1025,8 @@ def compute_point_total(db: Session, merchant_id: int, point_code: str, y: int, 
     coffee_sum = 0
     coffee_cnt = 0
     if rates["coffee_enabled"] and cnt_day_total > 0:
-        coffee_cnt = cnt_day_total
-        coffee_sum = rates["coffee_rate"] * cnt_day_total
+        coffee_cnt = coffee_count(db, merchant_id, point_code, month_start(y, m), cnt_day_total)
+        coffee_sum = rates["coffee_rate"] * coffee_cnt
         total += coffee_sum
 
     note_amount = 0
@@ -1084,7 +1107,7 @@ def compute_overall_total(db: Session, merchant_id: int, y: int, m: int):
 def get_all_tu_values(db: Session) -> list[str]:
     rows = db.execute(text("""
         SELECT DISTINCT tu
-        FROM merchants
+        FROM (SELECT tu FROM merchants UNION SELECT historical_tu AS tu FROM merchants) identities
         WHERE tu IS NOT NULL AND TRIM(tu) <> ''
         ORDER BY tu
     """)).all()
@@ -1287,9 +1310,16 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
             COALESCE(va.cnt_supply, 0) AS cnt_supply,
             COALESCE(va.cnt_no_supply, 0) AS cnt_no_supply,
             COALESCE(va.cnt_full_inv, 0) AS cnt_full_inv,
-            COALESCE(va.cnt_day_total, 0) AS cnt_day_total
+            COALESCE(va.cnt_day_total, 0) AS cnt_day_total,
+            cb.days_count AS coffee_days_count
         FROM base_points bp
-        JOIN merchants m ON m.id = bp.merchant_id
+        JOIN (SELECT id, COALESCE(historical_fio, fio) AS fio,
+                     COALESCE(historical_tu, tu) AS tu FROM merchants) m
+          ON m.id = bp.merchant_id
+        LEFT JOIN coffee_bonus cb
+          ON cb.merchant_id = bp.merchant_id
+         AND cb.point_code = bp.point_code
+         AND cb.month_key = :month_key
         LEFT JOIN visit_agg va
           ON va.merchant_id = bp.merchant_id
          AND va.point_code = bp.point_code
@@ -1338,7 +1368,8 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
         sum_supply = cnt_supply * rate_supply
         sum_no_supply = cnt_no_supply * rate_no_supply
         sum_inventory = cnt_full_inv * rate_inventory
-        coffee_cnt = cnt_day_total if coffee_enabled else 0
+        stored_coffee = row.get("coffee_days_count")
+        coffee_cnt = (cnt_day_total if stored_coffee is None else min(cnt_day_total, max(0, int(stored_coffee)))) if coffee_enabled else 0
         coffee_sum = coffee_cnt * coffee_rate if coffee_enabled else 0
         point_total = sum_supply + sum_no_supply + sum_inventory + coffee_sum + note_amount + reimb_amount
 
@@ -1419,8 +1450,10 @@ def _valid_intersection_candidates(
          AND v1.point_code = v2.point_code
          AND v1.slot = v2.slot
          AND v1.merchant_id < v2.merchant_id
-        JOIN merchants m1 ON m1.id = v1.merchant_id
-        JOIN merchants m2 ON m2.id = v2.merchant_id
+        JOIN (SELECT id, COALESCE(historical_fio, fio) AS fio,
+                     COALESCE(historical_tu, tu) AS tu FROM merchants) m1 ON m1.id = v1.merchant_id
+        JOIN (SELECT id, COALESCE(historical_fio, fio) AS fio,
+                     COALESCE(historical_tu, tu) AS tu FROM merchants) m2 ON m2.id = v2.merchant_id
         WHERE v1.visit_date >= :start_date
           AND v1.visit_date < :end_date
           AND v1.slot IN ('MORNING', 'EVENING')

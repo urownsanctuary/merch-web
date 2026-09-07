@@ -6,6 +6,7 @@ import json
 import re
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import bindparam, inspect, text
@@ -30,6 +31,11 @@ MERCHANT_OWNED_TABLES = (
     "point_notes",
     "point_reimbursements",
     "point_adjustments",
+    "point_submissions",
+    "coffee_bonus",
+    "coffee_days_audit",
+    "reimbursements",
+    "submissions",
     "monthly_submissions",
     "visits",
     "merchant_audit_log",
@@ -107,6 +113,9 @@ def ensure_merchant_admin_schema(db: Session) -> None:
         ("is_active", "BOOLEAN NOT NULL DEFAULT TRUE"),
         ("created_at", "TIMESTAMP"),
         ("updated_at", "TIMESTAMP"),
+        ("historical_fio", "TEXT"),
+        ("historical_tu", "TEXT"),
+        ("credentials_cleared_at", "TIMESTAMP"),
     )
     dialect = db.get_bind().dialect.name
     for column, definition in additions:
@@ -293,7 +302,7 @@ def get_merchant_for_admin(db: Session, merchant_id: int) -> dict[str, Any] | No
     row = db.execute(
         text(
             """
-            SELECT id, fio, fio_norm, last4, tu, is_active, created_at, updated_at
+            SELECT id, fio, fio_norm, last4, tu, is_active, created_at, updated_at, credentials_cleared_at
             FROM merchants
             WHERE id = :merchant_id
             """
@@ -319,6 +328,8 @@ def update_merchant(
     existing = get_merchant_for_admin(db, merchant_id)
     if not existing:
         raise MerchantInputError(message="Сотрудник не найден.")
+    if existing.get("credentials_cleared_at"):
+        raise MerchantInputError(message="Это архивная запись. Загрузите сотрудника через новый список.")
     values = validate_merchant_values(
         fio, last4, tu, fio_normalizer=fio_normalizer
     )
@@ -387,6 +398,8 @@ def set_merchant_active(
         raise MerchantInputError(message="Сотрудник не найден.")
     if bool(existing["is_active"]) == bool(active):
         return False
+    if existing.get("credentials_cleared_at"):
+        raise MerchantInputError(message="Это архивная запись. Загрузите сотрудника через новый список.")
     db.execute(
         text(
             """
@@ -474,6 +487,7 @@ def _merchant_receipt_file_ids(db: Session, tables: dict[str, set[str]]) -> set[
     file_ids: set[str] = set()
     path_sources = (
         ("monthly_submissions", "receipt_path"),
+        ("point_submissions", "receipt_path"),
         ("point_adjustments", "reimb_receipt"),
     )
     for table_name, column_name in path_sources:
@@ -493,6 +507,18 @@ def _merchant_receipt_file_ids(db: Session, tables: dict[str, set[str]]) -> set[
                 match = re.search(r"(?:^|/)receipts/([^/]+)/", path.strip())
                 if match:
                     file_ids.add(match.group(1))
+    if "receipt_file_id" in tables.get("reimbursements", set()):
+        rows = db.execute(
+            text(
+                """
+                SELECT receipt_file_id
+                FROM reimbursements
+                WHERE merchant_id IN (SELECT id FROM merchants)
+                  AND receipt_file_id IS NOT NULL
+                """
+            )
+        ).all()
+        file_ids.update(str(row[0]) for row in rows if row[0])
     return file_ids
 
 
@@ -535,6 +561,11 @@ def count_merchant_owned_rows(db: Session) -> dict[str, int]:
         "point_notes",
         "point_reimbursements",
         "point_adjustments",
+        "point_submissions",
+        "coffee_bonus",
+        "coffee_days_audit",
+        "reimbursements",
+        "submissions",
         "monthly_submissions",
         "visits",
         "merchant_audit_log",
@@ -583,64 +614,29 @@ def count_merchant_owned_rows(db: Session) -> dict[str, int]:
 
 
 def delete_all_merchants_and_data(db: Session) -> dict[str, int]:
-    """Delete all merchant-owned rows. The caller owns commit or rollback."""
-    tables = _existing_merchant_owned_tables(db)
-    counts = count_merchant_owned_rows(db)
-    if "merchants" not in tables:
-        return counts
+    """Compatibility name: clear credentials only, retaining every historical ID.
 
-    receipt_file_ids = _existing_merchant_receipt_file_ids(db, tables)
-    deleted: dict[str, int] = {table_name: 0 for table_name in counts}
-
-    if (
-        "reimbursement_receipts" in tables
-        and "point_reimbursements" in tables
-    ):
-        result = db.execute(
-            text(
-                """
-                DELETE FROM reimbursement_receipts
-                WHERE reimbursement_id IN (
-                    SELECT id FROM point_reimbursements
-                    WHERE merchant_id IN (SELECT id FROM merchants)
-                )
-                """
-            )
+    Display snapshots are stored before clearing the live identity. The caller
+    owns commit/rollback. No financial rows or receipt links are deleted.
+    """
+    if db.get_bind().dialect.name == "postgresql":
+        db.execute(text("LOCK TABLE merchants IN SHARE ROW EXCLUSIVE MODE"))
+    db.execute(text("""
+        DELETE FROM merchant_audit_log WHERE merchant_id IN (
+            SELECT id FROM merchants WHERE credentials_cleared_at IS NULL
         )
-        deleted["reimbursement_receipts"] = result.rowcount or 0
-    if receipt_file_ids and "receipt_files" in tables:
-        result = db.execute(
-            text("DELETE FROM receipt_files WHERE file_id IN :file_ids").bindparams(
-                bindparam("file_ids", expanding=True)
-            ),
-            {"file_ids": sorted(receipt_file_ids)},
-        )
-        deleted["receipt_files"] = result.rowcount or 0
-
-    for table_name in (
-        "point_notes",
-        "point_reimbursements",
-        "point_adjustments",
-        "monthly_submissions",
-        "visits",
-        "merchant_audit_log",
-    ):
-        if "merchant_id" in tables.get(table_name, set()):
-            result = db.execute(
-                text(
-                    f"""
-                    DELETE FROM {table_name}
-                    WHERE merchant_id IN (SELECT id FROM merchants)
-                    """
-                )
-            )
-            deleted[table_name] = result.rowcount or 0
-    result = db.execute(text("DELETE FROM merchants"))
-    deleted["merchants"] = result.rowcount or 0
-
-    if deleted != counts:
-        raise RuntimeError("Merchant-owned row count changed during deletion")
-    return counts
+    """))
+    result = db.execute(text("""
+        UPDATE merchants SET
+            historical_fio = COALESCE(historical_fio, fio),
+            historical_tu = COALESCE(historical_tu, tu, ''),
+            fio = '', fio_norm = 'archived:' || CAST(id AS TEXT),
+            last4 = NULL, pass_hash = '', telegram_id = NULL, tu = NULL,
+            is_active = FALSE, credentials_cleared_at = :cleared_at,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE credentials_cleared_at IS NULL
+    """), {"cleared_at": datetime.now(timezone.utc).replace(tzinfo=None)})
+    return {"merchants": result.rowcount or 0}
 
 
 def import_or_reactivate_merchant(

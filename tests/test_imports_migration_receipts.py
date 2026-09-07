@@ -13,7 +13,7 @@ os.environ.setdefault("ENVIRONMENT", "test")
 from openpyxl import Workbook
 
 from app.legacy_migration import build_migration_plan
-from app.main import validate_receipt
+from app.main import validate_receipt, MAX_RECEIPT_BYTES
 from app.production_calendar import parse_calendar_workbook
 from app.services import import_merchants_xlsx, import_rates_xlsx, import_supplies_xlsx
 
@@ -162,13 +162,12 @@ class ReceiptValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_receipt("check.jpg", "image/jpeg", b"MZ executable")
 
-    def test_extension_must_match_mime(self):
-        with self.assertRaises(ValueError):
-            validate_receipt("check.exe", "image/png", b"\x89PNG\r\n\x1a\nrest")
+    def test_extension_is_normalized_from_real_content(self):
+        self.assertEqual(validate_receipt("Фото без расширения", "application/octet-stream", b"\x89PNG\r\n\x1a\nrest"), ("image/png", ".png"))
 
     def test_size_limit(self):
         with self.assertRaises(ValueError):
-            validate_receipt("check.pdf", "application/pdf", b"%PDF-" + b"x" * (5 * 1024 * 1024))
+            validate_receipt("check.pdf", "application/pdf", b"%PDF-" + b"x" * MAX_RECEIPT_BYTES)
 
 
 def legacy_row(**overrides):
