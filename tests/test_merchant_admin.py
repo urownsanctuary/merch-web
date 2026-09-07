@@ -430,6 +430,35 @@ class MerchantAdminTests(unittest.TestCase):
             response.text,
         )
 
+    def test_delete_preview_counts_coffee_audit_and_reset_preserves_it(self):
+        merchant = self.create()
+        with self.engine.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE TABLE coffee_days_audit "
+                "(id INTEGER PRIMARY KEY, merchant_id INTEGER NOT NULL)"
+            )
+            connection.execute(
+                text("INSERT INTO coffee_days_audit VALUES (1, :merchant_id)"),
+                {"merchant_id": merchant["id"]},
+            )
+        with self.factory() as db:
+            self.assertEqual(count_merchant_owned_rows(db)["coffee_days_audit"], 1)
+        with patch("app.main.get_active_period", return_value={"year": 2026, "month": 7}), patch(
+            "app.main.get_all_tu_values", return_value=["ТУ-1"]
+        ), patch("app.main.get_special_inventory_days", return_value=[]), patch(
+            "app.main.get_calendar_status", return_value=[]
+        ), patch("app.main.log_redacted_exception") as log_error:
+            response = self.client.get("/admin-data")
+        self.assertEqual(response.status_code, 200)
+        log_error.assert_not_called()
+        with self.factory() as db:
+            self.assertEqual(delete_all_merchants_and_data(db), {"merchants": 1})
+            db.commit()
+            self.assertEqual(
+                db.execute(text("SELECT merchant_id FROM coffee_days_audit")).scalar(),
+                merchant["id"],
+            )
+
     def test_delete_preview_accepts_legacy_merchant_tables(self):
         merchant = self.create()
         with self.engine.begin() as connection:
