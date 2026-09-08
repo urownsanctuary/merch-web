@@ -1735,7 +1735,7 @@ def calendar_page(
                 <input type="hidden" name="csrf_token" value="{escape(session['csrf'])}" />
                 <button class="btn btn-inline" style="padding:10px 12px;margin:0;" name="delta" value="-1" {'disabled' if point_total['coffee_cnt'] <= 0 else ''}>−1 день</button>
                 <output aria-label="Количество дней с кофемашиной" style="font-weight:800;">{coffee_days}</output>
-                <button class="btn btn-inline" style="padding:10px 12px;margin:0;" name="delta" value="1" {'disabled' if point_total['coffee_cnt'] >= point_total['cnt_day_total'] else ''}>+1 день</button>
+                <button class="btn btn-inline" style="padding:10px 12px;margin:0;" name="delta" value="1" {'disabled' if point_total['coffee_cnt'] >= point_total['coffee_auto_days'] else ''}>+1 день</button>
             </form>"""
         coffee_card_html += '</div>'
 
@@ -2894,7 +2894,7 @@ def toggle_day_post(
         )
 
     try:
-        sync_coffee = normalized_slot in (SLOT_DAY, SLOT_MORNING) and get_point_rates(
+        sync_coffee = get_point_rates(
             db, point_code, period["year"], period["month"]
         )["coffee_enabled"]
         month_key = date(period["year"], period["month"], 1)
@@ -2905,10 +2905,9 @@ def toggle_day_post(
                           {"id": merchant["id"], "month_key": month_key}).scalar() == "submitted":
                 db.rollback()
                 return HTMLResponse("Reconciliation is submitted", status_code=409)
-            coffee_before = eligible_coffee_days(db, merchant["id"], point_code, month_key)
         toggle_day_visit(db, merchant["id"], point_code, period["year"], period["month"], day, normalized_slot, commit=False)
         if sync_coffee:
-            sync_coffee_after_visit(db, merchant["id"], point_code, month_key, coffee_before)
+            sync_coffee_after_visit(db, merchant["id"], point_code, month_key)
         db.commit()
     except InventoryWeekLimitError as exc:
         db.rollback()
