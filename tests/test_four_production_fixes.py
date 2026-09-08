@@ -193,10 +193,22 @@ class FourFixTests(unittest.TestCase):
         self.assertIn("saved=1",response.headers["location"])
         page = self.client.get(response.headers["location"])
         self.assertEqual(page.status_code,200)
-        self.assertIn("Дни с кофемашиной: 0",page.text)
+        self.assertIn("Дни с кофемашиной",page.text)
+        self.assertNotIn('<div class="detail-title">Кофемашина</div>',page.text)
+        self.assertEqual(page.text.count('class="detail-card coffee-days-card"'),1)
+        coffee_card = page.text.split('class="detail-card coffee-days-card"',1)[1].split('</form>',1)[0]
+        self.assertIn('0 дней × 100 ₽ = 0 ₽',coffee_card)
+        self.assertIn('>−1 день</button>',coffee_card)
+        self.assertIn('>+1 день</button>',coffee_card)
         with self.factory() as db:
             self.assertEqual(services.compute_point_total(db,1,"P1",2026,7)["total"],400)
             self.assertEqual(services.get_admin_report_rows(db,2026,7)[0]["point_total"],400)
+        response = self.client.post("/coffee-days",data={"fio":"Тестовый Мерч","point_code":"P1","delta":1,"csrf_token":self.csrf},follow_redirects=False)
+        self.assertEqual(response.status_code,303)
+        page = self.client.get(response.headers["location"])
+        self.assertIn('1 день × 100 ₽ = 100 ₽',page.text)
+        with self.factory() as db:
+            self.assertEqual(services.compute_point_total(db,1,"P1",2026,7)["total"],500)
 
     def test_coffee_ui_hidden_when_disabled_and_locked_after_submit(self):
         with self.factory() as db:
