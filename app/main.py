@@ -1716,22 +1716,28 @@ def calendar_page(
     coffee_card_html = ""
     if point_total.get("coffee_enabled"):
         coffee_meta_html = '<div class="mini-pill">КМ: Да</div>'
+        coffee_days = point_total["coffee_cnt"]
+        coffee_day_label = (
+            "дней" if 11 <= coffee_days % 100 <= 14 else
+            "день" if coffee_days % 10 == 1 else
+            "дня" if 2 <= coffee_days % 10 <= 4 else "дней"
+        )
         coffee_card_html = (
-            '<div class="detail-card">'
-            '<div class="detail-title">Кофемашина</div>'
-            f'<div class="detail-line">{point_total["coffee_cnt"]} × {point_total["coffee_rate"]} ₽ = {point_total["coffee_sum"]} ₽</div>'
-            '</div>'
+            '<div class="detail-card coffee-days-card">'
+            '<div class="detail-title">Дни с кофемашиной</div>'
+            f'<div class="detail-line">{coffee_days} {coffee_day_label} × {point_total["coffee_rate"]} ₽ = {point_total["coffee_sum"]} ₽</div>'
         )
         if not monthly_submitted:
             coffee_card_html += f"""
-            <form method="post" action="/coffee-days" class="detail-card">
+            <form method="post" action="/coffee-days" style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-top:12px;">
                 <input type="hidden" name="fio" value="{escape(fio)}" />
                 <input type="hidden" name="point_code" value="{escape(point_code)}" />
                 <input type="hidden" name="csrf_token" value="{escape(session['csrf'])}" />
-                <div class="detail-title">Дни с кофемашиной: {point_total['coffee_cnt']}</div>
-                <button class="btn btn-inline" name="delta" value="-1" {'disabled' if point_total['coffee_cnt'] <= 0 else ''}>−</button>
-                <button class="btn btn-inline" name="delta" value="1" {'disabled' if point_total['coffee_cnt'] >= point_total['cnt_day_total'] else ''}>+</button>
+                <button class="btn btn-inline" style="padding:10px 12px;margin:0;" name="delta" value="-1" {'disabled' if point_total['coffee_cnt'] <= 0 else ''}>−1 день</button>
+                <output aria-label="Количество дней с кофемашиной" style="font-weight:800;">{coffee_days}</output>
+                <button class="btn btn-inline" style="padding:10px 12px;margin:0;" name="delta" value="1" {'disabled' if point_total['coffee_cnt'] >= point_total['cnt_day_total'] else ''}>+1 день</button>
             </form>"""
+        coffee_card_html += '</div>'
 
     supply_policy_note = (
         "Для этой точки поставки от 1 коробки оплачиваются по ставке поставки."
