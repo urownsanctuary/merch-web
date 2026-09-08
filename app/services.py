@@ -9,7 +9,7 @@ from sqlalchemy import text, bindparam, inspect
 from openpyxl import load_workbook
 from app.security import request_merchant_matches, request_session_issued_at
 from app.runtime import maintenance_mode_enabled
-from app.coffee_days import coffee_count
+from app.coffee_days import coffee_count, snapshot_coffee_for_submit
 from app.merchant_admin import (
     create_merchant,
     deactivate_all_merchants,
@@ -709,6 +709,7 @@ def upsert_monthly_submission_draft(db: Session, merchant_id: int, y: int, m: in
 def submit_monthly_submission(db: Session, merchant_id: int, y: int, m: int):
     ensure_monthly_submissions_table(db)
     mk = month_start(y, m)
+    snapshot_coffee_for_submit(db, merchant_id, mk)
     db.execute(text("""
         INSERT INTO monthly_submissions (merchant_id, month_key, comment, extra_amount, receipt_path, status)
         VALUES (:merchant_id, :month_key, '', 0, NULL, 'submitted')
@@ -1060,6 +1061,7 @@ def compute_point_total(db: Session, merchant_id: int, point_code: str, y: int, 
         "coffee_rate": rates["coffee_rate"],
         "coffee_sum": coffee_sum,
         "coffee_cnt": coffee_cnt,
+        "coffee_auto_days": sum(bool(slots.intersection(REGULAR_PAY_SLOTS)) for slots in visits.values()),
         "pay_lt5": rates["pay_lt5"],
         "rate_supply": rates["rate_supply"],
         "rate_no_supply": rates["rate_no_supply"],
@@ -1374,6 +1376,9 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
         sum_inventory = cnt_full_inv * rate_inventory
         stored_coffee = row.get("coffee_days_count")
         coffee_cnt = (cnt_day_total if stored_coffee is None else min(cnt_day_total, max(0, int(stored_coffee)))) if coffee_enabled else 0
+        period = get_active_period()
+        if coffee_enabled and (y, m) == (period["year"], period["month"]) and status_value != "submitted":
+            coffee_cnt = coffee_count(db, row["merchant_id"], row["point_code"], start_date, cnt_day_total)
         coffee_sum = coffee_cnt * coffee_rate if coffee_enabled else 0
         point_total = sum_supply + sum_no_supply + sum_inventory + coffee_sum + note_amount + reimb_amount
 
