@@ -275,6 +275,7 @@ class SlotHotfixTests(unittest.TestCase):
                     side_effect=[{}, {1: {SLOT_DAY}}]
                 ),
                 get_calendar_overrides=MagicMock(return_value={}),
+                get_point_rates=MagicMock(return_value={"coffee_enabled": False}),
             ):
                 with TestClient(app) as client:
                     client.cookies.set("merchant_session", token)

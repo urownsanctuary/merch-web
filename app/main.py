@@ -23,7 +23,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 
 from app.db import SessionLocal, engine
-from app.coffee_days import ensure_coffee_days_schema, change_coffee_days
+from app.coffee_days import ensure_coffee_days_schema, change_coffee_days, eligible_coffee_days, sync_coffee_after_visit
 from app.services import (
     get_active_period,
     fio_norm,
@@ -2182,8 +2182,11 @@ def update_coffee_days(
     params = {"fio": fio, "point_code": point_code}
     try:
         total = compute_point_total(db, merchant["id"], point_code, period["year"], period["month"])
+        if total["coffee_enabled"] and db.get_bind().dialect.name == "postgresql":
+            db.execute(text("SELECT id FROM merchants WHERE id=:id FOR UPDATE"), {"id": merchant["id"]})
+        coffee_eligible = eligible_coffee_days(db, merchant["id"], point_code, date(period["year"], period["month"], 1)) if total["coffee_enabled"] else 0
         change_coffee_days(db, merchant["id"], point_code, date(period["year"], period["month"], 1), delta,
-                           total["cnt_day_total"], total["coffee_enabled"])
+                           coffee_eligible, total["coffee_enabled"])
         db.commit()
         params["saved"] = "1"
     except Exception as exc:
@@ -2891,7 +2894,22 @@ def toggle_day_post(
         )
 
     try:
-        toggle_day_visit(db, merchant["id"], point_code, period["year"], period["month"], day, normalized_slot)
+        sync_coffee = normalized_slot in (SLOT_DAY, SLOT_MORNING) and get_point_rates(
+            db, point_code, period["year"], period["month"]
+        )["coffee_enabled"]
+        month_key = date(period["year"], period["month"], 1)
+        if sync_coffee:
+            if db.get_bind().dialect.name == "postgresql":
+                db.execute(text("SELECT id FROM merchants WHERE id=:id FOR UPDATE"), {"id": merchant["id"]})
+            if db.execute(text("SELECT status FROM monthly_submissions WHERE merchant_id=:id AND month_key=:month_key"),
+                          {"id": merchant["id"], "month_key": month_key}).scalar() == "submitted":
+                db.rollback()
+                return HTMLResponse("Reconciliation is submitted", status_code=409)
+            coffee_before = eligible_coffee_days(db, merchant["id"], point_code, month_key)
+        toggle_day_visit(db, merchant["id"], point_code, period["year"], period["month"], day, normalized_slot, commit=False)
+        if sync_coffee:
+            sync_coffee_after_visit(db, merchant["id"], point_code, month_key, coffee_before)
+        db.commit()
     except InventoryWeekLimitError as exc:
         db.rollback()
         query = urlencode(
