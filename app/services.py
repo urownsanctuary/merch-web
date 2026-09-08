@@ -455,6 +455,8 @@ def toggle_day_visit(
     m: int,
     day: int,
     slot: str = SLOT_DAY,
+    *,
+    commit: bool = True,
 ):
     slot = normalize_visit_slot(slot)
     visit_date = date(y, m, day)
@@ -480,7 +482,8 @@ def toggle_day_visit(
 
     if existing:
         db.execute(text("DELETE FROM visits WHERE id = :id"), {"id": existing})
-        db.commit()
+        if commit:
+            db.commit()
         return "removed"
 
     if slot not in allowed_visit_slots(visit_date):
@@ -507,7 +510,8 @@ def toggle_day_visit(
             "slot": slot,
         },
     )
-    db.commit()
+    if commit:
+        db.commit()
     return "added"
 
 
