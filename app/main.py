@@ -4188,9 +4188,16 @@ async def admin_upload_supplies(
         result = import_supplies_xlsx(db, file.file)
         msg = f"Поставки загружены: строк {result['loaded_rows']}, точек {result['loaded_points']}."
         return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
-    except Exception as e:
+    except Exception as exc:
         db.rollback()
-        return RedirectResponse(url=f"/admin-data?error={str(e)}", status_code=303)
+        log_redacted_exception("admin_upload_supplies_failed", exc)
+        return RedirectResponse(
+            url="/admin-data?" + urlencode({"error": (
+                "Не удалось загрузить файл поставок. "
+                "Проверьте формат файла или обратитесь к администратору."
+            )}),
+            status_code=303,
+        )
 
 
 @app.post("/admin-sync-production-calendar")
@@ -4296,7 +4303,14 @@ async def admin_upload_production_calendar(
         return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
     except Exception as exc:
         db.rollback()
-        return RedirectResponse(url=f"/admin-data?error={str(exc)}", status_code=303)
+        log_redacted_exception("admin_upload_production_calendar_failed", exc)
+        return RedirectResponse(
+            url="/admin-data?" + urlencode({"error": (
+                "Не удалось загрузить файл производственного календаря. "
+                "Проверьте формат файла или обратитесь к администратору."
+            )}),
+            status_code=303,
+        )
 
 
 @app.post("/admin-upload-rates")
@@ -4317,9 +4331,16 @@ async def admin_upload_rates(
         result = import_rates_xlsx(db, file.file, year, month)
         msg = f"Ставки загружены: строк {result['loaded_rows']}."
         return RedirectResponse(url=f"/admin-data?success={msg}", status_code=303)
-    except Exception as e:
+    except Exception as exc:
         db.rollback()
-        return RedirectResponse(url=f"/admin-data?error={str(e)}", status_code=303)
+        log_redacted_exception("admin_upload_rates_failed", exc)
+        return RedirectResponse(
+            url="/admin-data?" + urlencode({"error": (
+                "Не удалось загрузить файл ставок. "
+                "Проверьте формат файла или обратитесь к администратору."
+            )}),
+            status_code=303,
+        )
 
 
 @app.post("/admin-upload-merchants")

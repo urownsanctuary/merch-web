@@ -1,5 +1,10 @@
 # Production audit status
 
+> Historical report for the July 2026 audit, not the current production runbook.
+> Deployment, rollback, migration and PASS statements below refer to that stage.
+> Do not execute the historical rollback plan. Use [the FirstVDS runbook](docs/VPS_RUNBOOK.md)
+> and [current handoff limitations](docs/HANDOFF_STATUS.md).
+
 ## Baseline verification
 
 The first audit pass used stale `main@c1444fd`. A full remote fetch on

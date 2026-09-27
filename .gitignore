@@ -213,6 +213,40 @@ deploy/env/production.env
 *.dump.sha256
 *.backup
 
+# Local credentials; sanitized configuration examples remain versioned.
+.env.*
+*.env
+*.env.*
+!/deploy/env/
+!.env.example
+!*.env.example
+*.pem
+*.key
+id_ed25519
+id_rsa
+*_ed25519
+
+# Private uploads, backups, and local smoke artifacts (not source fixtures).
+/uploads/
+/backups/
+/backup/
+/artifacts/
+/test-results/
+/playwright-report/
+/synthetic-uploads/
+backup*.sql
+*.sql.gz
+/screenshot*.png
+/screenshot*.jpg
+/trace*.zip
+/receipt*.pdf
+/receipt*.jpg
+/receipt*.png
+
+# Per-developer editor state.
+.vscode/
+.idea/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/

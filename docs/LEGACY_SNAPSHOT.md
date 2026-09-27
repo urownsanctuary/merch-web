@@ -1,10 +1,12 @@
 # Anonymized legacy migration snapshot
 
-Run this only from the existing production service's Render Shell. The command
-uses the already configured `DATABASE_URL`; do not paste or print that value.
+Current production is FirstVDS. After explicit approval for a read-only export,
+run inside the existing `salary-app` container. The command uses its configured
+`DATABASE_URL`; never paste or print that value. It creates only a snapshot file,
+not source database rows. Do not run a migration as part of the export.
 
 ```sh
-python -m app.legacy_snapshot --output /tmp/merch-web-legacy-snapshot.sql
+docker exec salary-app python -B -m app.legacy_snapshot --output /tmp/merch-web-legacy-snapshot.sql
 ```
 
 The PostgreSQL source transaction is `REPEATABLE READ, READ ONLY`. Source SQL is
@@ -18,8 +20,9 @@ limited to `SHOW` and `SELECT`:
   selected.
 - relevant column names from `information_schema.columns`.
 
-The exporter does not query `merchants`, so names, phone suffixes, password
-hashes, email addresses, and TU values never enter the snapshot process.
+The exporter does not query `merchants`, so it does not read directory names,
+phone suffixes or password hashes from that table. Legacy free-text fields can
+still contain personal data; their content is sanitized before serialization.
 Merchant IDs, point codes, row IDs, normalized IDs, receipt IDs, and legacy
 keys are deterministically remapped. Free text is reduced to placeholders while
 line breaks and migration delimiters are retained. Receipt paths are replaced
@@ -32,22 +35,38 @@ created with owner-only permissions. Snapshot patterns are ignored by Git.
 
 ## Secure download
 
-Use the SSH destination shown in the production service's Render
-**Connect → SSH** panel. From a trusted local machine, copy the file over
-SFTP-backed SCP:
+The file is inside the app container, not the SSH user's `/tmp`. In an authorized
+FirstVDS SSH session, copy it to a newly created private staging directory:
 
 ```sh
-scp -s YOUR_SERVICE@ssh.YOUR_REGION.render.com:/tmp/merch-web-legacy-snapshot.sql ./
+umask 077
+SNAPSHOT_STAGE=$(mktemp -d /tmp/sverka-snapshot.XXXXXX)
+docker cp salary-app:/tmp/merch-web-legacy-snapshot.sql "$SNAPSHOT_STAGE/merch-web-legacy-snapshot.sql"
+chmod 600 "$SNAPSHOT_STAGE/merch-web-legacy-snapshot.sql"
+sha256sum "$SNAPSHOT_STAGE/merch-web-legacy-snapshot.sql"
+printf 'STAGING_DIRECTORY=%s\n' "$SNAPSHOT_STAGE"
 ```
 
-For a service with multiple instances, use the same instance-specific hostname
-for both the Render Shell run and the download. Verify the local SHA-256 against
-the exporter report before sharing the file. Do not expose it through an HTTP
-route, paste it into logs, or commit it.
+On Windows, replace both marked placeholders with your assigned key and the
+printed directory's final name, for example `sverka-snapshot.ABC123`
+(not the full `/tmp/...` path and not the literal placeholder):
+
+```powershell
+$SverkaKey = 'C:\REPLACE_WITH_YOUR_KEY_DIRECTORY\sverka_vps_ed25519'
+scp -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -i $SverkaKey 'sverka-deploy@188.120.237.160:/tmp/REPLACE_WITH_PRINTED_STAGING_DIRECTORY/merch-web-legacy-snapshot.sql' .
+Get-FileHash -Algorithm SHA256 .\merch-web-legacy-snapshot.sql
+```
+
+Compare exporter, staging and downloaded SHA-256. Review the privacy scan and
+intended recipient before sharing. Never expose the snapshot via HTTP, logs or Git.
+After verified download, remove only the exact snapshot file inside the container
+and the exact staged file; remove the now-empty staging directory with `rmdir`.
+Do not use recursive cleanup or wildcards. Snapshot generation/cleanup is not part
+of a read-only schema audit unless explicitly requested.
 
 ## Loading into an isolated test PostgreSQL
 
-Use a blank, disposable database. The SQL refuses to load without its explicit
+Use a blank, disposable database on a separate test PostgreSQL instance. The SQL refuses to load without its explicit
 test-only psql gate:
 
 ```sh
@@ -63,4 +82,7 @@ python -m app.legacy_migration --apply
 python -m app.legacy_migration --apply
 ```
 
-Never use `DATABASE_URL` from the production service for loading or migration.
+Never use production `DATABASE_URL` for loading or migration. Test-only psql flags
+do not prove that a database is disposable: independently verify host and volume.
+Do not copy the resulting normalized tables into production. Their existence
+changes application reads; see the [legacy storage warning](VPS_RUNBOOK.md#legacy-storage-do-not-enable-migration-during-handoff).

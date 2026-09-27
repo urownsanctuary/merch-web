@@ -1,5 +1,9 @@
 # Route compatibility against production `87fd984`
 
+> Historical route comparison, not the complete current inventory or proof that
+> every current mutation has CSRF coverage. Later releases added and changed routes.
+> Use current `app/main.py` and tests; see [known limitations](docs/HANDOFF_STATUS.md).
+
 No production route was removed. `GET /toggle-day`, `GET /toggle-inventory`,
 and `GET /reopen-monthly-submission` remain as non-mutating compatibility
 redirects; the same paths now also accept protected POST forms.

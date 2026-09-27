@@ -1,5 +1,10 @@
 # Four targeted fixes — validation checkpoint
 
+> Historical pre-release checkpoint, not current production acceptance.
+> Counts, coffee implementation details and remaining gates describe that stage.
+> Later validation does not retroactively change what was verified here.
+> See [current operations](VPS_RUNBOOK.md) and [handoff status](HANDOFF_STATUS.md).
+
 Production baseline: `334d2166da55c69aa21073b739f953d44c6eba05`.
 Branch: `codex/hotfix-four-production-fixes`.
 The branch was created from fetched `origin/main` (`525e0db`) and fast-forwarded
@@ -49,7 +54,7 @@ AGENTS branch exception is its own commit: `e7e66c7`.
 - Local browser on synthetic in-memory data: merchant login, calendar and coffee
   decrement/recalculation on desktop and increment at 393x851 passed.
 - Mobile receipt form selected two synthetic files (screenshot showed count 2),
-  but submission was blocked by the automation approval reviewer. Browser upload
+  but the browser submission could not be completed in that test session. Browser upload
   PASS is **not** claimed. Multipart upload scenarios passed automated tests.
 - Local Uvicorn was bounded to 600 seconds and stopped; no production writes.
 
