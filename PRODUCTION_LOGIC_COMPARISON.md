@@ -1,5 +1,10 @@
 # Production logic comparison
 
+> Historical comparison against `87fd984`, not a specification of today's behavior.
+> Later releases changed ordinary-day actions, coffee-day counting and credential
+> reset. Do not restore old behavior from this document. See
+> [handoff status](docs/HANDOFF_STATUS.md) and the current code/tests.
+
 Baseline: `origin/main@87fd984`
 
 ## Preserved without behavioral removal

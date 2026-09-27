@@ -1,5 +1,10 @@
 # Test deployment and acceptance report
 
+> Historical Render test evidence from July 2026. These URLs, credentials templates,
+> limits, test counts and rollback instructions are not current production settings.
+> Do not provision Render resources or repeat these mutations during handoff.
+> See [FirstVDS operations](docs/VPS_RUNBOOK.md) and [local checks](docs/DEVELOPMENT.md).
+
 Date: 2026-07-29
 
 ## Isolation and deployed revisions
