@@ -47,7 +47,9 @@ receipts were changed, and no migration was executed in this check.
 
 ## Not changed: separate review and regression required
 
-- **5:** exception details in administrative redirect URLs.
+- **5 (remaining scope):** exception details in other administrative redirects,
+  including special-inventory-date errors. A separately authorized follow-up fixes
+  only the three import handlers described below; this is not a global error rewrite.
 - **10–11:** technical/contradictory UI wording and plain technical error responses.
   Changing form confirmation tokens, response formats or redirects can affect clients.
 - **12:** incomplete explicit CSRF-token coverage on some mutation routes.
@@ -97,3 +99,14 @@ No SSH, production DB query/write, server restart, browser smoke, migration,
 commit, push or deployment was performed for this documentation edit. The earlier
 read-only production observation is identified separately above. No browser PASS
 or fresh PostgreSQL integration PASS is claimed by this local gate.
+
+## Separately authorized follow-up: import error disclosure
+
+After the documentation-only checkpoint, the owner authorized an import-error fix
+and production rollout conditional on passing checks. Only failure branches of
+supplies, rates and production-calendar uploads change: rollback is retained,
+redirects use fixed user-facing messages, and the existing redacted logger records
+error type/trace frames without exception values. Import functions, successful
+responses and merchant-import validation are unchanged. Separate regression tests
+cover safe redirects/rendering, rollback, auth/CSRF, malformed files and success.
+Release results must be recorded separately; this paragraph is not a deployment PASS.
