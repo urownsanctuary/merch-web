@@ -1,10 +1,7 @@
-# Four targeted fixes — validation checkpoint
+# Four targeted fixes: archived validation checkpoint
 
-Production baseline: `334d2166da55c69aa21073b739f953d44c6eba05`.
-Branch: `codex/hotfix-four-production-fixes`.
-The branch was created from fetched `origin/main` (`525e0db`) and fast-forwarded
-through the already deployed baseline and existing AGENTS authorization commit.
-AGENTS branch exception is its own commit: `e7e66c7`.
+> Архивный технический отчёт. Описывает состояние на момент проверки,
+> не подтверждает состояние текущего production и не является инструкцией выпуска.
 
 ## Changes
 
@@ -48,15 +45,13 @@ AGENTS branch exception is its own commit: `e7e66c7`.
   rollback also restores deleted directory audit records.
 - Local browser on synthetic in-memory data: merchant login, calendar and coffee
   decrement/recalculation on desktop and increment at 393x851 passed.
-- Mobile receipt form selected two synthetic files (screenshot showed count 2),
-  but submission was blocked by the automation approval reviewer. Browser upload
-  PASS is **not** claimed. Multipart upload scenarios passed automated tests.
+- Mobile receipt form selected two synthetic files. Browser submission was not
+  completed, so browser upload PASS is not claimed. Multipart upload scenarios
+  passed automated tests.
 - Local Uvicorn was bounded to 600 seconds and stopped; no production writes.
 
-## Remaining release gates
+## Validation limitations at the time of the report
 
-- Render dashboard navigation timed out twice; an independent curl connection
-  also timed out. No test Render deployment/Live status or test URL is claimed.
 - PostgreSQL migration/integration and complete desktop/mobile business smoke
   remain required in an isolated test environment. SQLite tests are not a
   substitute for PostgreSQL validation.

@@ -138,9 +138,9 @@ celerybeat.pid
 .env
 .envrc
 .venv
-env/
+/env/
 venv/
-ENV/
+/ENV/
 env.bak/
 venv.bak/
 
@@ -176,7 +176,6 @@ cython_debug/
 #.idea/
 
 # Abstra
-# Abstra is an AI-powered process automation framework.
 # Ignore directories containing user credentials, local state, and settings.
 # Learn more at https://abstra.io/docs
 .abstra/
@@ -195,9 +194,6 @@ cython_debug/
 .pypirc
 
 # Cursor
-#  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
-#  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
-#  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
 
@@ -217,3 +213,41 @@ deploy/env/production.env
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Local credentials and environment variants
+.env.*
+*.env
+*.env.*
+!*.env.example
+!.env.example
+*.pem
+*.key
+
+# User content, database copies, backups and temporary output
+uploads/
+receipts/
+logs/
+cache/
+screenshots/
+test-results/
+playwright-report/
+playwright/.cache/
+blob-report/
+artifacts/
+dumps/
+backups/
+*.sql
+*.sql.gz
+*.dump.*
+*.backup.*
+*.sqlite
+*.sqlite3
+*.db
+*.bak
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+*.tmp
+*.har
