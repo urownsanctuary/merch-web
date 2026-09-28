@@ -1,11 +1,22 @@
-# Anonymized legacy migration snapshot
+# Merch Web: обезличенный снимок старых данных
 
-Run this only from the existing production service's Render Shell. The command
-uses the already configured `DATABASE_URL`; do not paste or print that value.
+Снимок используется для проверки `app.legacy_migration`, а не для полного
+восстановления приложения. Экспорт читает исходную БД и записывает файл; запуск
+на production выполняется только по согласованной задаче эксплуатации.
+
+На FirstVDS из checkout и с действующей конфигурацией площадки, описанной в
+[VPS runbook](VPS_RUNBOOK.md):
 
 ```sh
-python -m app.legacy_snapshot --output /tmp/merch-web-legacy-snapshot.sql
+export SALARY_ENV_FILE=/opt/salary-prod/config/production.env
+docker compose --env-file "$SALARY_ENV_FILE" exec -T app \
+  python -m app.legacy_snapshot --output /tmp/merch-web-legacy-snapshot.sql
 ```
+
+Контейнер использует своё настроенное подключение. Не печатайте и не копируйте
+его секреты в команды или журналы.
+
+## Состав и обезличивание
 
 The PostgreSQL source transaction is `REPEATABLE READ, READ ONLY`. Source SQL is
 limited to `SHOW` and `SELECT`:
@@ -30,32 +41,36 @@ The output report prints row counts, excluded fields, privacy scan counts, the
 absolute path, and SHA-256. The output file and its atomic temporary file are
 created with owner-only permissions. Snapshot patterns are ignored by Git.
 
-## Secure download
 
-Use the SSH destination shown in the production service's Render
-**Connect → SSH** panel. From a trusted local machine, copy the file over
-SFTP-backed SCP:
+## Получение файла
+
+На VPS скопируйте файл из контейнера в закрытый каталог учётной записи оператора:
 
 ```sh
-scp -s YOUR_SERVICE@ssh.YOUR_REGION.render.com:/tmp/merch-web-legacy-snapshot.sql ./
+umask 077
+install -d -m 700 ./legacy-snapshots
+docker compose --env-file "$SALARY_ENV_FILE" cp \
+  app:/tmp/merch-web-legacy-snapshot.sql ./legacy-snapshots/merch-web-legacy-snapshot.sql
+chmod 600 ./legacy-snapshots/merch-web-legacy-snapshot.sql
+sha256sum ./legacy-snapshots/merch-web-legacy-snapshot.sql
 ```
 
-For a service with multiple instances, use the same instance-specific hostname
-for both the Render Shell run and the download. Verify the local SHA-256 against
-the exporter report before sharing the file. Do not expose it through an HTTP
-route, paste it into logs, or commit it.
+Передайте файл по утверждённому SSH/SFTP-каналу или через корпоративное хранилище
+с ограниченным доступом. Сверьте SHA-256 с отчётом экспортера. Не публикуйте файл
+через HTTP, не добавляйте его в Git и удалите временные копии по политике хранения.
 
-## Loading into an isolated test PostgreSQL
+## Проверка в изолированной PostgreSQL
 
-Use a blank, disposable database. The SQL refuses to load without its explicit
-test-only psql gate:
+Используйте пустую одноразовую БД. `TEST_DATABASE_URL` — переменная команды проверки,
+содержащая libpq-совместимое подключение к этой БД, без префикса драйвера SQLAlchemy.
+SQL отказывается загружаться без явного тестового флага:
 
 ```sh
 psql -v LEGACY_SNAPSHOT_TEST_ONLY=on "$TEST_DATABASE_URL" \
-  -f /secure/path/merch-web-legacy-snapshot.sql
+  -f ./legacy-snapshots/merch-web-legacy-snapshot.sql
 ```
 
-After loading, point the application at that disposable database and run:
+Затем настройте `DATABASE_URL` приложения на ту же тестовую БД и выполните:
 
 ```sh
 python -m app.legacy_migration --dry-run
@@ -63,4 +78,6 @@ python -m app.legacy_migration --apply
 python -m app.legacy_migration --apply
 ```
 
-Never use `DATABASE_URL` from the production service for loading or migration.
+Проверьте отчёт неоднозначных записей, сохранность исходных строк и отсутствие
+дубликатов при повторном применении. Для загрузки и проверки миграции production
+подключение не используется. Эти команды не являются частью обычного deploy.

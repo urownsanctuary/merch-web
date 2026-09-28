@@ -1,5 +1,8 @@
 # Route compatibility against production `87fd984`
 
+> Архивный технический отчёт. Описывает состояние на момент проверки,
+> не подтверждает состояние текущего production и не является инструкцией выпуска.
+
 No production route was removed. `GET /toggle-day`, `GET /toggle-inventory`,
 and `GET /reopen-monthly-submission` remain as non-mutating compatibility
 redirects; the same paths now also accept protected POST forms.

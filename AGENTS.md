@@ -1,14 +1,25 @@
-# merch-web production rules
+# Merch Web: правила работы с репозиторием
 
-- Work only on `codex/full-production-audit`, except `codex/hotfix-four-production-fixes` is permitted for the four fixes explicitly authorized by the user. Production merge or deployment is allowed only after the user explicitly confirms it in the current conversation; otherwise, do not change production.
-- Treat `origin/main` as production baseline only after fetching every remote ref.
-- Preserve existing routes, imports, exports, reports, and user data.
-- Schema changes are additive and idempotent. Never delete legacy fields during migration.
-- Legacy financial backfill runs only from an explicit administrative command with `--dry-run` or `--apply`.
-- State-changing HTTP operations use POST and CSRF protection. Compatibility GET routes may redirect but must not mutate.
-- Merchant identity comes from a signed session, never from `fio` in a URL.
-- Receipts are durable, size-limited, content-validated, and private to their owner and authenticated administrators.
-- Visit slots are centralized constants. Intersections require the same point, date, explicit work slot, and different merchants.
-- Production-calendar data is stored in PostgreSQL and updated administratively, not fetched during page rendering.
-- Excel imports validate the complete workbook before one transaction; never commit inside a row loop.
-- Run compile, unit/integration tests, Uvicorn smoke checks, migration dry-run/apply/reapply, route inventory, and final diff review.
+- Создавайте отдельную ветку от актуального `main` для каждой задачи и оформляйте PR.
+- Перед сравнением с production baseline получите все remote refs и отдельно
+  подтвердите фактически развёрнутый SHA; вершина `main` не доказывает состояние сервера.
+- Слияние и deployment требуют отдельного явного разрешения владельца проекта.
+- Сохраняйте существующие маршруты, импорты, выгрузки, отчёты и пользовательские данные.
+- Изменения схемы должны быть добавочными и идемпотентными; не удаляйте legacy-поля.
+- Перенос финансовых данных выполняется только отдельной согласованной командой
+  с предварительным `--dry-run` и последующим `--apply`.
+- Изменяющие данные операции используют POST и CSRF-защиту. Совместимые GET-маршруты
+  могут перенаправлять запросы, но не должны менять данные.
+- Идентификация мерчендайзера опирается на подписанную сессию, а не на FIO из URL.
+- Чеки должны храниться надёжно, проверяться по размеру и содержимому и быть доступны
+  только владельцу и авторизованным администраторам.
+- Используйте общие константы слотов. Пересечения требуют одинаковых точки, даты,
+  явного рабочего слота и разных мерчендайзеров.
+- Производственный календарь хранится в PostgreSQL; не загружайте его из сети
+  во время формирования страницы.
+- Excel-импорт проверяет весь файл до записи и выполняется одной транзакцией.
+- Для изменений приложения выполняйте compile, unit/integration tests и smoke;
+  изменения миграций проверяйте через dry-run/apply/reapply на изолированной БД,
+  изменения маршрутов — проверкой совместимости.
+- Для документационных изменений проверяйте ссылки, отсутствие секретов, diff,
+  compile, существующие тесты и зависимости. Не запускайте миграции и production-операции.

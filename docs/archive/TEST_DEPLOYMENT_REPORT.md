@@ -1,40 +1,9 @@
-# Test deployment and acceptance report
+# Test deployment: archived acceptance evidence
+
+> Архивный технический отчёт. Описывает состояние на момент проверки,
+> не подтверждает состояние текущего production и не является инструкцией выпуска.
 
 Date: 2026-07-29
-
-## Isolation and deployed revisions
-
-- Test URL: `https://merch-web-audit-b8cdf8f-eu.onrender.com`
-- Render service: `merch-web-audit-b8cdf8f-eu`, Frankfurt, free test service
-- Source branch: `codex/full-production-audit`
-- Auto-deploy: disabled
-- Requested revision deployed and tested first:
-  `b8cdf8fc0770a66dafaf7620776c18164710bdf0`
-- Database: an existing non-production Render PostgreSQL 18 resource
-- Isolation: dedicated schema `merch_audit_b8cdf8f` selected with `PGOPTIONS`
-- Production service and production database: not used or modified
-
-The final audit commit is deployed to this same test service after the complete
-local gate. The Render deploy page is the authoritative source for its full SHA.
-
-## Safe environment configuration
-
-Required names:
-
-| Variable | Safe test value / rule |
-|---|---|
-| `DATABASE_URL` | Internal URL of the non-production database only |
-| `PGOPTIONS` | `-c search_path=merch_audit_b8cdf8f,public` |
-| `SECRET_SALT` | New random test-only value, at least 32 characters |
-| `SESSION_SECRET` | Different new random test-only value, at least 32 characters |
-| `ADMIN_LOGIN` | Audit-only login, not a production account |
-| `ADMIN_PASSWORD` | Random test-only password, at least 20 characters |
-| `ENVIRONMENT` | `production` so secure-cookie behavior is exercised |
-| `MAX_RECEIPT_BYTES` | `5242880` |
-| `PORT` | Managed by Render; do not hard-code |
-
-Never commit database URLs/passwords, `SECRET_SALT`, `SESSION_SECRET`,
-administrator credentials, or Render deploy hooks to Git.
 
 ## Production-like anonymized fixture
 
@@ -102,12 +71,11 @@ The following was exercised through the deployed UI:
 
 Receipt rejection for HTML, SVG, executable disguises, size limits, MIME/magic
 byte mismatch, and owner/admin/other/anonymous authorization is additionally
-covered by automated tests. Receipt durability is checked again after the final
-test-service redeploy.
+covered by automated tests. A later deployment requires its own receipt-durability verification.
 
 ## Automated and runtime gate
 
-The final gate consists of:
+The recorded validation procedure was:
 
 ```text
 python -m unittest discover -s tests -v
@@ -122,10 +90,3 @@ The 66-test suite covers imports and rollback, legacy dry/apply/reapply,
 authorization, file validation, every original route, CSRF/session behavior,
 calendar overrides, supply policy, explicit slots, overlap rules, canonical
 A/B ordering, and all three exports.
-
-## Rollback
-
-The test service can be rolled back to the previously verified requested SHA
-from Render. The database changes are additive; do not drop new tables or
-columns. Preserve all legacy rows and receipts. Production rollback remains
-redeploying `87fd984`, but no production deployment is part of this audit.

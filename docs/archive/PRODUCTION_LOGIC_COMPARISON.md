@@ -1,5 +1,8 @@
 # Production logic comparison
 
+> Архивный технический отчёт. Описывает состояние на момент проверки,
+> не подтверждает состояние текущего production и не является инструкцией выпуска.
+
 Baseline: `origin/main@87fd984`
 
 ## Preserved without behavioral removal
@@ -61,4 +64,4 @@ Baseline: `origin/main@87fd984`
 No working production route or business capability from `87fd984` was removed.
 Three legacy mutation-by-GET handlers no longer mutate, but the paths remain as
 compatibility redirects and equivalent protected POST handlers are present.
-`ROUTE_COMPATIBILITY.md` contains the route-by-route evidence.
+[route compatibility](ROUTE_COMPATIBILITY.md) contains the route-by-route evidence.
