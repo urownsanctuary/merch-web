@@ -20,7 +20,7 @@ from openpyxl import load_workbook
 
 from app.db import engine
 from app.legacy_migration import build_migration_plan, run_migration
-from app.main import app, get_admin_cookie_value, get_db, require_draft_month
+from app.main import app, get_admin_cookie_value, get_db, initialize_application_schema, require_draft_month
 from app.security import create_merchant_session, reset_request_merchant, set_request_merchant
 from app.services import fio_norm, get_merchant_by_fio, hash_last4
 
@@ -43,6 +43,8 @@ class RouteTests(unittest.TestCase):
                 "fio": "Иванов Иван", "norm": fio_norm("Иванов Иван"), "password": hash_last4("1234"),
                 "other": "Петров Пётр", "other_norm": fio_norm("Петров Пётр"), "other_password": hash_last4("5678"),
             })
+        # Fixture setup is explicit; opening an HTTP client no longer migrates it.
+        initialize_application_schema()
 
     def test_merchant_login_success_sets_session(self):
         with TestClient(app) as client:

@@ -216,9 +216,17 @@ def get_db():
 
 @app.on_event("startup")
 def ensure_admin_schema_on_startup():
+    """Starting an HTTP worker must not migrate data or synchronize calendars."""
     if maintenance_mode_enabled():
         logger.warning("maintenance_mode_enabled startup_writes_and_calendar_sync_disabled")
-        return
+    else:
+        logger.info("startup_read_only schema_setup_and_calendar_sync_require_explicit_commands")
+
+
+def initialize_application_schema():
+    """Explicit maintenance entry point; never called by the HTTP lifecycle."""
+    if maintenance_mode_enabled():
+        raise RuntimeError("Schema setup is disabled in maintenance/read-only mode")
     db = SessionLocal()
     try:
         ensure_merchant_admin_schema(db)
@@ -230,16 +238,6 @@ def ensure_admin_schema_on_startup():
         raise
     finally:
         db.close()
-    if (
-        os.getenv("ENVIRONMENT", "").lower() != "test"
-        and os.getenv("AUTO_SYNC_PRODUCTION_CALENDAR", "1") == "1"
-    ):
-        threading.Thread(
-            target=_sync_calendar_background,
-            kwargs={"years": None},
-            name="production-calendar-sync",
-            daemon=True,
-        ).start()
 
 
 def _sync_calendar_background(years: list[int] | None) -> None:
