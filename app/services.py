@@ -28,8 +28,8 @@ SLOT_DAY = "DAY"  # backward-compatible value for records created before explici
 SLOT_FULL_INVENT = "FULL_INVENT"
 VISIT_SLOTS = frozenset({SLOT_MORNING, SLOT_EVENING, SLOT_DAY})
 OVERLAP_SLOTS = frozenset({SLOT_MORNING, SLOT_EVENING})
-# Calendar badge «В» uses these slots; inventory-only marks are not exits.
-PRESENCE_SLOTS = frozenset({SLOT_DAY, SLOT_MORNING})
+# Report fallback includes different explicit shifts; it does not change calendar badges.
+PRESENCE_SLOTS = VISIT_SLOTS
 INTERSECTION_CALENDAR_DAY = "CALENDAR_DAY"  # report level, never a stored visit slot
 ALL_SLOTS = frozenset({*VISIT_SLOTS, SLOT_FULL_INVENT})
 REGULAR_PAY_SLOTS = frozenset({SLOT_DAY, SLOT_MORNING})
@@ -1544,10 +1544,10 @@ def _valid_intersection_candidates(
 def _calendar_intersection_candidates(
     db: Session, y: int, m: int, tu: str | None = None
 ) -> list[dict]:
-    """Pair distinct people with a «В» mark, independent of supply and inventory.
+    """Fallback for distinct people present without a common explicit shift.
 
-    DISTINCT collapses repeated rows and DAY/MORNING marks for the same person.
-    No-supply financial adjustments do not cancel an explicitly recorded exit.
+    DISTINCT collapses raw repeats. A shared MORNING/EVENING belongs only to
+    the existing slot calculation, including its no-supply exclusions.
     """
     sql = """
         SELECT DISTINCT v1.merchant_id AS merchant_id1,
@@ -1566,6 +1566,18 @@ def _calendar_intersection_candidates(
                      COALESCE(historical_tu, tu) AS tu FROM merchants) m2 ON m2.id = v2.merchant_id
         WHERE v1.visit_date >= :start_date AND v1.visit_date < :end_date
           AND v1.slot IN :presence_slots AND v2.slot IN :presence_slots
+          AND NOT EXISTS (
+              SELECT 1 FROM visits s1
+              JOIN visits s2
+                ON s2.point_code = s1.point_code
+               AND s2.visit_date = s1.visit_date
+               AND s2.slot = s1.slot
+               AND s2.merchant_id = v2.merchant_id
+              WHERE s1.merchant_id = v1.merchant_id
+                AND s1.point_code = v1.point_code
+                AND s1.visit_date = v1.visit_date
+                AND s1.slot IN ('MORNING', 'EVENING')
+          )
     """
     params = {"start_date": month_start(y, m), "end_date": month_end_exclusive(y, m),
               "presence_slots": sorted(PRESENCE_SLOTS)}
