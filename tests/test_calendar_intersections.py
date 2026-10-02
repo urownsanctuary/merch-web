@@ -177,8 +177,12 @@ class CalendarIntersectionTests(unittest.TestCase):
             (("EVENING",), ("EVENING",), ["EVENING"]),
             (("MORNING", "EVENING"), ("MORNING", "EVENING"), ["EVENING", "MORNING"]),
             (("DAY",), ("MORNING",), ["CALENDAR_DAY"]),
-            (("MORNING",), ("EVENING",), ["CALENDAR_DAY"]),
+            (("MORNING",), ("EVENING",), []),
+            (("EVENING",), ("MORNING",), []),
+            (("DAY",), ("DAY",), ["CALENDAR_DAY"]),
             (("DAY",), ("EVENING",), ["CALENDAR_DAY"]),
+            (("MORNING",), ("DAY",), ["CALENDAR_DAY"]),
+            (("EVENING",), ("DAY",), ["CALENDAR_DAY"]),
             (("DAY", "EVENING"), ("MORNING", "EVENING"), ["EVENING"]),
         ]
         for day, (left, right, expected) in enumerate(cases, 1):
@@ -190,6 +194,24 @@ class CalendarIntersectionTests(unittest.TestCase):
         for day, (_, _, expected) in enumerate(cases, 1):
             with self.subTest(day=day):
                 self.assertEqual(sorted(r["slot1"] for r in self.rows() if r["visit_date"] == f"2026-09-{day:02d}"), expected)
+
+    def test_9527_different_explicit_shifts_have_no_report_or_excel_overlap(self):
+        # Synthetic employees reproduce the incident without personal data.
+        self.visit(1, 4, "MORNING", point="9527")
+        self.visit(2, 4, "EVENING", point="9527")
+        self.db.commit()
+        self.assertEqual(self.rows(), [])
+        report = services.get_admin_report_rows(self.db, 2026, 9)
+        self.assertEqual(len(report), 2)
+        self.assertTrue(all(not row["has_overlap"] for row in report))
+        main.app.dependency_overrides[main.get_db] = lambda: self.db
+        with TestClient(main.app) as client:
+            client.cookies.set("admin_auth", main.get_admin_cookie_value())
+            response = client.get("/admin-export-overlaps?year=2026&month=9")
+        self.assertEqual(response.status_code, 200)
+        workbook = load_workbook(BytesIO(response.content), data_only=True)
+        self.assertEqual(workbook["Пересечения"].max_row, 1)
+        self.assertEqual(workbook["По дням"].max_row, 1)
 
     def test_fallback_exclusion_is_scoped_to_pair_point_and_date(self):
         self.visit(1, 1, "MORNING")

@@ -1520,7 +1520,7 @@ def _valid_intersection_candidates(
 def _calendar_intersection_candidates(
     db: Session, y: int, m: int, tu: str | None = None
 ) -> list[dict]:
-    """Fallback for distinct people present without a common explicit shift.
+    """DAY-based overlap for distinct people without a common explicit shift.
 
     Grouping collapses raw repeats. A shared MORNING/EVENING belongs only to
     the existing slot calculation, including its no-supply exclusions.
@@ -1528,6 +1528,7 @@ def _calendar_intersection_candidates(
     sql = """
         WITH presence AS (
             SELECT merchant_id, visit_date, point_code,
+                   MAX(CASE WHEN slot = 'DAY' THEN 1 ELSE 0 END) AS has_day,
                    MAX(CASE WHEN slot = 'MORNING' THEN 1 ELSE 0 END) AS morning,
                    MAX(CASE WHEN slot = 'EVENING' THEN 1 ELSE 0 END) AS evening
             FROM visits
@@ -1549,7 +1550,8 @@ def _calendar_intersection_candidates(
                      COALESCE(historical_tu, tu) AS tu FROM merchants) m1 ON m1.id = v1.merchant_id
         JOIN (SELECT id, COALESCE(historical_fio, fio) AS fio,
                      COALESCE(historical_tu, tu) AS tu FROM merchants) m2 ON m2.id = v2.merchant_id
-        WHERE NOT ((v1.morning = 1 AND v2.morning = 1)
+        WHERE (v1.has_day = 1 OR v2.has_day = 1)
+          AND NOT ((v1.morning = 1 AND v2.morning = 1)
                 OR (v1.evening = 1 AND v2.evening = 1))
     """
     params = {"start_date": month_start(y, m), "end_date": month_end_exclusive(y, m),
