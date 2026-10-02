@@ -28,7 +28,7 @@ SLOT_DAY = "DAY"  # backward-compatible value for records created before explici
 SLOT_FULL_INVENT = "FULL_INVENT"
 VISIT_SLOTS = frozenset({SLOT_MORNING, SLOT_EVENING, SLOT_DAY})
 OVERLAP_SLOTS = frozenset({SLOT_MORNING, SLOT_EVENING})
-# Report fallback includes different explicit shifts; it does not change calendar badges.
+# DAY can intersect an explicit shift; different explicit shifts do not overlap.
 PRESENCE_SLOTS = VISIT_SLOTS
 INTERSECTION_CALENDAR_DAY = "CALENDAR_DAY"  # report level, never a stored visit slot
 ALL_SLOTS = frozenset({*VISIT_SLOTS, SLOT_FULL_INVENT})
@@ -1352,9 +1352,10 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
 
     rows = db.execute(text(sql), params).mappings().all()
     valid_overlap_keys: set[tuple[int, str]] = set()
+    exclusions = _overlap_receipt_exclusions(db, y, m)
     for overlap in (
-        _valid_intersection_candidates(db, y, m, tu)
-        + _calendar_intersection_candidates(db, y, m, tu)
+        _valid_intersection_candidates(db, y, m, tu, exclusions=exclusions)
+        + _calendar_intersection_candidates(db, y, m, tu, exclusions=exclusions)
     ):
         point_code = str(overlap["point_code"])
         valid_overlap_keys.add((int(overlap["merchant_id1"]), point_code))
@@ -1447,9 +1448,63 @@ def get_admin_payroll_rows(db: Session, y: int, m: int, tu: str | None = None, s
     return result
 
 
+def no_supply_note_dates(comment: str | None, y: int, m: int) -> set[date]:
+    """Read explicit dates attached to the reason, never amounts or other notes.
+
+    An undated reason cannot identify an attendance date. Stop at other prose
+    so a later date with a different reason is not silently excluded.
+    """
+    dates: set[date] = set()
+    value = str(comment or "")
+    for reason in re.finditer(r"\bне\s+принимал(?:а)?\s+поставку\b", value, re.IGNORECASE):
+        tail = value[reason.end():]
+        cursor = 0
+        for token in re.finditer(r"(?<!\d)(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?(?!\d)", tail):
+            separator = tail[cursor:token.start()]
+            if not re.fullmatch(r"[\s,.;:/—–-]*(?:(?:и|за|в)[\s,.;:/—–-]*)?", separator, re.IGNORECASE):
+                break
+            cursor = token.end()
+            try:
+                day = date(int(token[3]) if token[3] else y, int(token[2]), int(token[1]))
+            except ValueError:
+                continue
+            if day.year == y and day.month == m:
+                dates.add(day)
+    return dates
+
+
+def _overlap_receipt_exclusions(db: Session, y: int, m: int) -> set[tuple[int, str, date]]:
+    normalized = normalized_adjustments_available(db)
+    note_table = "point_notes" if normalized else "point_adjustments"
+    note_column = "comment" if normalized else "note_comment"
+    rows = db.execute(text(f"""
+        SELECT merchant_id, point_code, {note_column} AS comment
+        FROM {note_table} WHERE month_key = :month_key
+    """), {"month_key": month_start(y, m)}).mappings().all()
+    return {(int(row["merchant_id"]), str(row["point_code"]), day)
+            for row in rows for day in no_supply_note_dates(row["comment"], y, m)}
+
+
+def _overlap_query(sql: str, exclusions: set[tuple[int, str, date]]):
+    # Filter reception facts BEFORE grouping/pairing. Separate inventory survives.
+    predicate = """
+          AND (slot NOT IN ('DAY', 'MORNING')
+               OR (merchant_id, point_code, visit_date) NOT IN :excluded_receipts)
+    """ if exclusions else ""
+    statement = text("""
+        WITH overlap_visits AS (
+            SELECT * FROM visits
+            WHERE visit_date >= :start_date AND visit_date < :end_date
+    """ + predicate + ") " + sql)
+    return (statement.bindparams(bindparam("excluded_receipts", expanding=True))
+            if exclusions else statement)
+
+
 def _valid_intersection_candidates(
-    db: Session, y: int, m: int, tu: str | None = None
+    db: Session, y: int, m: int, tu: str | None = None, *, exclusions=None
 ) -> list[dict]:
+    if exclusions is None:
+        exclusions = _overlap_receipt_exclusions(db, y, m)
     start = month_start(y, m)
     end = month_end_exclusive(y, m)
     sql = """
@@ -1459,8 +1514,8 @@ def _valid_intersection_candidates(
                m1.fio AS fio1, m1.tu AS tu1,
                m2.fio AS fio2, m2.tu AS tu2,
                v1.slot AS slot1, v2.slot AS slot2
-        FROM visits v1
-        JOIN visits v2
+        FROM overlap_visits v1
+        JOIN overlap_visits v2
           ON v1.visit_date = v2.visit_date
          AND v1.point_code = v2.point_code
          AND v1.slot = v2.slot
@@ -1473,65 +1528,31 @@ def _valid_intersection_candidates(
           AND v1.visit_date < :end_date
           AND v1.slot IN ('MORNING', 'EVENING')
     """
-    params = {"start_date": start, "end_date": end}
+    params = {"start_date": start, "end_date": end, "excluded_receipts": sorted(exclusions)}
     if tu:
         sql += " AND (m1.tu = :tu OR m2.tu = :tu)"
         params["tu"] = tu
     sql += " ORDER BY v1.visit_date, v1.point_code, v1.slot, m1.fio, m2.fio"
-    rows = db.execute(text(sql), params).mappings().all()
-    if not rows:
-        return []
-    # Fetch notes once per export instead of inspecting schema and querying each pair.
-    normalized = normalized_adjustments_available(db)
-    note_table = "point_notes" if normalized else "point_adjustments"
-    note_column = "comment" if normalized else "note_comment"
-    merchant_ids = sorted({int(row[key]) for row in rows for key in ("merchant_id1", "merchant_id2")})
-    note_rows = db.execute(text(f"""
-        SELECT merchant_id, point_code, {note_column} AS comment
-        FROM {note_table}
-        WHERE month_key = :month_key AND merchant_id IN :merchant_ids
-    """).bindparams(bindparam("merchant_ids", expanding=True)),
-        {"month_key": start, "merchant_ids": merchant_ids}).mappings().all()
-    adjustment_cache: dict[tuple[int, str], str] = {}
-    for note in note_rows:
-        key = (int(note["merchant_id"]), str(note["point_code"]))
-        if normalized:
-            adjustment_cache[key] = adjustment_cache.get(key, "") + "\n" + str(note["comment"] or "")
-        else:
-            adjustment_cache.setdefault(key, str(note["comment"] or ""))
-    result = []
-    for raw_row in rows:
-        row = dict(raw_row)
-        visit_date = row["visit_date"]
-        if isinstance(visit_date, str):
-            visit_date = date.fromisoformat(visit_date)
-        marker = no_supply_adjustment_marker(visit_date)
-        suppressed = False
-        for merchant_id in (row["merchant_id1"], row["merchant_id2"]):
-            key = (int(merchant_id), str(row["point_code"]))
-            if marker in adjustment_cache.get(key, ""):
-                suppressed = True
-                break
-        if not suppressed:
-            result.append(row)
-    return result
+    return [dict(row) for row in db.execute(_overlap_query(sql, exclusions), params).mappings().all()]
 
 
 def _calendar_intersection_candidates(
-    db: Session, y: int, m: int, tu: str | None = None
+    db: Session, y: int, m: int, tu: str | None = None, *, exclusions=None
 ) -> list[dict]:
     """DAY-based overlap for distinct people without a common explicit shift.
 
     Grouping collapses raw repeats. A shared MORNING/EVENING belongs only to
     the existing slot calculation, including its no-supply exclusions.
     """
+    if exclusions is None:
+        exclusions = _overlap_receipt_exclusions(db, y, m)
     sql = """
-        WITH presence AS (
+        , presence AS (
             SELECT merchant_id, visit_date, point_code,
                    MAX(CASE WHEN slot = 'DAY' THEN 1 ELSE 0 END) AS has_day,
                    MAX(CASE WHEN slot = 'MORNING' THEN 1 ELSE 0 END) AS morning,
                    MAX(CASE WHEN slot = 'EVENING' THEN 1 ELSE 0 END) AS evening
-            FROM visits
+            FROM overlap_visits
             WHERE visit_date >= :start_date AND visit_date < :end_date
               AND slot IN :presence_slots
             GROUP BY merchant_id, visit_date, point_code
@@ -1555,12 +1576,12 @@ def _calendar_intersection_candidates(
                 OR (v1.evening = 1 AND v2.evening = 1))
     """
     params = {"start_date": month_start(y, m), "end_date": month_end_exclusive(y, m),
-              "presence_slots": sorted(PRESENCE_SLOTS)}
+              "presence_slots": sorted(PRESENCE_SLOTS), "excluded_receipts": sorted(exclusions)}
     if tu:
         sql += " AND (m1.tu = :tu OR m2.tu = :tu)"
         params["tu"] = tu
     sql += " ORDER BY v1.visit_date, v1.point_code, v1.merchant_id, v2.merchant_id"
-    rows = db.execute(text(sql).bindparams(bindparam("presence_slots", expanding=True)), params).mappings().all()
+    rows = db.execute(_overlap_query(sql, exclusions).bindparams(bindparam("presence_slots", expanding=True)), params).mappings().all()
     return [dict(row, slot1=INTERSECTION_CALENDAR_DAY, slot2=INTERSECTION_CALENDAR_DAY)
             for row in rows]
 
@@ -1569,9 +1590,10 @@ def get_intersections_rows(
     db: Session, y: int, m: int, tu: str | None = None, *, include_calendar_days: bool = False
 ):
     """Keep the legacy slot-only contract; the registry/export opts into day rows."""
-    rows = _valid_intersection_candidates(db, y, m, tu)
+    exclusions = _overlap_receipt_exclusions(db, y, m)
+    rows = _valid_intersection_candidates(db, y, m, tu, exclusions=exclusions)
     if include_calendar_days:
-        rows += _calendar_intersection_candidates(db, y, m, tu)
+        rows += _calendar_intersection_candidates(db, y, m, tu, exclusions=exclusions)
     return [{
         "visit_date": str(r["visit_date"]),
         "point_code": r["point_code"],
