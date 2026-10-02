@@ -310,17 +310,19 @@ def safe_admin_tu_values(db: Session) -> list[str]:
 def style_sheet(ws):
     green_fill = PatternFill("solid", fgColor="E8F5E9")
     bold = Font(bold=True)
+    header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    body_alignment = Alignment(vertical="top", wrap_text=True)
     for cell in ws[1]:
         cell.font = bold
         cell.fill = green_fill
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.alignment = header_alignment
     for col in ws.columns:
         max_len = 0
         col_letter = col[0].column_letter
         for cell in col:
             value = "" if cell.value is None else str(cell.value)
             max_len = max(max_len, len(value))
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            cell.alignment = body_alignment
         ws.column_dimensions[col_letter].width = min(max(max_len + 2, 12), 35)
     ws.freeze_panes = "A2"
 
@@ -330,7 +332,7 @@ def build_excel_response(wb: Workbook, filename: str) -> StreamingResponse:
     wb.save(buffer)
     buffer.seek(0)
     return StreamingResponse(
-        buffer,
+        iter((buffer.getvalue(),)),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'}
     )

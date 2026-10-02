@@ -1131,8 +1131,7 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
     Пересечение: выходы «В» разных сотрудников на одну точку и дату,
     либо существующее пересечение одинаковых MORNING/EVENING слотов.
     """
-    ensure_monthly_submissions_table(db)
-    ensure_point_adjustments_table(db)
+    # Read-only report: compatibility DDL belongs to explicit schema setup.
     start_date = month_start(y, m)
     end_date = month_end_exclusive(y, m)
 
@@ -1480,7 +1479,26 @@ def _valid_intersection_candidates(
         params["tu"] = tu
     sql += " ORDER BY v1.visit_date, v1.point_code, v1.slot, m1.fio, m2.fio"
     rows = db.execute(text(sql), params).mappings().all()
-    adjustment_cache: dict[tuple[int, str], dict] = {}
+    if not rows:
+        return []
+    # Fetch notes once per export instead of inspecting schema and querying each pair.
+    normalized = normalized_adjustments_available(db)
+    note_table = "point_notes" if normalized else "point_adjustments"
+    note_column = "comment" if normalized else "note_comment"
+    merchant_ids = sorted({int(row[key]) for row in rows for key in ("merchant_id1", "merchant_id2")})
+    note_rows = db.execute(text(f"""
+        SELECT merchant_id, point_code, {note_column} AS comment
+        FROM {note_table}
+        WHERE month_key = :month_key AND merchant_id IN :merchant_ids
+    """).bindparams(bindparam("merchant_ids", expanding=True)),
+        {"month_key": start, "merchant_ids": merchant_ids}).mappings().all()
+    adjustment_cache: dict[tuple[int, str], str] = {}
+    for note in note_rows:
+        key = (int(note["merchant_id"]), str(note["point_code"]))
+        if normalized:
+            adjustment_cache[key] = adjustment_cache.get(key, "") + "\n" + str(note["comment"] or "")
+        else:
+            adjustment_cache.setdefault(key, str(note["comment"] or ""))
     result = []
     for raw_row in rows:
         row = dict(raw_row)
@@ -1491,49 +1509,7 @@ def _valid_intersection_candidates(
         suppressed = False
         for merchant_id in (row["merchant_id1"], row["merchant_id2"]):
             key = (int(merchant_id), str(row["point_code"]))
-            if key not in adjustment_cache:
-                if normalized_adjustments_available(db):
-                    note_rows = db.execute(
-                        text(
-                            """
-                            SELECT comment
-                            FROM point_notes
-                            WHERE merchant_id = :merchant_id
-                              AND point_code = :point_code
-                              AND month_key = :month_key
-                            """
-                        ),
-                        {
-                            "merchant_id": key[0],
-                            "point_code": key[1],
-                            "month_key": start,
-                        },
-                    ).all()
-                    adjustment_cache[key] = {
-                        "note_comment": "\n".join(
-                            str(note[0] or "") for note in note_rows
-                        )
-                    }
-                else:
-                    adjustment = db.execute(
-                        text(
-                            """
-                            SELECT note_comment
-                            FROM point_adjustments
-                            WHERE merchant_id = :merchant_id
-                              AND point_code = :point_code
-                              AND month_key = :month_key
-                            LIMIT 1
-                            """
-                        ),
-                        {
-                            "merchant_id": key[0],
-                            "point_code": key[1],
-                            "month_key": start,
-                        },
-                    ).mappings().first()
-                    adjustment_cache[key] = dict(adjustment) if adjustment else {}
-            if marker in str(adjustment_cache[key].get("note_comment") or ""):
+            if marker in adjustment_cache.get(key, ""):
                 suppressed = True
                 break
         if not suppressed:
@@ -1546,17 +1522,26 @@ def _calendar_intersection_candidates(
 ) -> list[dict]:
     """Fallback for distinct people present without a common explicit shift.
 
-    DISTINCT collapses raw repeats. A shared MORNING/EVENING belongs only to
+    Grouping collapses raw repeats. A shared MORNING/EVENING belongs only to
     the existing slot calculation, including its no-supply exclusions.
     """
     sql = """
-        SELECT DISTINCT v1.merchant_id AS merchant_id1,
+        WITH presence AS (
+            SELECT merchant_id, visit_date, point_code,
+                   MAX(CASE WHEN slot = 'MORNING' THEN 1 ELSE 0 END) AS morning,
+                   MAX(CASE WHEN slot = 'EVENING' THEN 1 ELSE 0 END) AS evening
+            FROM visits
+            WHERE visit_date >= :start_date AND visit_date < :end_date
+              AND slot IN :presence_slots
+            GROUP BY merchant_id, visit_date, point_code
+        )
+        SELECT v1.merchant_id AS merchant_id1,
                v2.merchant_id AS merchant_id2,
                v1.visit_date, v1.point_code,
                m1.fio AS fio1, m1.tu AS tu1,
                m2.fio AS fio2, m2.tu AS tu2
-        FROM visits v1
-        JOIN visits v2
+        FROM presence v1
+        JOIN presence v2
           ON v1.visit_date = v2.visit_date
          AND v1.point_code = v2.point_code
          AND v1.merchant_id < v2.merchant_id
@@ -1564,20 +1549,8 @@ def _calendar_intersection_candidates(
                      COALESCE(historical_tu, tu) AS tu FROM merchants) m1 ON m1.id = v1.merchant_id
         JOIN (SELECT id, COALESCE(historical_fio, fio) AS fio,
                      COALESCE(historical_tu, tu) AS tu FROM merchants) m2 ON m2.id = v2.merchant_id
-        WHERE v1.visit_date >= :start_date AND v1.visit_date < :end_date
-          AND v1.slot IN :presence_slots AND v2.slot IN :presence_slots
-          AND NOT EXISTS (
-              SELECT 1 FROM visits s1
-              JOIN visits s2
-                ON s2.point_code = s1.point_code
-               AND s2.visit_date = s1.visit_date
-               AND s2.slot = s1.slot
-               AND s2.merchant_id = v2.merchant_id
-              WHERE s1.merchant_id = v1.merchant_id
-                AND s1.point_code = v1.point_code
-                AND s1.visit_date = v1.visit_date
-                AND s1.slot IN ('MORNING', 'EVENING')
-          )
+        WHERE NOT ((v1.morning = 1 AND v2.morning = 1)
+                OR (v1.evening = 1 AND v2.evening = 1))
     """
     params = {"start_date": month_start(y, m), "end_date": month_end_exclusive(y, m),
               "presence_slots": sorted(PRESENCE_SLOTS)}

@@ -241,7 +241,7 @@ class CalendarIntersectionTests(unittest.TestCase):
             statements.append(statement.lstrip().upper())
         report = build_report(self.db, 2026, 9)
         self.assertEqual(build_report(self.db, 2026, 9), report)
-        self.assertTrue(all(s.startswith(("SELECT", "PRAGMA")) for s in statements))
+        self.assertTrue(all(s.startswith(("SELECT", "WITH", "PRAGMA")) for s in statements))
         self.assertEqual(report["before"], {"points": 1, "point_dates": 2, "calendar_dates": 2})
         self.assertEqual(report["after"], {"points": 1, "point_dates": 9, "calendar_dates": 9})
         self.assertEqual(len(report["previously_missed_pairs"]), 7)
