@@ -28,6 +28,9 @@ SLOT_DAY = "DAY"  # backward-compatible value for records created before explici
 SLOT_FULL_INVENT = "FULL_INVENT"
 VISIT_SLOTS = frozenset({SLOT_MORNING, SLOT_EVENING, SLOT_DAY})
 OVERLAP_SLOTS = frozenset({SLOT_MORNING, SLOT_EVENING})
+# Calendar badge «В» uses these slots; inventory-only marks are not exits.
+PRESENCE_SLOTS = frozenset({SLOT_DAY, SLOT_MORNING})
+INTERSECTION_CALENDAR_DAY = "CALENDAR_DAY"  # report level, never a stored visit slot
 ALL_SLOTS = frozenset({*VISIT_SLOTS, SLOT_FULL_INVENT})
 REGULAR_PAY_SLOTS = frozenset({SLOT_DAY, SLOT_MORNING})
 INVENTORY_PAY_SLOTS = frozenset({SLOT_EVENING, SLOT_FULL_INVENT})
@@ -1125,7 +1128,8 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
 
     Важно: отчёт должен включать точки, где нет выходов, но есть примечание/возмещение.
     Поэтому базовый список точек берём из visits UNION point_adjustments.
-    Пересечение считается только при полном совпадении: дата + точка + слот.
+    Пересечение: выходы «В» разных сотрудников на одну точку и дату,
+    либо существующее пересечение одинаковых MORNING/EVENING слотов.
     """
     ensure_monthly_submissions_table(db)
     ensure_point_adjustments_table(db)
@@ -1349,7 +1353,10 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
 
     rows = db.execute(text(sql), params).mappings().all()
     valid_overlap_keys: set[tuple[int, str]] = set()
-    for overlap in _valid_intersection_candidates(db, y, m, tu):
+    for overlap in (
+        _valid_intersection_candidates(db, y, m, tu)
+        + _calendar_intersection_candidates(db, y, m, tu)
+    ):
         point_code = str(overlap["point_code"])
         valid_overlap_keys.add((int(overlap["merchant_id1"]), point_code))
         valid_overlap_keys.add((int(overlap["merchant_id2"]), point_code))
@@ -1447,7 +1454,7 @@ def _valid_intersection_candidates(
     start = month_start(y, m)
     end = month_end_exclusive(y, m)
     sql = """
-        SELECT v1.merchant_id AS merchant_id1,
+        SELECT DISTINCT v1.merchant_id AS merchant_id1,
                v2.merchant_id AS merchant_id2,
                v1.visit_date, v1.point_code,
                m1.fio AS fio1, m1.tu AS tu1,
@@ -1534,8 +1541,50 @@ def _valid_intersection_candidates(
     return result
 
 
-def get_intersections_rows(db: Session, y: int, m: int, tu: str | None = None):
+def _calendar_intersection_candidates(
+    db: Session, y: int, m: int, tu: str | None = None
+) -> list[dict]:
+    """Pair distinct people with a «В» mark, independent of supply and inventory.
+
+    DISTINCT collapses repeated rows and DAY/MORNING marks for the same person.
+    No-supply financial adjustments do not cancel an explicitly recorded exit.
+    """
+    sql = """
+        SELECT DISTINCT v1.merchant_id AS merchant_id1,
+               v2.merchant_id AS merchant_id2,
+               v1.visit_date, v1.point_code,
+               m1.fio AS fio1, m1.tu AS tu1,
+               m2.fio AS fio2, m2.tu AS tu2
+        FROM visits v1
+        JOIN visits v2
+          ON v1.visit_date = v2.visit_date
+         AND v1.point_code = v2.point_code
+         AND v1.merchant_id < v2.merchant_id
+        JOIN (SELECT id, COALESCE(historical_fio, fio) AS fio,
+                     COALESCE(historical_tu, tu) AS tu FROM merchants) m1 ON m1.id = v1.merchant_id
+        JOIN (SELECT id, COALESCE(historical_fio, fio) AS fio,
+                     COALESCE(historical_tu, tu) AS tu FROM merchants) m2 ON m2.id = v2.merchant_id
+        WHERE v1.visit_date >= :start_date AND v1.visit_date < :end_date
+          AND v1.slot IN :presence_slots AND v2.slot IN :presence_slots
+    """
+    params = {"start_date": month_start(y, m), "end_date": month_end_exclusive(y, m),
+              "presence_slots": sorted(PRESENCE_SLOTS)}
+    if tu:
+        sql += " AND (m1.tu = :tu OR m2.tu = :tu)"
+        params["tu"] = tu
+    sql += " ORDER BY v1.visit_date, v1.point_code, v1.merchant_id, v2.merchant_id"
+    rows = db.execute(text(sql).bindparams(bindparam("presence_slots", expanding=True)), params).mappings().all()
+    return [dict(row, slot1=INTERSECTION_CALENDAR_DAY, slot2=INTERSECTION_CALENDAR_DAY)
+            for row in rows]
+
+
+def get_intersections_rows(
+    db: Session, y: int, m: int, tu: str | None = None, *, include_calendar_days: bool = False
+):
+    """Keep the legacy slot-only contract; the registry/export opts into day rows."""
     rows = _valid_intersection_candidates(db, y, m, tu)
+    if include_calendar_days:
+        rows += _calendar_intersection_candidates(db, y, m, tu)
     return [{
         "visit_date": str(r["visit_date"]),
         "point_code": r["point_code"],
@@ -1545,11 +1594,14 @@ def get_intersections_rows(db: Session, y: int, m: int, tu: str | None = None):
         "fio2": r["fio2"],
         "tu2": r["tu2"] or "",
         "slot2": r["slot2"],
+        **({"merchant_id1": r["merchant_id1"], "merchant_id2": r["merchant_id2"],
+            "intersection_level": "calendar_day" if r["slot1"] == INTERSECTION_CALENDAR_DAY else "slot"}
+           if include_calendar_days else {}),
     } for r in rows]
 
 
 def find_visit_intersections(visits: list[dict]) -> list[dict]:
-    """Pure reference implementation used by tests and non-SQL exports."""
+    """Legacy slot-only reference; calendar exits are a separate report level."""
     grouped: dict[tuple, dict[int, str]] = {}
     for visit in visits:
         slot = str(visit.get("slot") or "").upper()
