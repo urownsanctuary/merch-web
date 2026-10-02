@@ -4735,7 +4735,8 @@ def admin_export_overlaps(
         db=db,
         y=year,
         m=month,
-        tu=tu.strip() or None
+        tu=tu.strip() or None,
+        include_calendar_days=True,
     )
 
     wb = Workbook()
@@ -4750,7 +4751,10 @@ def admin_export_overlaps(
         "Слот 1",
         "Мерч 2",
         "ТУ 2",
-        "Слот 2"
+        "Слот 2",
+        "Уровень пересечения",
+        "ID мерча 1",
+        "ID мерча 2",
     ])
 
     for r in rows:
@@ -4763,7 +4767,36 @@ def admin_export_overlaps(
             r["fio2"],
             r["tu2"],
             r["slot2"],
+            "Календарный день (В)" if r.get("intersection_level") == "calendar_day" else "Слот",
+            r.get("merchant_id1"),
+            r.get("merchant_id2"),
         ])
 
     style_sheet(ws)
+    # One row per TT/date, regardless of the number of pairs or slot details.
+    days = {}
+    for r in rows:
+        key = (str(r["point_code"]), str(r["visit_date"]))
+        entry = days.setdefault(key, {"people": set(), "slots": set(), "presence": False})
+        for side in (1, 2):
+            merchant_id = r.get(f"merchant_id{side}")
+            entry["people"].add(f'{r[f"fio{side}"]} (ID {merchant_id})' if merchant_id is not None else r[f"fio{side}"])
+        if r.get("intersection_level") == "calendar_day":
+            entry["presence"] = True
+        else:
+            entry["slots"].add(r["slot1"])
+    day_sheet = wb.create_sheet("По дням")
+    day_sheet.append(["Дата", "Точка", "Сотрудники", "Пересечение выходов (В)", "Слоты пересечений"])
+    for (point, day), entry in sorted(days.items()):
+        day_sheet.append([day, point, "; ".join(sorted(entry["people"])),
+                          "Да" if entry["presence"] else "", ", ".join(sorted(entry["slots"]))])
+    style_sheet(day_sheet)
+    summary = wb.create_sheet("Итоги")
+    summary.append(["Показатель", "Количество"])
+    summary.append(["Уникальные ТТ с пересечениями", len({point for point, _ in days})])
+    summary.append(["Уникальные дни по ТТ (ТТ + дата)", len(days)])
+    summary.append(["Уникальные календарные даты по всем ТТ", len({day for _, day in days})])
+    summary.append(["Дни по ТТ с пересечением выходов (В)", sum(entry["presence"] for entry in days.values())])
+    summary.append(["Пересечения по слотам (пары сотрудников)", sum(r.get("intersection_level") != "calendar_day" for r in rows)])
+    style_sheet(summary)
     return build_excel_response(wb, f"peresecheniya_{year}_{month:02d}.xlsx")
