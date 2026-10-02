@@ -7,9 +7,10 @@
 
 Для пары разных `merchant_id` на `point_code + visit_date` общие MORNING/EVENING
 имеют приоритет: выводятся только эти слотные строки, без CALENDAR_DAY.
-Если общего конкретного слота нет, но оба имеют DAY/MORNING/EVENING на этой ТТ
-и дате, выводится ровно один CALENDAR_DAY. Например, DAY/MORNING или
-MORNING/EVENING у разных сотрудников дают fallback. Legacy FULL_INVENT
+Если общего конкретного слота нет, оба имеют DAY/MORNING/EVENING на этой ТТ
+и дате и хотя бы один имеет DAY, выводится ровно один CALENDAR_DAY.
+DAY/MORNING, DAY/EVENING и DAY/DAY дают fallback; MORNING/EVENING у разных
+сотрудников не пересекаются. Одного совпадения даты недостаточно. Legacy FULL_INVENT
 не добавляет календарный fallback. DISTINCT исключает технические повторы.
 Слотные исключения «Не принимал поставку» сохранены и не обходятся fallback.
 
