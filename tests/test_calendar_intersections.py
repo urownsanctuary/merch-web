@@ -1,4 +1,4 @@
-"""Calendar exits are separate from legacy inventory/slot intersections."""
+"""Exact shift intersections take precedence over calendar fallback."""
 import os
 import unittest
 import json
@@ -70,9 +70,9 @@ class CalendarIntersectionTests(unittest.TestCase):
         rows = self.rows()
         calendar = [r for r in rows if r["intersection_level"] == "calendar_day"]
         self.assertEqual([r["visit_date"] for r in calendar],
-                         [f"2026-09-{day:02d}" for day in (1, 2, 3, 4, 7, 8, 9, 10, 11)])
+                         [f"2026-09-{day:02d}" for day in (1, 2, 3, 7, 8, 9, 10)])
         self.assertEqual(len({r["visit_date"] for r in rows}), 9)
-        self.assertEqual(len(rows), 13)
+        self.assertEqual(len(rows), 11)
         self.assertEqual({(r["visit_date"], r["slot1"]) for r in rows if r["intersection_level"] == "slot"},
                          {(f"2026-09-{day:02d}", slot) for day in (4, 11) for slot in ("MORNING", "EVENING")})
         self.assertEqual({(r["merchant_id1"], r["merchant_id2"]) for r in rows}, {(1, 2)})
@@ -85,9 +85,9 @@ class CalendarIntersectionTests(unittest.TestCase):
             self.visit(person, 1, "MORNING")
         self.db.commit()
         rows = self.rows()
-        for level in ("calendar_day", "slot"):
-            pairs = [ (r["merchant_id1"], r["merchant_id2"]) for r in rows if r["intersection_level"] == level]
-            self.assertEqual(sorted(pairs), [(1, 2), (1, 3), (2, 3)])
+        self.assertEqual([r for r in rows if r["intersection_level"] == "calendar_day"], [])
+        self.assertEqual(sorted((r["merchant_id1"], r["merchant_id2"]) for r in rows),
+                         [(1, 2), (1, 3), (2, 3)])
         # Same name, different stable IDs still represents different employees.
         self.assertTrue(any(r["fio1"] == r["fio2"] for r in rows))
 
@@ -98,13 +98,11 @@ class CalendarIntersectionTests(unittest.TestCase):
         self.db.commit()
         self.assertEqual(self.rows(), [])
 
-    def test_only_v_counts_not_supply_or_inventory(self):
+    def test_legacy_full_inventory_and_supplies_do_not_create_fallback(self):
         self.visit(1, 1)
         self.visit(2, 1, "FULL_INVENT")
         self.visit(1, 2, "FULL_INVENT")
         self.visit(2, 2, "FULL_INVENT")
-        self.visit(1, 3, "MORNING")
-        self.visit(2, 3, "EVENING")
         self.db.execute(text("INSERT INTO supplies VALUES ('3284','2026-09-01',100)"))
         self.db.commit()
         self.assertEqual(self.rows(), [])
@@ -127,14 +125,14 @@ class CalendarIntersectionTests(unittest.TestCase):
         self.assertEqual(len(self.rows(tu="TU-2")), 1)
         self.assertEqual(self.rows(tu="TU-3"), [])
 
-    def test_no_supply_note_preserves_legacy_suppression_but_not_exit_day(self):
+    def test_no_supply_note_suppression_is_not_reintroduced_as_fallback(self):
         self.visit(1, 4, "MORNING")
         self.visit(2, 4, "MORNING")
         self.db.execute(text("INSERT INTO point_adjustments (merchant_id,point_code,month_key,note_comment) VALUES (1,'3284','2026-09-01',:note)"),
                         {"note": services.no_supply_adjustment_marker(date(2026, 9, 4))})
         self.db.commit()
         self.assertEqual(services.get_intersections_rows(self.db, 2026, 9), [])
-        self.assertEqual([r["intersection_level"] for r in self.rows()], ["calendar_day"])
+        self.assertEqual(self.rows(), [])
 
     def test_registry_draft_submitted_and_payroll_unchanged(self):
         self.visit(1, 1)
@@ -161,12 +159,77 @@ class CalendarIntersectionTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         workbook = load_workbook(BytesIO(response.content), data_only=True)
         self.assertEqual(workbook["По дням"].max_row, 10)
-        self.assertEqual(workbook["Пересечения"].max_row, 14)
+        self.assertEqual(workbook["Пересечения"].max_row, 12)
         self.assertEqual([c.value for c in workbook["Пересечения"][1]][:8],
                          ["Дата", "Точка", "Мерч 1", "ТУ 1", "Слот 1", "Мерч 2", "ТУ 2", "Слот 2"])
         summary = dict(workbook["Итоги"].iter_rows(min_row=2, values_only=True))
         self.assertEqual(summary["Уникальные дни по ТТ (ТТ + дата)"], 9)
         self.assertEqual(summary["Пересечения по слотам (пары сотрудников)"], 4)
+        self.assertEqual(summary["Дни по ТТ с календарным fallback"], 7)
+        levels = {}
+        for row in workbook["Пересечения"].iter_rows(min_row=2, values_only=True):
+            levels.setdefault((row[1], row[0], row[9], row[10]), set()).add(row[8])
+        self.assertTrue(all(len(value) == 1 for value in levels.values()))
+
+    def test_exact_slots_precede_fallback_for_each_pair_day(self):
+        cases = [
+            (("MORNING",), ("MORNING",), ["MORNING"]),
+            (("EVENING",), ("EVENING",), ["EVENING"]),
+            (("MORNING", "EVENING"), ("MORNING", "EVENING"), ["EVENING", "MORNING"]),
+            (("DAY",), ("MORNING",), ["CALENDAR_DAY"]),
+            (("MORNING",), ("EVENING",), ["CALENDAR_DAY"]),
+            (("DAY",), ("EVENING",), ["CALENDAR_DAY"]),
+            (("DAY", "EVENING"), ("MORNING", "EVENING"), ["EVENING"]),
+        ]
+        for day, (left, right, expected) in enumerate(cases, 1):
+            for slot in left:
+                self.visit(1, day, slot)
+            for slot in right:
+                self.visit(2, day, slot)
+        self.db.commit()
+        for day, (_, _, expected) in enumerate(cases, 1):
+            with self.subTest(day=day):
+                self.assertEqual(sorted(r["slot1"] for r in self.rows() if r["visit_date"] == f"2026-09-{day:02d}"), expected)
+
+    def test_fallback_exclusion_is_scoped_to_pair_point_and_date(self):
+        self.visit(1, 1, "MORNING")
+        self.visit(2, 1, "MORNING")
+        self.visit(3, 1, "DAY")
+        self.visit(1, 1, "DAY", point="OTHER")
+        self.visit(2, 1, "DAY", point="OTHER")
+        self.visit(1, 2, "DAY")
+        self.visit(2, 2, "DAY")
+        self.db.commit()
+        rows = self.rows()
+        self.assertEqual(len(rows), 5)
+        self.assertEqual(sum(r["intersection_level"] == "calendar_day" for r in rows), 4)
+
+    def test_submission_history_neither_filters_nor_duplicates_visit_dates(self):
+        self.fixture_3284()
+        self.db.execute(text("INSERT INTO monthly_submissions (merchant_id,month_key,status) VALUES "
+                             "(1,'2026-09-01','draft'),(1,'2026-09-01','submitted'),(2,'2026-09-01','submitted')"))
+        self.db.commit()
+        rows = self.rows()
+        self.assertEqual(len(rows), 11)
+        self.assertEqual(len({r["visit_date"] for r in rows}), 9)
+
+    def test_current_partial_draft_does_not_invent_missing_dates_from_totals(self):
+        # Synthetic counterpart: one draft has 14 exits, the submitted peer has 9.
+        for day in (11, 14, 15, 16, 17, 18, 21, 22, 23, 24, 25, 28, 29, 30):
+            self.visit(1, day, "MORNING" if day in (11, 18, 25) else "DAY")
+        for day in (1, 2, 3, 4, 7, 8, 9, 10, 11):
+            self.visit(2, day, "MORNING" if day in (4, 11) else "DAY")
+        for person in (1, 2):
+            self.visit(person, 11, "EVENING")
+        self.db.execute(text("INSERT INTO monthly_submissions (merchant_id,month_key,status) VALUES "
+                             "(1,'2026-09-01','draft'),(2,'2026-09-01','submitted')"))
+        self.db.commit()
+        rows = self.rows()
+        self.assertEqual({r["visit_date"] for r in rows}, {"2026-09-11"})
+        self.assertEqual(sorted(r["slot1"] for r in rows), ["EVENING", "MORNING"])
+        self.visit(1, 1)  # A real new date must be read even while the month is draft.
+        self.db.commit()
+        self.assertEqual({r["visit_date"] for r in self.rows()}, {"2026-09-01", "2026-09-11"})
 
     def test_audit_is_read_only_repeatable_and_reports_duplicates(self):
         self.fixture_3284()

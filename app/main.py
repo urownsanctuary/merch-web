@@ -4765,7 +4765,7 @@ def admin_export_overlaps(
             r["fio2"],
             r["tu2"],
             r["slot2"],
-            "Календарный день (В)" if r.get("intersection_level") == "calendar_day" else "Слот",
+            "Календарный день (fallback)" if r.get("intersection_level") == "calendar_day" else "Слот",
             r.get("merchant_id1"),
             r.get("merchant_id2"),
         ])
@@ -4784,7 +4784,7 @@ def admin_export_overlaps(
         else:
             entry["slots"].add(r["slot1"])
     day_sheet = wb.create_sheet("По дням")
-    day_sheet.append(["Дата", "Точка", "Сотрудники", "Пересечение выходов (В)", "Слоты пересечений"])
+    day_sheet.append(["Дата", "Точка", "Сотрудники", "Календарное пересечение без общего слота", "Слоты пересечений"])
     for (point, day), entry in sorted(days.items()):
         day_sheet.append([day, point, "; ".join(sorted(entry["people"])),
                           "Да" if entry["presence"] else "", ", ".join(sorted(entry["slots"]))])
@@ -4794,7 +4794,7 @@ def admin_export_overlaps(
     summary.append(["Уникальные ТТ с пересечениями", len({point for point, _ in days})])
     summary.append(["Уникальные дни по ТТ (ТТ + дата)", len(days)])
     summary.append(["Уникальные календарные даты по всем ТТ", len({day for _, day in days})])
-    summary.append(["Дни по ТТ с пересечением выходов (В)", sum(entry["presence"] for entry in days.values())])
+    summary.append(["Дни по ТТ с календарным fallback", sum(entry["presence"] for entry in days.values())])
     summary.append(["Пересечения по слотам (пары сотрудников)", sum(r.get("intersection_level") != "calendar_day" for r in rows)])
     style_sheet(summary)
     return build_excel_response(wb, f"peresecheniya_{year}_{month:02d}.xlsx")
