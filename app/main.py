@@ -110,6 +110,9 @@ from app.security import (
     verify_csrf,
 )
 from app.runtime import maintenance_mode_enabled
+from app.services import month_end_exclusive
+from app import delivery_roles
+from app.delivery_ui import action_input, handle_visit
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
@@ -173,6 +176,7 @@ async def bind_merchant_identity(request: Request, call_next):
     context_token = set_request_merchant(
         session.get("sub") if session else None,
         float(session.get("iat", session.get("exp", 0) - 12 * 60 * 60)) if session else 0,
+        session.get("merchant_id") if session else None,
     )
     try:
         response = await call_next(request)
@@ -1262,7 +1266,7 @@ def login_api(response: Response, fio: str, last4: str, db: Session = Depends(ge
 
     response.set_cookie(
         MERCHANT_COOKIE,
-        create_merchant_session(user["fio_norm"]),
+        create_merchant_session(user["fio_norm"], user["id"]),
         httponly=True,
         secure=secure_cookie(),
         samesite="lax",
@@ -1343,7 +1347,7 @@ def login_submit(
     response = RedirectResponse(url=f"/menu-page?fio={user['fio']}", status_code=303)
     response.set_cookie(
         MERCHANT_COOKIE,
-        create_merchant_session(user["fio_norm"]),
+        create_merchant_session(user["fio_norm"], user["id"]),
         httponly=True,
         secure=secure_cookie(),
         samesite="lax",
@@ -1622,6 +1626,7 @@ def build_calendar_html(
                 <input type="hidden" name="day" value="{day}" />
                 <input type="hidden" name="slot" value="{SLOT_DAY}" />
                 <input type="hidden" name="csrf_token" value="{escape(csrf_token)}" />
+                {action_input(csrf_token, point_code, current_date, SLOT_DAY, adding_day)}
                 {confirmation_input}
                 <button class="{cls}" type="submit">{day_content}</button>
             </form>
@@ -1912,6 +1917,7 @@ def calendar_page(
 
 @app.get("/point-note-page", response_class=HTMLResponse)
 def point_note_page(
+    request: Request,
     fio: str,
     point_code: str,
     mode: str = "",
@@ -2004,6 +2010,8 @@ def point_note_page(
         ) or {}
         existing_note_comment = str(existing.get("note_comment") or "")
         supply_days = filter_unadjusted_supply_days(supply_days, existing_note_comment)
+        assigned = delivery_roles.roles_for_month(db, merchant["id"], point_code_clean, period["year"], period["month"])
+        supply_days = [d for d in supply_days if d.day not in assigned]
         adjustment = get_supply_adjustment_amount(db, point_code_clean, period["year"], period["month"])
         options = "".join([f"<option value='{d.day}'>{d.strftime('%d.%m.%Y')}</option>" for d in supply_days])
         disabled = "" if supply_days else " disabled"
@@ -2029,6 +2037,7 @@ def point_note_page(
             <div class="hint">Выберите день с поставкой. Сумма корректировки рассчитается автоматически.</div>
 
             <form method="post" action="/save-point-note-no-supply" autocomplete="off">
+                <input type="hidden" name="csrf_token" value="{escape((read_merchant_session(request.cookies.get(MERCHANT_COOKIE)) or {}).get('csrf', ''))}" />
                 <input type="hidden" name="fio" value="{escape(fio)}" />
                 <input type="hidden" name="point_code" value="{escape(point_code_clean)}" />
 
@@ -2121,12 +2130,16 @@ def save_point_note_normal(
 
 @app.post("/save-point-note-no-supply")
 def save_point_note_no_supply(
+    request: Request,
     fio: str = Form(...),
     point_code: str = Form(...),
     supply_day: int = Form(...),
     comment: str = Form(""),
+    csrf_token: str = Form(""),
     db: Session = Depends(get_db)
 ):
+    if not verify_csrf(read_merchant_session(request.cookies.get(MERCHANT_COOKIE)), csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
     period = get_active_period()
     merchant = get_merchant_by_fio(db, fio)
     if not merchant:
@@ -2141,10 +2154,17 @@ def save_point_note_no_supply(
     if supply_date not in allowed_dates:
         raise HTTPException(status_code=400, detail="Дата не является оплачиваемым днём поставки")
 
+    delivery_roles.lock_day(db, point_code_clean, supply_date)
+    delivery_roles.lock_merchants(db, [merchant["id"]])
+    if delivery_roles.submitted(db, merchant["id"], supply_date):
+        raise HTTPException(status_code=409, detail="Сверка уже отправлена")
+    assigned = delivery_roles.roles_for_month(db, merchant["id"], point_code_clean, period["year"], period["month"])
+    if supply_day in assigned:
+        raise HTTPException(status_code=409, detail="Тип оплаты этого выхода уже подтверждён. Обратитесь к администратору.")
     adjustment = get_supply_adjustment_amount(db, point_code_clean, period["year"], period["month"])
     base_comment = no_supply_adjustment_marker(supply_date)
     note_comment = base_comment if not comment else f"{base_comment}. {comment}"
-    existing = get_point_adjustment(db, merchant["id"], point_code_clean, period["year"], period["month"]) or {}
+    existing = get_point_adjustment(db, merchant["id"], point_code_clean, period["year"], period["month"], ensure_schema=False) or {}
     existing_note_amount = int(existing.get("note_amount") or 0)
     existing_note_comment = existing.get("note_comment") or ""
     if base_comment in existing_note_comment:
@@ -2162,8 +2182,10 @@ def save_point_note_no_supply(
         reimb_amount=int(existing.get("reimb_amount") or 0),
         reimb_comment=existing.get("reimb_comment") or "",
         reimb_receipt=existing.get("reimb_receipt"),
+        commit=False,
     )
 
+    db.commit()
     return RedirectResponse(url=f"/calendar-page?fio={escape(fio)}&point_code={escape(point_code_clean)}&saved=1", status_code=303)
 
 
@@ -2746,6 +2768,7 @@ def day_action_page(
                 <input type="hidden" name="day" value="{day}" />
                 {slot_input}
                 <input type="hidden" name="csrf_token" value="{escape(session["csrf"])}" />
+                {action_input(session["csrf"], point_code, current_date, slot, adding)}
                 {confirmation}
                 <button class="{button_class}" type="submit">{button_text}</button>
                 <div class="calendar-note">{"Не отмечен — нажмите, чтобы добавить" if adding else "Отмечен — нажмите, чтобы убрать"}</div>
@@ -2840,6 +2863,8 @@ def toggle_day_post(
     slot: str = Form(...),
     csrf_token: str = Form(...),
     confirm_non_working: str = Form(""),
+    visit_action: str = Form(""),
+    delivery_choice: str = Form(""),
     db: Session = Depends(get_db),
 ):
     session = read_merchant_session(request.cookies.get(MERCHANT_COOKIE))
@@ -2858,6 +2883,7 @@ def toggle_day_post(
         db.rollback()
         return HTMLResponse("Некорректная дата выхода.", status_code=400)
 
+    point_code = normalize_point_code(point_code)
     current_date = date(period["year"], period["month"], day)
     try:
         normalized_slot = normalize_visit_slot(slot)
@@ -2894,6 +2920,12 @@ def toggle_day_post(
             status_code=409,
         )
 
+    response = handle_visit(db=db, merchant=merchant, point=point_code, day=current_date,
+                            slot=normalized_slot, csrf=session["csrf"], action=visit_action,
+                            choice=delivery_choice, non_working=confirm_non_working,
+                            base_css=base_css, special_inventory=False)
+    if response is not None:
+        return response
     try:
         sync_coffee = get_point_rates(
             db, point_code, period["year"], period["month"]
@@ -2961,6 +2993,8 @@ def toggle_inventory_post(
     day: int = Form(...),
     csrf_token: str = Form(...),
     confirm_non_working: str = Form(""),
+    visit_action: str = Form(""),
+    delivery_choice: str = Form(""),
     db: Session = Depends(get_db),
 ):
     session = read_merchant_session(request.cookies.get(MERCHANT_COOKIE))
@@ -2976,6 +3010,7 @@ def toggle_inventory_post(
         db.rollback()
         return HTMLResponse("Некорректная дата полного инвента.", status_code=400)
 
+    point_code = normalize_point_code(point_code)
     current_date = date(period["year"], period["month"], day)
     special_inventory = current_date in set(get_special_inventory_days(db))
     if SLOT_FULL_INVENT not in allowed_visit_slots(
@@ -3002,6 +3037,12 @@ def toggle_inventory_post(
             NON_WORKING_CONFIRM_MESSAGE,
             status_code=409,
         )
+    response = handle_visit(db=db, merchant=merchant, point=point_code, day=current_date,
+                            slot=SLOT_FULL_INVENT, csrf=session["csrf"], action=visit_action,
+                            choice=delivery_choice, non_working=confirm_non_working,
+                            base_css=base_css, special_inventory=special_inventory)
+    if response is not None:
+        return response
     try:
         toggle_inventory_visit(
             db,
@@ -3349,8 +3390,12 @@ def render_merchant_form_page(
                 <input id="merchant_fio" name="fio" type="text" value="{escape(str(values.get('fio') or ''))}" autocomplete="name" required />
                 <div class="field-error">{escape(errors.get("fio", ""))}</div>
 
+                <label for="merchant_phone">Полный телефон (необязательно для старых записей)</label>
+                <input id="merchant_phone" name="phone" type="tel" value="{escape(str(values.get('phone') or ''))}" autocomplete="off" />
+                <div class="field-error">{escape(errors.get("phone", ""))}</div>
+                <div class="hint">Если указан полный телефон, последние четыре цифры можно не заполнять.</div>
                 <label for="merchant_last4">Последние 4 цифры телефона</label>
-                <input id="merchant_last4" name="last4" type="text" inputmode="numeric" pattern="[0-9]{{4}}" minlength="4" maxlength="4" value="{escape(str(values.get('last4') or ''))}" required />
+                <input id="merchant_last4" name="last4" type="text" inputmode="numeric" pattern="[0-9]{{4}}" minlength="4" maxlength="4" value="{escape(str(values.get('last4') or ''))}" />
                 <div class="field-error">{escape(errors.get("last4", ""))}</div>
 
                 <label for="merchant_tu">ТУ</label>
@@ -3620,6 +3665,7 @@ def admin_update_merchant(
     merchant_id: int,
     fio: str = Form(""),
     last4: str = Form(""),
+    phone: Optional[str] = Form(None),
     tu: str = Form(""),
     status: str = Form("active"),
     csrf_token: str = Form(""),
@@ -3636,7 +3682,8 @@ def admin_update_merchant(
         return RedirectResponse(url="/admin-login", status_code=303)
     if not verify_admin_csrf(admin_auth, csrf_token):
         raise HTTPException(status_code=403, detail="Недействительный CSRF-токен")
-    values = {"fio": fio, "last4": last4, "tu": tu, "status": status}
+    phone = phone if isinstance(phone, str) else None
+    values = {"phone": phone, "fio": fio, "last4": last4, "tu": tu, "status": status}
     try:
         update_merchant(
             db,
@@ -3645,6 +3692,7 @@ def admin_update_merchant(
             last4,
             tu,
             status,
+            phone=phone,
             actor=ADMIN_LOGIN,
             fio_normalizer=fio_norm,
             last4_hasher=hash_last4,
@@ -3894,6 +3942,8 @@ def admin_report(
                 <a class="btn btn-secondary btn-inline" href="/admin-export-check?{export_query}">Выгрузка для проверки</a>
                 <a class="btn btn-secondary btn-inline" href="/admin-export-payroll?{export_query}">Выгрузка в ведомость</a>
                 <a class="btn btn-secondary btn-inline" href="/admin-export-overlaps?{export_query}">Выгрузка пересечений</a>
+                <a class="btn btn-secondary btn-inline" href="/admin-export-delivery-changes?{export_query}">Изменённые выходы мерчендайзеров по ставкам</a>
+                <a class="btn btn-secondary btn-inline" href="/admin-delivery-exceptions?{export_query}">Выходы, требующие разбора</a>
             </div>
 
             <div class="hint">
@@ -4075,8 +4125,9 @@ def admin_data_page(
                     <form method="post" action="/admin-upload-merchants" enctype="multipart/form-data">
                         <input type="hidden" name="csrf_token" value="{admin_csrf}" />
                         <label for="merchants_tu">Территориальный управляющий</label>
-                        <input id="merchants_tu" name="tu" type="text" placeholder="Например: Хрупов" required />
+                        <input id="merchants_tu" name="tu" type="text" placeholder="Если ТУ не указан в файле" />
 
+                        <div class="hint">Колонки: ФИО, Телефон, ТУ. Старый формат ФИО + Последние 4 также поддерживается. Если есть Телефон и Последние 4, они должны совпадать.</div>
                         <label for="merchants_file">Файл мерчей</label>
                         <input id="merchants_file" name="file" type="file" accept=".xlsx" required />
 
@@ -4325,7 +4376,7 @@ async def admin_upload_rates(
 
 @app.post("/admin-upload-merchants")
 async def admin_upload_merchants(
-    tu: str = Form(...),
+    tu: str = Form(""),
     file: UploadFile = File(...),
     csrf_token: str = Form(""),
     admin_auth: Optional[str] = Cookie(default=None),
@@ -4361,6 +4412,7 @@ async def admin_upload_merchants(
 def admin_add_merchant(
     fio: str = Form(""),
     last4: str = Form(""),
+    phone: Optional[str] = Form(None),
     tu: str = Form(""),
     csrf_token: str = Form(""),
     confirm_same_name: str = Form(""),
@@ -4376,13 +4428,15 @@ def admin_add_merchant(
         return RedirectResponse(url="/admin-login", status_code=303)
     if not verify_admin_csrf(admin_auth, csrf_token):
         raise HTTPException(status_code=403, detail="Недействительный CSRF-токен")
-    values = {"fio": fio, "last4": last4, "tu": tu, "status": "active"}
+    phone = phone if isinstance(phone, str) else None
+    values = {"phone": phone, "fio": fio, "last4": last4, "tu": tu, "status": "active"}
     try:
         created = create_merchant(
             db,
             fio,
             last4,
             tu,
+            phone=phone,
             actor=ADMIN_LOGIN,
             fio_normalizer=fio_norm,
             last4_hasher=hash_last4,
@@ -4740,6 +4794,13 @@ def admin_export_overlaps(
         include_calendar_days=True,
     )
 
+    confirmations = set()
+    if delivery_roles.available(db):
+        confirmations = {(str(r["point_code"]), str(r["visit_date"]), int(r["second_merchant_id"]))
+            for r in db.execute(text("""SELECT point_code, visit_date, second_merchant_id
+                FROM delivery_events WHERE visit_date>=:start AND visit_date<:end
+                AND (event_type LIKE 'DOUBLE_%' OR event_type='TRANSFER')"""),
+                {"start": date(year,month,1), "end": month_end_exclusive(year,month)}).mappings()}
     wb = Workbook()
     ws = wb.active
     ws.title = "Пересечения"
@@ -4756,6 +4817,7 @@ def admin_export_overlaps(
         "Уровень пересечения",
         "ID мерча 1",
         "ID мерча 2",
+        "Подтверждение совместного выхода",
     ])
 
     for r in rows:
@@ -4771,6 +4833,7 @@ def admin_export_overlaps(
             "Календарный день (fallback)" if r.get("intersection_level") == "calendar_day" else "Слот",
             r.get("merchant_id1"),
             r.get("merchant_id2"),
+            "Подтверждён" if any((str(r["point_code"]), str(r["visit_date"]), r.get(f"merchant_id{side}")) in confirmations for side in (1,2)) else "",
         ])
 
     style_sheet(ws)
@@ -4801,3 +4864,56 @@ def admin_export_overlaps(
     summary.append(["Пересечения по слотам (пары сотрудников)", sum(r.get("intersection_level") != "calendar_day" for r in rows)])
     style_sheet(summary)
     return build_excel_response(wb, f"peresecheniya_{year}_{month:02d}.xlsx")
+
+@app.get("/admin-export-delivery-changes")
+def admin_export_delivery_changes(year: int, month: int,
+                                  admin_auth: Optional[str] = Cookie(default=None),
+                                  db: Session = Depends(get_db)):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse("/admin-login", status_code=303)
+    if not 1 <= month <= 12 or not 2000 <= year <= 2200:
+        raise HTTPException(status_code=400, detail="Некорректный период")
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Изменённые выходы"
+    ws.append(["Дата", "ТТ", "Первый мерчендайзер", "Полный номер первого мерчендайзера",
+               "Ставка первого до", "Ставка первого после", "Второй мерчендайзер",
+               "Полный номер второго мерчендайзера", "Ставка второго", "Дата/время изменения",
+               "ID первого", "ID второго", "ID события"])
+    for row in delivery_roles.events_for_period(db, year, month):
+        ws.append([str(row["visit_date"]), row["point_code"], row["first_fio"], row["first_phone"],
+                   row["first_rate_before"], row["first_rate_after"], row["second_fio"],
+                   row["second_phone"], row["second_rate"], str(row["created_at"]),
+                   row["first_merchant_id"], row["second_merchant_id"], row["id"]])
+    for row in ws:
+        for cell in row:
+            if isinstance(cell.value, str):
+                cell.data_type = "s"
+    style_sheet(ws)
+    response = build_excel_response(wb, f"delivery_changes_{year}_{month:02d}.xlsx")
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.get("/admin-delivery-exceptions", response_class=HTMLResponse)
+def admin_delivery_exceptions(year: int, month: int,
+                              admin_auth: Optional[str] = Cookie(default=None),
+                              db: Session = Depends(get_db)):
+    if not is_admin_authenticated(admin_auth):
+        return RedirectResponse("/admin-login", status_code=303)
+    if not 1 <= month <= 12 or not 2000 <= year <= 2200:
+        raise HTTPException(status_code=400, detail="Некорректный период")
+    labels = {"EXCEPTION_SUBMITTED": "Сверка первого уже отправлена",
+              "EXCEPTION_RECEIVER_ASSIGNED": "Принимающий поставку уже подтверждён",
+              "EXCEPTION_AMBIGUOUS": "Неоднозначные прежние выходы",
+              "EXCEPTION_LEGACY_NOTE": "Есть прежняя корректировка"}
+    cards = "".join(f'<div class="detail-card"><strong>{escape(str(r["visit_date"]))} · ТТ {escape(r["point_code"])}</strong>'
+                    f'<p>{escape(labels.get(r["event_type"], r["event_type"]))}</p>'
+                    f'<p>ID сотрудников: {r["first_merchant_id"] or "—"}, {r["second_merchant_id"]}</p>'
+                    f'<small>{escape(str(r["created_at"]))} · {escape(r["id"])}</small></div>'
+                    for r in delivery_roles.events_for_period(db, year, month, exceptions=True))
+    return HTMLResponse(f'<!doctype html><html lang="ru"><head><meta charset="utf-8">'
+                        f'<meta name="viewport" content="width=device-width,initial-scale=1">{base_css()}</head>'
+                        f'<body><div class="page"><div class="card"><h1>Выходы, требующие разбора</h1>'
+                        f'{cards or "Нет случаев за выбранный период"}</div></div></body></html>',
+                        headers={"Cache-Control": "no-store"})

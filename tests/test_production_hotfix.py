@@ -39,6 +39,12 @@ MERCHANT = {"id": 1, "fio": "Тестовый Мерч"}
 
 
 class SlotHotfixTests(unittest.TestCase):
+    def setUp(self):
+        # These unit tests use a mock legacy DB; migrated flow has real DB tests.
+        guard = patch("app.delivery_roles.available", return_value=False)
+        guard.start()
+        self.addCleanup(guard.stop)
+
     def test_allowed_slots_for_every_weekday(self):
         expected = {
             13: {SLOT_DAY},       # Monday
