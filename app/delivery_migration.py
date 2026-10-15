@@ -64,15 +64,17 @@ class PreflightError(ValueError):
 def _sql_key(value):
     # Ignore formatting/casts outside literals, never whitespace *inside* a
     # literal: role='RE CEIVER' must not match role='RECEIVER'.
-    return re.sub(r"'(?:''|[^'])*'|::text|[\s()\[\]\"]",
-                  lambda m: m[0] if m[0].startswith("'") else '', str(value).lower())
+    return re.sub(r"('(?:''|[^'])*')|::text|[\s()\[\]\"]|([a-z_]+)",
+                  lambda m: m[1] if m[1] is not None else (m[2].lower() if m[2] else ''),
+                  str(value), flags=re.IGNORECASE)
 
 
 def _default_key(value):
-    value = str(value).strip().lower()
+    value = str(value).strip()
     while value.startswith('(') and value.endswith(')'):
         value = value[1:-1].strip()
-    return re.sub(r'::text$', '', value)
+    value = re.sub(r'::text$', '', value, flags=re.IGNORECASE)
+    return value if value.startswith("'") else value.lower()
 
 
 def _require_columns(inspector, table, specification):
@@ -172,7 +174,7 @@ def preflight(db, inspector):
                        AND v.merchant_id=r.restore_merchant_id AND v.point_code=r.point_code
                        AND v.visit_date=r.visit_date AND v.slot IN ('DAY','MORNING'))))""")
             checks = {_sql_key(c['sqltext']) for c in inspector.get_check_constraints(table)}
-            accepted_checks = {"rolein'no_supply','receiver'", "role=anyarray'no_supply','receiver'"}
+            accepted_checks = {"rolein'NO_SUPPLY','RECEIVER'", "role=anyarray'NO_SUPPLY','RECEIVER'"}
             if not checks or not checks.issubset(accepted_checks):
                 raise PreflightError('missing_or_incompatible_role_check')
         if table == 'delivery_events' and inspector.get_check_constraints(table):

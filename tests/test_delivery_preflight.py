@@ -135,6 +135,12 @@ class PreflightTests(unittest.TestCase):
         self.execute("CREATE UNIQUE INDEX uq_delivery_receiver ON visit_payment_roles(point_code,visit_date) WHERE role='RE CEIVER'")
         self.assert_rejected_unchanged('incompatible_index_definition')
 
+    def test_index_literal_case_is_not_ignored(self):
+        self.install()
+        self.execute('DROP INDEX uq_delivery_receiver')
+        self.execute("CREATE UNIQUE INDEX uq_delivery_receiver ON visit_payment_roles(point_code,visit_date) WHERE role='receiver'")
+        self.assert_rejected_unchanged('incompatible_index_definition')
+
     def test_incompatible_phone_type_fails(self):
         self.execute('ALTER TABLE merchants ADD COLUMN phone INTEGER')
         self.assert_rejected_unchanged('incompatible_phone_type')
