@@ -25,6 +25,9 @@ MERCHANT_SORTS = {
 }
 
 DELETE_ALL_CONFIRMATION = "УДАЛИТЬ ВСЕХ МЕРЧЕНДАЙЗЕРОВ"
+# Payment state and immutable audit survive a credential reset. They are known
+# to the schema guard but are deliberately not exposed or counted in preview.
+MERCHANT_PRESERVED_TABLES = frozenset({'visit_payment_roles', 'delivery_events'})
 MERCHANT_OWNED_TABLES = (
     "reimbursement_receipts",
     "receipt_files",
@@ -69,15 +72,35 @@ def normalize_tu(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").replace("\u00a0", " ")).strip()
 
 
+def normalize_phone(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if isinstance(value, (float, int)) and float(value).is_integer():
+        raw = str(int(value))
+    if not re.fullmatch(r"[+0-9 ()\-]+", raw):
+        raise MerchantInputError(field_errors={"phone": "Введите полный российский номер телефона."})
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) != 11 or digits[0] not in "78":
+        raise MerchantInputError(field_errors={"phone": "Номер должен содержать 11 цифр и начинаться с 7 или 8."})
+    return "7" + digits[1:]
+
+
 def validate_merchant_values(
     fio: Any,
     last4: Any,
     tu: Any,
     *,
     fio_normalizer,
+    phone: Any = None,
 ) -> dict[str, str]:
     fio_clean = normalize_fio_display(fio)
     last4_raw = str(last4 if last4 is not None else "")
+    phone_clean = normalize_phone(phone)
+    if phone_clean:
+        if last4_raw and last4_raw != phone_clean[-4:]:
+            raise MerchantInputError(message="Последние 4 цифры не совпадают с полным телефоном.")
+        last4_raw = phone_clean[-4:]
     tu_clean = normalize_tu(tu)
     errors: dict[str, str] = {}
     if not fio_clean or not fio_normalizer(fio_clean):
@@ -92,6 +115,7 @@ def validate_merchant_values(
         "fio": fio_clean,
         "fio_norm": fio_normalizer(fio_clean),
         "last4": last4_raw,
+        "phone": phone_clean or None,
         "tu": tu_clean,
     }
 
@@ -110,6 +134,7 @@ def ensure_merchant_admin_schema(db: Session) -> None:
         return
     additions = (
         ("last4", "TEXT"),
+        ("phone", "TEXT"),
         ("is_active", "BOOLEAN NOT NULL DEFAULT TRUE"),
         ("created_at", "TIMESTAMP"),
         ("updated_at", "TIMESTAMP"),
@@ -260,13 +285,14 @@ def create_merchant(
     last4: Any,
     tu: Any,
     *,
+    phone: Any = None,
     actor: str,
     fio_normalizer,
     last4_hasher,
     confirm_same_name: bool = False,
 ) -> dict[str, Any]:
     values = validate_merchant_values(
-        fio, last4, tu, fio_normalizer=fio_normalizer
+        fio, last4, tu, fio_normalizer=fio_normalizer, phone=phone
     )
     password_hash = last4_hasher(values["last4"])
     _check_duplicates(
@@ -279,9 +305,9 @@ def create_merchant(
         text(
             """
             INSERT INTO merchants
-                (fio, fio_norm, pass_hash, last4, tu, is_active, updated_at)
+                (fio, fio_norm, pass_hash, last4, phone, tu, is_active, updated_at)
             VALUES
-                (:fio, :fio_norm, :pass_hash, :last4, :tu, TRUE, CURRENT_TIMESTAMP)
+                (:fio, :fio_norm, :pass_hash, :last4, :phone, :tu, TRUE, CURRENT_TIMESTAMP)
             RETURNING id
             """
         ),
@@ -302,7 +328,7 @@ def get_merchant_for_admin(db: Session, merchant_id: int) -> dict[str, Any] | No
     row = db.execute(
         text(
             """
-            SELECT id, fio, fio_norm, last4, tu, is_active, created_at, updated_at, credentials_cleared_at
+            SELECT id, fio, fio_norm, last4, phone, tu, is_active, created_at, updated_at, credentials_cleared_at
             FROM merchants
             WHERE id = :merchant_id
             """
@@ -320,6 +346,7 @@ def update_merchant(
     tu: Any,
     status: str,
     *,
+    phone: Any = None,
     actor: str,
     fio_normalizer,
     last4_hasher,
@@ -331,8 +358,12 @@ def update_merchant(
     if existing.get("credentials_cleared_at"):
         raise MerchantInputError(message="Это архивная запись. Загрузите сотрудника через новый список.")
     values = validate_merchant_values(
-        fio, last4, tu, fio_normalizer=fio_normalizer
+        fio, last4, tu, fio_normalizer=fio_normalizer, phone=phone
     )
+    if phone is None:
+        values["phone"] = existing.get("phone")
+        if values["phone"] and values["last4"] != values["phone"][-4:]:
+            raise MerchantInputError(message="Обновите полный телефон вместе с последними четырьмя цифрами.")
     status = str(status or "").strip().lower()
     if status not in MERCHANT_STATUSES:
         raise MerchantInputError(
@@ -352,6 +383,7 @@ def update_merchant(
         for field_name, new_value in (
             ("fio", values["fio"]),
             ("last4", values["last4"]),
+            ("phone", values["phone"]),
             ("tu", values["tu"]),
             ("status", is_active),
         )
@@ -369,6 +401,7 @@ def update_merchant(
                     fio_norm = :fio_norm,
                     pass_hash = :pass_hash,
                     last4 = :last4,
+                    phone = :phone,
                     tu = :tu,
                     is_active = :is_active,
                     updated_at = CURRENT_TIMESTAMP
@@ -473,7 +506,8 @@ def _existing_merchant_owned_tables(db: Session) -> dict[str, set[str]]:
     unknown = []
     for table_name in sorted(tables - {"merchants"}):
         columns = {column["name"] for column in inspector.get_columns(table_name)}
-        if "merchant_id" in columns and table_name not in MERCHANT_OWNED_TABLES:
+        if ("merchant_id" in columns and table_name not in MERCHANT_OWNED_TABLES
+                and table_name not in MERCHANT_PRESERVED_TABLES):
             unknown.append(table_name)
     if unknown:
         raise RuntimeError(
@@ -631,7 +665,7 @@ def delete_all_merchants_and_data(db: Session) -> dict[str, int]:
             historical_fio = COALESCE(historical_fio, fio),
             historical_tu = COALESCE(historical_tu, tu, ''),
             fio = '', fio_norm = 'archived:' || CAST(id AS TEXT),
-            last4 = NULL, pass_hash = '', telegram_id = NULL, tu = NULL,
+            last4 = NULL, phone = NULL, pass_hash = '', telegram_id = NULL, tu = NULL,
             is_active = FALSE, credentials_cleared_at = :cleared_at,
             updated_at = CURRENT_TIMESTAMP
         WHERE credentials_cleared_at IS NULL
@@ -645,13 +679,14 @@ def import_or_reactivate_merchant(
     last4: Any,
     tu: Any,
     *,
+    phone: Any = None,
     actor: str,
     fio_normalizer,
     last4_hasher,
 ) -> dict[str, Any]:
     """Match imports only by normalized FIO plus last4, preserving merchant_id."""
     values = validate_merchant_values(
-        fio, last4, tu, fio_normalizer=fio_normalizer
+        fio, last4, tu, fio_normalizer=fio_normalizer, phone=phone
     )
     password_hash = last4_hasher(values["last4"])
     existing_id = db.execute(
@@ -684,6 +719,7 @@ def import_or_reactivate_merchant(
             fio_normalizer=fio_normalizer,
             last4_hasher=last4_hasher,
             confirm_same_name=True,
+            phone=phone,
         )
         return {**created, "created": True, "reactivated": False}
 
@@ -699,6 +735,7 @@ def import_or_reactivate_merchant(
         fio_normalizer=fio_normalizer,
         last4_hasher=last4_hasher,
         confirm_same_name=True,
+        phone=phone,
     )
     return {
         "id": int(existing_id),
@@ -741,7 +778,7 @@ def list_merchants(
     rows = db.execute(
         text(
             f"""
-            SELECT id, fio, fio_norm, last4, tu, is_active, created_at, updated_at
+            SELECT id, fio, fio_norm, last4, phone, tu, is_active, created_at, updated_at
             FROM merchants
             WHERE {' AND '.join(conditions)}
             ORDER BY {order_by}

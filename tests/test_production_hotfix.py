@@ -39,6 +39,12 @@ MERCHANT = {"id": 1, "fio": "Тестовый Мерч"}
 
 
 class SlotHotfixTests(unittest.TestCase):
+    def setUp(self):
+        # These unit tests use a mock legacy DB; migrated flow has real DB tests.
+        guard = patch("app.delivery_roles.available", return_value=False)
+        guard.start()
+        self.addCleanup(guard.stop)
+
     def test_allowed_slots_for_every_weekday(self):
         expected = {
             13: {SLOT_DAY},       # Monday
@@ -104,7 +110,7 @@ class SlotHotfixTests(unittest.TestCase):
     def test_day_pages_show_only_allowed_actions(self):
         db = MagicMock()
         app.dependency_overrides[get_db] = lambda: db
-        token = create_merchant_session("тестовый мерч")
+        token = create_merchant_session("тестовый мерч", 1)
         try:
             common = {
                 "get_active_period": MagicMock(return_value=FIXED_PERIOD),
@@ -141,7 +147,7 @@ class SlotHotfixTests(unittest.TestCase):
     def test_non_working_day_requires_explicit_confirmation(self):
         db = MagicMock()
         app.dependency_overrides[get_db] = lambda: db
-        token = create_merchant_session("Тестовый Мерч")
+        token = create_merchant_session("Тестовый Мерч", 1)
         csrf = read_merchant_session(token)["csrf"]
         toggle = MagicMock()
         common = {
@@ -262,7 +268,7 @@ class SlotHotfixTests(unittest.TestCase):
             )
         db = Session(engine)
         app.dependency_overrides[get_db] = lambda: db
-        token = create_merchant_session("Тестовый Мерч")
+        token = create_merchant_session("Тестовый Мерч", 1)
         csrf = read_merchant_session(token)["csrf"]
         try:
             with patch.multiple(
@@ -311,7 +317,7 @@ class SlotHotfixTests(unittest.TestCase):
     def test_database_error_rolls_back_without_http_500(self):
         db = MagicMock()
         app.dependency_overrides[get_db] = lambda: db
-        token = create_merchant_session("Тестовый Мерч")
+        token = create_merchant_session("Тестовый Мерч", 1)
         csrf = read_merchant_session(token)["csrf"]
         try:
             with patch.multiple(
@@ -348,7 +354,7 @@ class SlotHotfixTests(unittest.TestCase):
     def test_inventory_week_conflict_redirects_to_styled_calendar_warning(self):
         db = MagicMock()
         app.dependency_overrides[get_db] = lambda: db
-        token = create_merchant_session("Тестовый Мерч")
+        token = create_merchant_session("Тестовый Мерч", 1)
         csrf = read_merchant_session(token)["csrf"]
         common = {
             "get_active_period": MagicMock(return_value=FIXED_PERIOD),
@@ -445,7 +451,7 @@ class SlotHotfixTests(unittest.TestCase):
     def test_submitted_reconciliation_blocks_direct_calendar_toggle(self):
         db = MagicMock()
         app.dependency_overrides[get_db] = lambda: db
-        token = create_merchant_session("Тестовый Мерч")
+        token = create_merchant_session("Тестовый Мерч", 1)
         csrf = read_merchant_session(token)["csrf"]
         toggle = MagicMock()
         try:
@@ -579,7 +585,7 @@ class SlotHotfixTests(unittest.TestCase):
     def test_direct_invalid_slots_roll_back_without_write(self):
         db = MagicMock()
         app.dependency_overrides[get_db] = lambda: db
-        token = create_merchant_session("тестовый мерч")
+        token = create_merchant_session("тестовый мерч", 1)
         csrf = read_merchant_session(token)["csrf"]
         toggle = MagicMock()
         try:
@@ -741,7 +747,7 @@ class MonthlySubmissionHotfixTests(unittest.TestCase):
     def test_monthly_page_has_session_and_does_not_raise_name_error(self):
         db = MagicMock()
         app.dependency_overrides[get_db] = lambda: db
-        token = create_merchant_session("тестовый мерч")
+        token = create_merchant_session("тестовый мерч", 1)
         overall = {
             "submission_status": "draft",
             "per_point": {},
@@ -767,7 +773,7 @@ class MonthlySubmissionHotfixTests(unittest.TestCase):
     def test_submit_is_repeatable_and_rolls_back_on_error(self):
         db = MagicMock()
         app.dependency_overrides[get_db] = lambda: db
-        token = create_merchant_session("тестовый мерч")
+        token = create_merchant_session("тестовый мерч", 1)
         csrf = read_merchant_session(token)["csrf"]
         submit = MagicMock()
         try:

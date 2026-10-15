@@ -7,8 +7,9 @@ from datetime import date, datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 from sqlalchemy import text, bindparam, inspect
 from openpyxl import load_workbook
-from app.security import request_merchant_matches, request_session_issued_at
+from app.security import request_merchant_matches, request_session_issued_at, request_merchant_id, invalidate_merchant_session
 from app.runtime import maintenance_mode_enabled
+from app import delivery_roles
 from app.coffee_days import coffee_count, snapshot_coffee_for_submit
 from app.merchant_admin import (
     create_merchant,
@@ -151,6 +152,10 @@ def login_user(db: Session, fio: str, last4: str):
 
 def get_merchant_by_fio(db: Session, fio: str):
     fio_n = fio_norm(fio)
+    identity = request_merchant_id()
+    if type(identity) is not int or identity <= 0:
+        invalidate_merchant_session()
+        return None
     if not request_merchant_matches(fio_n):
         return None
     # A roster reset invalidates previously issued sessions even if the same
@@ -162,22 +167,25 @@ def get_merchant_by_fio(db: Session, fio: str):
         if cleared_at.tzinfo is None:
             cleared_at = cleared_at.replace(tzinfo=timezone.utc)
         if request_session_issued_at() <= cleared_at.timestamp():
+            invalidate_merchant_session()
             return None
-    result = db.execute(
+    results = db.execute(
         text(
             """
             SELECT id, fio, fio_norm, telegram_id, tu, created_at
             FROM merchants
-            WHERE fio_norm = :fio_norm
+            WHERE id = :identity
               AND COALESCE(is_active, TRUE) = TRUE
-            LIMIT 1
+            LIMIT 2
             """
         ),
-        {"fio_norm": fio_n},
-    ).mappings().first()
+        {"identity": identity},
+    ).mappings().all()
 
-    if not result:
+    if len(results) != 1:
+        invalidate_merchant_session()
         return None
+    result = results[0]
 
     return {
         "id": result["id"],
@@ -526,6 +534,7 @@ def toggle_inventory_visit(
     day: int,
     *,
     special_inventory: bool = False,
+    commit: bool = True,
 ):
     visit_date = date(y, m, day)
     if SLOT_FULL_INVENT not in allowed_visit_slots(
@@ -556,7 +565,8 @@ def toggle_inventory_visit(
 
     if existing:
         db.execute(text("DELETE FROM visits WHERE id = :id"), {"id": existing})
-        db.commit()
+        if commit:
+            db.commit()
         return "removed"
 
     existing_inventory_date = inventory_date_in_iso_week(
@@ -580,7 +590,8 @@ def toggle_inventory_visit(
             "slot": SLOT_FULL_INVENT,
         },
     )
-    db.commit()
+    if commit:
+        db.commit()
     return "added"
 
 
@@ -713,6 +724,7 @@ def upsert_monthly_submission_draft(db: Session, merchant_id: int, y: int, m: in
 def submit_monthly_submission(db: Session, merchant_id: int, y: int, m: int):
     ensure_monthly_submissions_table(db)
     mk = month_start(y, m)
+    delivery_roles.lock_merchants(db, [merchant_id])
     snapshot_coffee_for_submit(db, merchant_id, mk)
     db.execute(text("""
         INSERT INTO monthly_submissions (merchant_id, month_key, comment, extra_amount, receipt_path, status)
@@ -1003,6 +1015,7 @@ def compute_point_total(db: Session, merchant_id: int, point_code: str, y: int, 
     visits = get_visits_for_month(db, merchant_id, point_code, y, m)
     rates = get_point_rates(db, point_code, y, m)
     point_adj = get_point_adjustment(db, merchant_id, point_code, y, m)
+    payment_roles = delivery_roles.payment_roles_for_month(db, merchant_id, point_code, y, m)
 
     total = 0
     cnt_supply = 0
@@ -1017,7 +1030,7 @@ def compute_point_total(db: Session, merchant_id: int, point_code: str, y: int, 
         for work_slot in slots.intersection(REGULAR_PAY_SLOTS):
             cnt_day_total += 1
             boxes = boxes_map.get(day, 0)
-            if effective_has_supply(boxes, rates["pay_lt5"]):
+            if delivery_roles.paid_as_supply(effective_has_supply(boxes, rates["pay_lt5"]), payment_roles.get(day)):
                 cnt_supply += 1
                 total += rates["rate_supply"]
                 sum_supply += rates["rate_supply"]
@@ -1221,6 +1234,9 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
         )
         """
 
+    roles_ready = delivery_roles.available(db)
+    role_condition = "AND " + delivery_roles.supply_owner_predicate("v") if roles_ready else ""
+
     sql = f"""
         WITH {adjustment_ctes},
         base_points AS (
@@ -1261,12 +1277,14 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
                 SUM(CASE
                     WHEN COALESCE(s.boxes, 0) > 0
                      AND (COALESCE(pr.pay_lt5, FALSE) = TRUE OR COALESCE(s.boxes, 0) >= 5)
+                     {role_condition}
                     THEN v.cnt_regular ELSE 0 END) AS cnt_supply,
 
                 SUM(CASE
                     WHEN NOT (
                         COALESCE(s.boxes, 0) > 0
                         AND (COALESCE(pr.pay_lt5, FALSE) = TRUE OR COALESCE(s.boxes, 0) >= 5)
+                     {role_condition}
                      )
                     THEN v.cnt_regular ELSE 0 END) AS cnt_no_supply,
 
@@ -1907,7 +1925,16 @@ def import_merchants_xlsx(
     wb = load_workbook(file_obj, data_only=True, read_only=True)
     ws = wb[wb.sheetnames[0]]
     tu = str(tu or "").strip()
-    if not tu:
+    headers = [str(v or "").strip().lower() for v in next(ws.iter_rows(min_row=1, max_row=1, values_only=True))]
+    def column(*names):
+        return next((i for i, name in enumerate(headers) if name in names), None)
+    phone_col = column("телефон", "phone", "номер телефона", "полный телефон")
+    last4_col = column("last4", "последние 4", "последние 4 цифры", "последние 4 цифры телефона")
+    fio_col = column("фио", "fio")
+    tu_col = column("ту", "tu")
+    if phone_col is None and last4_col is None:
+        last4_col = 1
+    if not tu and tu_col is None:
         raise ValueError("ТУ обязателен")
     parsed: list[dict[str, str]] = []
     seen_identities: dict[tuple[str, str], int] = {}
@@ -1915,11 +1942,12 @@ def import_merchants_xlsx(
         if not any(value not in (None, "") for value in row):
             continue
         try:
+            def cell(index):
+                return row[index] if index is not None and index < len(row) else ""
             values = validate_merchant_values(
-                row[0] if row else "",
-                row[1] if len(row) > 1 else "",
-                tu,
-                fio_normalizer=fio_norm,
+                cell(fio_col if fio_col is not None else 0),
+                cell(last4_col), cell(tu_col) or tu,
+                fio_normalizer=fio_norm, phone=cell(phone_col),
             )
             identity = (values["fio_norm"], values["last4"])
             if identity in seen_identities:
@@ -1946,6 +1974,7 @@ def import_merchants_xlsx(
                 actor=actor,
                 fio_normalizer=fio_norm,
                 last4_hasher=hash_last4,
+                phone=values["phone"],
             )
             created += int(imported["created"])
             reactivated += int(imported["reactivated"])
