@@ -390,11 +390,10 @@ def normalize_visit_slot(slot: str | None, *, allow_legacy_day: bool = True) -> 
 def allowed_visit_slots(visit_date: date, *, special_inventory: bool = False) -> frozenset[str]:
     """Return user-selectable work slots for a calendar date.
 
-    Friday and Saturday support a morning visit or an evening full inventory.
-    Every other weekday uses the original single DAY visit. FULL_INVENT remains
-    a separate special-inventory action and is intentionally not returned here.
+    Friday through Sunday support MORNING/EVENING. Other days retain DAY;
+    special inventory dates additionally retain the existing FULL_INVENT slot.
     """
-    if visit_date.weekday() in (4, 5):
+    if visit_date.weekday() in (4, 5, 6):
         return OVERLAP_SLOTS
     slots = {SLOT_DAY}
     if special_inventory:
@@ -531,7 +530,9 @@ def toggle_inventory_visit(
     visit_date = date(y, m, day)
     if SLOT_FULL_INVENT not in allowed_visit_slots(
         visit_date, special_inventory=special_inventory
-    ):
+    ) and not (special_inventory and visit_date.weekday() == 6):
+        # Preserve the existing FULL_INVENT API for special Sundays recorded
+        # before Sunday gained the MORNING/EVENING choice.
         raise ValueError("Full inventory is not allowed for this date")
     existing = db.execute(
         text(

@@ -1585,7 +1585,7 @@ def build_calendar_html(
             badges += '<span class="badge badge-inv">И</span>'
 
         current_date = date(y, m, day)
-        inventory_allowed = current_date.weekday() in (4, 5) or current_date in special_inventory_days
+        inventory_allowed = current_date.weekday() in (4, 5, 6) or current_date in special_inventory_days
         allowed_slots = allowed_visit_slots(
             current_date,
             special_inventory=current_date in special_inventory_days,
@@ -1882,12 +1882,12 @@ def calendar_page(
             <div class="legend">
                 <div class="legend-item">П — оплачиваемая поставка</div>
                 <div class="legend-item">В — отмечен выход</div>
-                <div class="legend-item">И — полный инвент</div>
+                <div class="legend-item">И — вечерний выход</div>
             </div>
 
             <div class="calendar-note">
-                В обычные дни отмечается один выход. В пятницу и субботу можно отдельно
-                отметить утренний выход и вечерний полный инвент.
+                В обычные дни отмечается один выход. В пятницу, субботу, воскресенье
+                и дополнительные даты можно отдельно отметить утренний и вечерний выход.
             </div>
 
             <div class="calendar-note">
@@ -2718,6 +2718,12 @@ def day_action_page(
         )
 
     action_forms = []
+    if current_date.weekday() == 6 and SLOT_DAY in day_visits:
+        # A previously recorded Sunday DAY is already the morning exit.
+        allowed_slots = (allowed_slots - {SLOT_MORNING}) | {SLOT_DAY}
+    if special_inventory and current_date.weekday() == 6 and SLOT_FULL_INVENT in day_visits:
+        # Let the user toggle the existing inventory mark without changing its type.
+        allowed_slots = (allowed_slots - {SLOT_EVENING}) | {SLOT_FULL_INVENT}
 
     def visit_form(slot: str, button_text: str, *, inventory: bool = False) -> str:
         action = "/toggle-inventory" if inventory else "/toggle-day"
@@ -2742,6 +2748,7 @@ def day_action_page(
                 <input type="hidden" name="csrf_token" value="{escape(session["csrf"])}" />
                 {confirmation}
                 <button class="{button_class}" type="submit">{button_text}</button>
+                <div class="calendar-note">{"Не отмечен — нажмите, чтобы добавить" if adding else "Отмечен — нажмите, чтобы убрать"}</div>
             </form>
         """
 
@@ -2749,34 +2756,28 @@ def day_action_page(
         action_forms.append(
             visit_form(
                 SLOT_DAY,
-                "Убрать выход" if SLOT_DAY in day_visits else "Добавить выход",
+                "Утренний выход",
             )
         )
     if SLOT_MORNING in allowed_slots:
         action_forms.append(
             visit_form(
                 SLOT_MORNING,
-                "Убрать утренний выход"
-                if SLOT_MORNING in day_visits
-                else "Добавить утренний выход",
+                "Утренний выход",
             )
         )
     if SLOT_EVENING in allowed_slots:
         action_forms.append(
             visit_form(
                 SLOT_EVENING,
-                "Убрать вечерний полный инвент"
-                if SLOT_EVENING in day_visits
-                else "Добавить вечерний полный инвент",
+                "Вечерний выход",
             )
         )
     if SLOT_FULL_INVENT in allowed_slots:
         action_forms.append(
             visit_form(
                 SLOT_FULL_INVENT,
-                "Убрать полный инвент"
-                if SLOT_FULL_INVENT in day_visits
-                else "Добавить полный инвент",
+                "Вечерний выход",
                 inventory=True,
             )
         )
@@ -2979,7 +2980,7 @@ def toggle_inventory_post(
     special_inventory = current_date in set(get_special_inventory_days(db))
     if SLOT_FULL_INVENT not in allowed_visit_slots(
         current_date, special_inventory=special_inventory
-    ):
+    ) and not (special_inventory and current_date.weekday() == 6):
         db.rollback()
         return HTMLResponse(
             "Полный инвент недоступен для этой даты. Вернитесь в календарь.",
