@@ -64,7 +64,7 @@ class VisitChoiceUXTests(unittest.TestCase):
             get_calendar_overrides=MagicMock(return_value={}),
         ))
         self.client = self.stack.enter_context(TestClient(main.app))
-        self.client.cookies.set("merchant_session", create_merchant_session("тестовый сотрудник"))
+        self.client.cookies.set("merchant_session", create_merchant_session("тестовый сотрудник", 1))
 
     def tearDown(self):
         self.stack.close()

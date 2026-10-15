@@ -108,3 +108,62 @@ class DeliveryPostgresTests(unittest.TestCase):
             self.assertEqual(db.execute(text('SELECT COUNT(*) FROM visit_payment_roles')).scalar(),0)
             self.assertEqual(db.execute(text('SELECT COUNT(*) FROM delivery_events')).scalar(),0)
             self.assertEqual(db.execute(text('SELECT COUNT(*) FROM visits')).scalar(),1)
+
+    def remove(self, mid, barrier=None):
+        with self.factory() as db:
+            if barrier:barrier.wait(timeout=5)
+            roles.lock_day(db,'P1',self.day)
+            rows=roles.day_visits(db,'P1',self.day)
+            roles.lock_merchants(db,[r['merchant_id'] for r in rows])
+            visit=next(r for r in rows if r['merchant_id']==mid)
+            key=uuid.uuid4().hex
+            error=roles.remove_role(db,merchant_id=mid,point='P1',day=self.day,visit=visit,key=key)
+            if not error:
+                services.toggle_day_visit(db,mid,'P1',2026,7,2,'DAY',commit=False)
+                roles.record_event(db,key=key,kind='VISIT_REMOVED',point='P1',day=self.day,second=mid,second_visit=visit['id'])
+            db.commit()
+            return 'exception' if error else 'removed'
+
+    def assert_single_supply_owner(self):
+        with self.factory() as db:
+            count=db.execute(text('SELECT COUNT(DISTINCT v.merchant_id) FROM visits v WHERE '+roles.supply_owner_predicate('v'))).scalar()
+            self.assertLessEqual(count,1)
+            self.assertEqual(db.execute(text('SELECT COUNT(*) FROM visit_payment_roles r LEFT JOIN visits v ON v.id=r.visit_id WHERE v.id IS NULL')).scalar(),0)
+
+    def test_concurrent_new_add_restore_after_all_deleted(self):
+        self.assertEqual(self.receive(2),'ready')
+        self.assertEqual(self.remove(1),'removed');self.assertEqual(self.remove(2),'removed')
+        barrier=threading.Barrier(2)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures=[pool.submit(self.receive,mid,barrier) for mid in (2,3)]
+            for future in futures:self.assertEqual(future.result(timeout=15),'ready')
+        self.assert_single_supply_owner()
+        with self.factory() as db:
+            self.assertEqual(db.execute(text('SELECT COUNT(*) FROM visits')).scalar(),2)
+            self.assertEqual(db.execute(text("SELECT COUNT(*) FROM delivery_events WHERE event_type='TRANSFER'")).scalar(),2)
+
+    def test_receiver_delete_races_new_add(self):
+        self.receive(2)
+        barrier=threading.Barrier(2)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            removal=pool.submit(self.remove,2,barrier)
+            addition=pool.submit(self.receive,3,barrier)
+            self.assertEqual(removal.result(timeout=15),'removed')
+            self.assertIn(addition.result(timeout=15),('ready','exception'))
+        self.assert_single_supply_owner()
+
+    def test_active_visit_fk_and_receiver_unique_enforced_by_postgres(self):
+        from sqlalchemy.exc import IntegrityError
+        self.receive(2)
+        with self.factory() as db:
+            with self.assertRaises(IntegrityError):
+                roles.set_role(db,3,'P1',self.day,'NO_SUPPLY',99999,'synthetic')
+            db.rollback()
+            with self.assertRaises(IntegrityError):
+                roles.set_role(db,1,'P1',self.day,'RECEIVER',1,'synthetic')
+            db.rollback()
+            # The database also prevents orphan state if a visit is deleted
+            # outside the HTTP handler; immutable events are independent.
+            db.execute(text('DELETE FROM visits WHERE merchant_id=2'));db.commit()
+            self.assertEqual(db.execute(text('SELECT COUNT(*) FROM visit_payment_roles WHERE merchant_id=2')).scalar(),0)
+            self.assertEqual(db.execute(text("SELECT COUNT(*) FROM delivery_events WHERE event_type='TRANSFER'")).scalar(),1)

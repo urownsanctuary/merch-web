@@ -14,6 +14,9 @@ TABLES = {
             role TEXT NOT NULL CHECK (role IN ('NO_SUPPLY', 'RECEIVER')),
             visit_id INTEGER NOT NULL,
             event_id TEXT NOT NULL,
+            can_transfer BOOLEAN NOT NULL DEFAULT FALSE,
+            restore_merchant_id INTEGER,
+            restore_visit_id INTEGER,
             PRIMARY KEY (merchant_id, point_code, visit_date)
         )""",
     "delivery_events": """
@@ -44,7 +47,7 @@ TABLES = {
 }
 INDEXES = {
     "uq_delivery_receiver": "CREATE UNIQUE INDEX uq_delivery_receiver ON visit_payment_roles (point_code, visit_date) WHERE role = 'RECEIVER'",
-    "uq_delivery_transfer": "CREATE UNIQUE INDEX uq_delivery_transfer ON delivery_events (point_code, visit_date) WHERE event_type = 'TRANSFER'",
+    "ix_delivery_roles_day": "CREATE INDEX ix_delivery_roles_day ON visit_payment_roles (point_code, visit_date)",
     "ix_delivery_events_period": "CREATE INDEX ix_delivery_events_period ON delivery_events (visit_date, event_type)",
 }
 
@@ -52,17 +55,38 @@ INDEXES = {
 def migrate(db, *, apply=False):
     """Caller owns the transaction. Inspect using its connection (also on SQLite)."""
     inspector = inspect(db.connection())
-    if not inspector.has_table("merchants"):
-        raise ValueError("Existing merchants schema is required")
+    if not all(inspector.has_table(t) for t in ('merchants', 'visits')):
+        raise ValueError("Existing merchants and visits schema is required")
     statements = []
     if "phone" not in {c["name"] for c in inspector.get_columns("merchants")}:
         statements.append("ALTER TABLE merchants ADD COLUMN phone TEXT")
     for name, ddl in TABLES.items():
         if not inspector.has_table(name):
             statements.append(ddl)
+    if inspector.has_table('visit_payment_roles'):
+        columns = {c['name'] for c in inspector.get_columns('visit_payment_roles')}
+        if not {'can_transfer', 'restore_merchant_id', 'restore_visit_id'}.issubset(columns):
+            if db.execute(text('SELECT COUNT(*) FROM visit_payment_roles')).scalar():
+                raise ValueError('Unreleased role data requires explicit review; no automatic state backfill')
+        for name, definition in [('can_transfer', 'BOOLEAN NOT NULL DEFAULT FALSE'), ('restore_merchant_id', 'INTEGER'), ('restore_visit_id', 'INTEGER')]:
+            if name not in columns:
+                statements.append(f'ALTER TABLE visit_payment_roles ADD COLUMN {name} {definition}')
     indexes = {idx["name"] for table in TABLES if inspector.has_table(table)
                for idx in inspector.get_indexes(table)}
     statements.extend(ddl for name, ddl in INDEXES.items() if name not in indexes)
+    # Only the superseded, unreleased PR index: audit must allow a new transfer
+    # after a complete attendance lifecycle. Request keys remain unique.
+    if 'uq_delivery_transfer' in indexes:
+        statements.append('DROP INDEX uq_delivery_transfer')
+    if db.get_bind().dialect.name == 'postgresql':
+        visit_indexes = {i['name'] for i in inspector.get_indexes('visits')}
+        if 'uq_delivery_visit_identity' not in visit_indexes:
+            statements.append('CREATE UNIQUE INDEX uq_delivery_visit_identity ON visits (id, merchant_id, point_code, visit_date)')
+        foreign_keys = inspector.get_foreign_keys('visit_payment_roles') if inspector.has_table('visit_payment_roles') else []
+        if not any(fk['name'] == 'fk_delivery_active_visit' for fk in foreign_keys):
+            statements.append('''ALTER TABLE visit_payment_roles ADD CONSTRAINT fk_delivery_active_visit
+                FOREIGN KEY (visit_id, merchant_id, point_code, visit_date)
+                REFERENCES visits (id, merchant_id, point_code, visit_date) ON DELETE CASCADE''')
     if apply:
         for sql in statements:
             db.execute(text(sql))

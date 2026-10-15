@@ -12,6 +12,7 @@ MERCHANT_COOKIE = "merchant_session"
 _request_merchant: ContextVar[str | None] = ContextVar("request_merchant", default=None)
 _request_merchant_id: ContextVar[int | None] = ContextVar("request_merchant_id", default=None)
 _request_session_time: ContextVar[float] = ContextVar("request_session_time", default=float("inf"))
+_request_auth_state: ContextVar[dict | None] = ContextVar("request_auth_state", default=None)
 
 
 def _secret() -> bytes:
@@ -21,7 +22,9 @@ def _secret() -> bytes:
     return value.encode()
 
 
-def create_merchant_session(fio_norm: str, merchant_id: int | None = None) -> str:
+def create_merchant_session(fio_norm: str, merchant_id: int) -> str:
+    if type(merchant_id) is not int or merchant_id <= 0:
+        raise ValueError('A positive merchant_id is required')
     payload = {
         "sub": fio_norm,
         "merchant_id": merchant_id,
@@ -41,6 +44,8 @@ def read_merchant_session(token: str | None) -> dict | None:
         if not hmac.compare_digest(signature, expected):
             return None
         payload = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+        if type(payload.get('merchant_id')) is not int or payload['merchant_id'] <= 0:
+            return None
         if int(payload.get("exp", 0)) < int(time.time()) or not payload.get("sub"):
             return None
         return payload
@@ -49,13 +54,24 @@ def read_merchant_session(token: str | None) -> dict | None:
 
 
 def set_request_merchant(fio_norm: str | None, issued_at: float = float("inf"), merchant_id: int | None = None):
-    return (_request_merchant.set(fio_norm), _request_session_time.set(issued_at), _request_merchant_id.set(merchant_id))
+    return (_request_merchant.set(fio_norm), _request_session_time.set(issued_at), _request_merchant_id.set(merchant_id), _request_auth_state.set({}))
 
 
 def reset_request_merchant(token) -> None:
     _request_merchant.reset(token[0])
     _request_session_time.reset(token[1])
     _request_merchant_id.reset(token[2])
+    _request_auth_state.reset(token[3])
+
+
+def invalidate_merchant_session():
+    state = _request_auth_state.get()
+    if state is not None:
+        state['invalid'] = True
+
+
+def merchant_session_invalid():
+    return bool((_request_auth_state.get() or {}).get('invalid'))
 
 
 def request_session_issued_at() -> float:

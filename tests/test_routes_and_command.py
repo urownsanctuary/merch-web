@@ -60,14 +60,14 @@ class RouteTests(unittest.TestCase):
 
     def test_merchant_logout_clears_signed_session(self):
         with TestClient(app) as client:
-            client.cookies.set("merchant_session", create_merchant_session("иванов иван"))
+            client.cookies.set("merchant_session", create_merchant_session("иванов иван", 1))
             response = client.get("/merchant-logout", follow_redirects=False)
         self.assertEqual(response.status_code, 303)
         self.assertEqual(response.headers["location"], "/login-page")
         self.assertIn("merchant_session=", response.headers["set-cookie"])
 
     def test_one_merchant_cannot_resolve_another(self):
-        token = set_request_merchant(fio_norm("Иванов Иван"))
+        token = set_request_merchant(fio_norm("Иванов Иван"), merchant_id=1)
         try:
             from sqlalchemy.orm import Session
             with Session(engine) as db:
@@ -162,6 +162,12 @@ class ReceiptResult:
     def first(self):
         return self.row
 
+    def scalar(self):
+        return None
+
+    def all(self):
+        return [self.row] if self.row else []
+
 
 class ReceiptDB:
     def __init__(self, owner_norm="иванов иван"):
@@ -173,6 +179,10 @@ class ReceiptDB:
                 "original_filename": "check.pdf", "content_type": "application/pdf",
                 "data": b"%PDF-test", "merchant_id": 1, "fio_norm": self.owner_norm,
             })
+        if 'WHERE id = :identity' in str(statement):
+            mid=params['identity']
+            return ReceiptResult(dict(id=mid,fio=self.owner_norm,fio_norm=self.owner_norm,
+                                      telegram_id=None,tu='TEST',created_at=None))
         return ReceiptResult()
 
     def commit(self):
@@ -197,14 +207,14 @@ class ReceiptAccessTests(unittest.TestCase):
 
     def test_owner_can_open_receipt(self):
         with TestClient(app) as client:
-            client.cookies.set("merchant_session", create_merchant_session("иванов иван"))
+            client.cookies.set("merchant_session", create_merchant_session("иванов иван", 1))
             response = client.get("/receipts/file/check.pdf")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.content, b"%PDF-test")
 
     def test_other_merchant_forbidden(self):
         with TestClient(app) as client:
-            client.cookies.set("merchant_session", create_merchant_session("петров петр"))
+            client.cookies.set("merchant_session", create_merchant_session("петров петр", 2))
             response = client.get("/receipts/file/check.pdf")
         self.assertEqual(response.status_code, 403)
 

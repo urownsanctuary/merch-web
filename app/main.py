@@ -113,6 +113,7 @@ from app.runtime import maintenance_mode_enabled
 from app.services import month_end_exclusive
 from app import delivery_roles
 from app.delivery_ui import action_input, handle_visit
+from app.security import merchant_session_invalid
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
@@ -172,7 +173,15 @@ async def reject_cross_site_mutations(request: Request, call_next):
 
 @app.middleware("http")
 async def bind_merchant_identity(request: Request, call_next):
-    session = read_merchant_session(request.cookies.get(MERCHANT_COOKIE))
+    raw_cookie = request.cookies.get(MERCHANT_COOKIE)
+    session = read_merchant_session(raw_cookie)
+    merchant_request = not (request.url.path.startswith(('/admin', '/static')) or request.url.path in {'/', '/login', '/login-page', '/db-check', '/active-period'})
+    if request.url.path.startswith('/receipts/') and is_admin_authenticated(request.cookies.get('admin_auth')):
+        merchant_request = False
+    if raw_cookie and not session and merchant_request:
+        response = RedirectResponse('/login-page', status_code=303)
+        response.delete_cookie(MERCHANT_COOKIE)
+        return response
     context_token = set_request_merchant(
         session.get("sub") if session else None,
         float(session.get("iat", session.get("exp", 0) - 12 * 60 * 60)) if session else 0,
@@ -180,6 +189,11 @@ async def bind_merchant_identity(request: Request, call_next):
     )
     try:
         response = await call_next(request)
+        if merchant_session_invalid() and merchant_request:
+            response = RedirectResponse('/login-page', status_code=303)
+            response.delete_cookie(MERCHANT_COOKIE)
+        elif raw_cookie and not session and request.url.path not in {'/login', '/login-page'}:
+            response.delete_cookie(MERCHANT_COOKIE)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "same-origin"
@@ -1221,16 +1235,17 @@ def receipt_file(
     if not row:
         raise HTTPException(status_code=404, detail="Not Found")
     session = read_merchant_session(request.cookies.get(MERCHANT_COOKIE))
-    owner_allowed = bool(session and row["fio_norm"] and session.get("sub") == row["fio_norm"])
-    if session and row["merchant_id"] is None:
+    merchant = get_merchant_by_fio(db, session['sub']) if session and not is_admin_authenticated(admin_auth) else None
+    owner_allowed = bool(merchant and row['merchant_id'] == merchant['id'])
+    if merchant and row["merchant_id"] is None:
         owner_allowed = db.execute(text("""
             SELECT 1
             FROM point_adjustments pa
             JOIN merchants m ON m.id=pa.merchant_id
-            WHERE m.fio_norm=:fio_norm AND pa.reimb_receipt LIKE :receipt_path
+            WHERE m.id=:merchant_id AND pa.reimb_receipt LIKE :receipt_path
             LIMIT 1
         """), {
-            "fio_norm": session["sub"],
+            "merchant_id": merchant['id'],
             "receipt_path": f"%receipts/{file_id}/%",
         }).first() is not None
     if not owner_allowed and not is_admin_authenticated(admin_auth):
@@ -2010,7 +2025,7 @@ def point_note_page(
         ) or {}
         existing_note_comment = str(existing.get("note_comment") or "")
         supply_days = filter_unadjusted_supply_days(supply_days, existing_note_comment)
-        assigned = delivery_roles.roles_for_month(db, merchant["id"], point_code_clean, period["year"], period["month"])
+        assigned = delivery_roles.note_locked_days(db, merchant["id"], point_code_clean, period["year"], period["month"])
         supply_days = [d for d in supply_days if d.day not in assigned]
         adjustment = get_supply_adjustment_amount(db, point_code_clean, period["year"], period["month"])
         options = "".join([f"<option value='{d.day}'>{d.strftime('%d.%m.%Y')}</option>" for d in supply_days])
@@ -2158,7 +2173,7 @@ def save_point_note_no_supply(
     delivery_roles.lock_merchants(db, [merchant["id"]])
     if delivery_roles.submitted(db, merchant["id"], supply_date):
         raise HTTPException(status_code=409, detail="Сверка уже отправлена")
-    assigned = delivery_roles.roles_for_month(db, merchant["id"], point_code_clean, period["year"], period["month"])
+    assigned = delivery_roles.note_locked_days(db, merchant["id"], point_code_clean, period["year"], period["month"])
     if supply_day in assigned:
         raise HTTPException(status_code=409, detail="Тип оплаты этого выхода уже подтверждён. Обратитесь к администратору.")
     adjustment = get_supply_adjustment_amount(db, point_code_clean, period["year"], period["month"])
@@ -4904,6 +4919,7 @@ def admin_delivery_exceptions(year: int, month: int,
     if not 1 <= month <= 12 or not 2000 <= year <= 2200:
         raise HTTPException(status_code=400, detail="Некорректный период")
     labels = {"EXCEPTION_SUBMITTED": "Сверка первого уже отправлена",
+              "EXCEPTION_DELETE_RECEIVER": "Удаление принимающего требует безопасного восстановления оплаты",
               "EXCEPTION_RECEIVER_ASSIGNED": "Принимающий поставку уже подтверждён",
               "EXCEPTION_AMBIGUOUS": "Неоднозначные прежние выходы",
               "EXCEPTION_LEGACY_NOTE": "Есть прежняя корректировка"}

@@ -34,13 +34,13 @@ class AuthenticationRulesTests(unittest.TestCase):
         self.assertEqual(fio_norm("Ёлкин Семён"), fio_norm("Елкин Семен"))
 
     def test_signed_session_and_csrf(self):
-        token = create_merchant_session("иванов иван")
+        token = create_merchant_session("иванов иван", 1)
         session = read_merchant_session(token)
         self.assertEqual(session["sub"], "иванов иван")
         self.assertTrue(verify_csrf(session, session["csrf"]))
 
     def test_tampered_session(self):
-        self.assertIsNone(read_merchant_session(create_merchant_session("a") + "x"))
+        self.assertIsNone(read_merchant_session(create_merchant_session("a", 1) + "x"))
 
 
 class SupplyRulesTests(unittest.TestCase):

@@ -1,5 +1,6 @@
 """Delivery decisions on isolated data; all people and phones are synthetic."""
 from datetime import date
+import os
 from html import unescape
 from io import BytesIO
 import re
@@ -22,6 +23,7 @@ class DeliveryTests(unittest.TestCase):
 
     def setUp(self):
         fixtures.FourFixTests.setUp(self)
+        self.stack.enter_context(patch.dict(os.environ, {'DELIVERY_ROLE_FLOW_ENABLED': '1'}))
         self.names = {1: 'Сотрудник Альфа', 2: 'Сотрудник Бета', 3: 'Сотрудник Гамма'}
         with self.factory() as db:
             migrate(db, apply=True)
@@ -102,7 +104,7 @@ class DeliveryTests(unittest.TestCase):
         before=self.sql('SELECT * FROM visits WHERE merchant_id=1')
         r,_=self.double('no_supply');self.assertEqual(r.status_code,303,r.text)
         self.assertEqual(self.sql('SELECT * FROM visits WHERE merchant_id=1'),before)
-        self.assertEqual(self.sql('SELECT * FROM visit_payment_roles WHERE merchant_id=1'),[])
+        self.assertEqual(self.sql('SELECT role FROM visit_payment_roles WHERE merchant_id=1')[0]['role'],'RECEIVER')
         self.assertEqual((self.totals(1)['total'],self.totals(2)['total']),(900,500))
         self.assertEqual(self.sql('SELECT * FROM point_adjustments'),[])
 
@@ -176,7 +178,7 @@ class DeliveryTests(unittest.TestCase):
             r=self.post(second,delivery_choice='receiver')
         self.assertEqual(r.status_code,503)
         self.assertEqual(len(self.sql('SELECT * FROM visits')),1)
-        self.assertEqual(self.sql('SELECT * FROM visit_payment_roles'),[])
+        self.assertEqual([r['merchant_id'] for r in self.sql('SELECT * FROM visit_payment_roles')],[1])
         self.assertEqual(len(self.sql('SELECT * FROM delivery_events')),1)
         self.assertEqual(self.totals(1)['total'],900)
 
@@ -194,14 +196,16 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(self.sql('SELECT * FROM point_adjustments'),[])
         self.assertEqual(self.totals(1)['total'],500)
 
-    def test_remove_readd_keeps_role_and_no_reassignment(self):
+    def test_remove_readd_requires_new_transfer_and_retains_history(self):
         self.supply();self.add_first();self.double()
         self.assertEqual(self.post(self.form(adding=False)).status_code,303)
         self.assertEqual(self.totals(2)['coffee_cnt'],0)
+        self.assertEqual(self.sql('SELECT * FROM visit_payment_roles WHERE merchant_id=2'),[])
+        self.assertEqual(self.totals(1)['cnt_supply'],1)
         r,_=self.double();self.assertEqual(r.status_code,303,r.text)
         self.assertEqual(self.totals(2)['cnt_supply'],1)
         self.assertEqual(self.totals(1)['cnt_no_supply'],1)
-        self.assertEqual(len(self.sql("SELECT * FROM delivery_events WHERE event_type='TRANSFER'")),1)
+        self.assertEqual(len(self.sql("SELECT * FROM delivery_events WHERE event_type='TRANSFER'")),2)
 
     def test_weekend_and_special_inventory_preserve_slots_and_week_limit(self):
         for day in (3,4,5,8):
@@ -270,14 +274,13 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(len(self.sql('SELECT * FROM visits')),2)
         self.assertEqual(len(self.sql("SELECT * FROM delivery_events WHERE event_type='TRANSFER'")),1)
 
-    def test_first_restores_attendance_after_second_declines_delivery(self):
+    def test_first_deletion_without_fallback_requires_admin(self):
         self.supply();self.add_first();self.double('no_supply');self.login(1)
-        self.assertEqual(self.post(self.form(adding=False)).status_code,303)
-        response,_=self.double(mid=1)
-        self.assertEqual(response.status_code,303,response.text)
+        # No recorded fallback recipient: keep finances intact for admin review.
+        self.assertEqual(self.post(self.form(adding=False)).status_code,409)
         self.assertEqual(self.totals(1)['total'],900)
         self.assertEqual(self.totals(2)['total'],500)
-        self.assertEqual(self.sql('SELECT * FROM visit_payment_roles WHERE merchant_id=1'),[])
+        self.assertEqual(self.sql('SELECT role FROM visit_payment_roles WHERE merchant_id=1')[0]['role'],'RECEIVER')
 
     def test_overlap_export_marks_confirmation_without_losing_sheets(self):
         self.supply();self.add_first();self.double()
@@ -310,7 +313,7 @@ class DeliveryTests(unittest.TestCase):
             self.assertEqual(response.status_code,303,response.text)
         self.assertEqual(self.totals(2)['cnt_full_inv'],4)
         self.assertEqual(self.totals(2)['coffee_cnt'],0)
-        self.assertEqual(self.sql('SELECT * FROM visit_payment_roles'),[])
+        self.assertEqual({r['merchant_id'] for r in self.sql('SELECT * FROM visit_payment_roles')},{1})
         self.assertEqual({r['slot'] for r in self.sql('SELECT slot FROM visits WHERE merchant_id=2')},{'EVENING','FULL_INVENT'})
 
     def test_ambiguous_legacy_first_visits_require_admin(self):
@@ -319,7 +322,7 @@ class DeliveryTests(unittest.TestCase):
         response,_=self.double()
         self.assertEqual(response.status_code,409,response.text)
         self.assertEqual(len(self.sql('SELECT * FROM visits')),2)
-        self.assertEqual(self.sql('SELECT * FROM visit_payment_roles'),[])
+        self.assertEqual({r['merchant_id'] for r in self.sql('SELECT * FROM visit_payment_roles')},{1})
         self.assertEqual(self.sql("SELECT event_type FROM delivery_events WHERE event_type LIKE 'EXCEPTION_%'")[0]['event_type'],'EXCEPTION_AMBIGUOUS')
 
 
@@ -330,6 +333,7 @@ class DeliveryMigrationTests(unittest.TestCase):
         engine=create_engine('sqlite+pysqlite:///:memory:')
         with Session(engine) as db:
             db.execute(text('CREATE TABLE merchants (id INTEGER PRIMARY KEY,last4 TEXT)'))
+            db.execute(text('CREATE TABLE visits (id INTEGER PRIMARY KEY,merchant_id INTEGER,point_code TEXT,visit_date DATE,slot TEXT)'))
             db.execute(text("INSERT INTO merchants VALUES (1,'1234')"));db.commit()
             self.assertGreater(migrate(db)['operations'],0)
             self.assertFalse(inspect(db.connection()).has_table('delivery_events'))

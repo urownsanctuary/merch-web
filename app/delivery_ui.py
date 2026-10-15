@@ -49,11 +49,15 @@ def handle_visit(*, db, merchant, point, day, slot, csrf, action, choice,
     from app.services import (toggle_day_visit, toggle_inventory_visit, SLOT_FULL_INVENT,
                               REGULAR_PAY_SLOTS, InventoryWeekLimitError)
     from app.coffee_days import sync_coffee_after_visit
-    if not roles.available(db):
-        if any(r["merchant_id"] != merchant["id"] for r in roles.day_visits(db, point, day)):
+    ready = roles.available(db)
+    if not roles.enabled():
+        if ready and roles.current_roles(db, point, day):
             db.rollback()
-            return HTMLResponse("Подтверждение совместного выхода временно недоступно. Обратитесь к администратору.", status_code=503)
+            return HTMLResponse("Изменение подтверждённых выходов временно отключено.", status_code=409)
         return None
+    if not ready:
+        db.rollback()
+        return HTMLResponse("Подтверждение совместного выхода временно недоступно. Обратитесь к администратору.", status_code=503)
     payload = read_visit_action(action, csrf) if action else None
     if action and (not payload or any(payload.get(k) != v for k, v in
                       {"point": point, "day": day.isoformat(), "slot": slot}.items())):
@@ -108,6 +112,11 @@ def handle_visit(*, db, merchant, point, day, slot, csrf, action, choice,
                 else:
                     db.rollback()
                 return HTMLResponse(escape(decision["message"]), status_code=409)
+        if not payload['adding']:
+            error = roles.remove_role(db, merchant_id=merchant['id'], point=point, day=day, visit=existing, key=payload['key'])
+            if error:
+                db.commit()
+                return HTMLResponse(escape(error), status_code=409)
         if slot == SLOT_FULL_INVENT:
             toggle_inventory_visit(db, merchant["id"], point, day.year, day.month, day.day,
                                    special_inventory=special_inventory, commit=False)

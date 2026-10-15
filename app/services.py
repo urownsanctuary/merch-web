@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 from sqlalchemy import text, bindparam, inspect
 from openpyxl import load_workbook
-from app.security import request_merchant_matches, request_session_issued_at, request_merchant_id
+from app.security import request_merchant_matches, request_session_issued_at, request_merchant_id, invalidate_merchant_session
 from app.runtime import maintenance_mode_enabled
 from app import delivery_roles
 from app.coffee_days import coffee_count, snapshot_coffee_for_submit
@@ -152,6 +152,10 @@ def login_user(db: Session, fio: str, last4: str):
 
 def get_merchant_by_fio(db: Session, fio: str):
     fio_n = fio_norm(fio)
+    identity = request_merchant_id()
+    if type(identity) is not int or identity <= 0:
+        invalidate_merchant_session()
+        return None
     if not request_merchant_matches(fio_n):
         return None
     # A roster reset invalidates previously issued sessions even if the same
@@ -163,23 +167,23 @@ def get_merchant_by_fio(db: Session, fio: str):
         if cleared_at.tzinfo is None:
             cleared_at = cleared_at.replace(tzinfo=timezone.utc)
         if request_session_issued_at() <= cleared_at.timestamp():
+            invalidate_merchant_session()
             return None
-    identity = request_merchant_id()
     results = db.execute(
         text(
             """
             SELECT id, fio, fio_norm, telegram_id, tu, created_at
             FROM merchants
-            WHERE fio_norm = :fio_norm
+            WHERE id = :identity
               AND COALESCE(is_active, TRUE) = TRUE
-              AND (CAST(:identity AS INTEGER) IS NULL OR id = :identity)
             LIMIT 2
             """
         ),
-        {"fio_norm": fio_n, "identity": identity},
+        {"identity": identity},
     ).mappings().all()
 
     if len(results) != 1:
+        invalidate_merchant_session()
         return None
     result = results[0]
 
@@ -1011,7 +1015,7 @@ def compute_point_total(db: Session, merchant_id: int, point_code: str, y: int, 
     visits = get_visits_for_month(db, merchant_id, point_code, y, m)
     rates = get_point_rates(db, point_code, y, m)
     point_adj = get_point_adjustment(db, merchant_id, point_code, y, m)
-    payment_roles = delivery_roles.roles_for_month(db, merchant_id, point_code, y, m)
+    payment_roles = delivery_roles.payment_roles_for_month(db, merchant_id, point_code, y, m)
 
     total = 0
     cnt_supply = 0
@@ -1231,8 +1235,7 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
         """
 
     roles_ready = delivery_roles.available(db)
-    role_join = "LEFT JOIN visit_payment_roles vr ON vr.merchant_id=v.merchant_id AND vr.point_code=v.point_code AND vr.visit_date=v.visit_date" if roles_ready else ""
-    role_condition = "AND COALESCE(vr.role, '') <> 'NO_SUPPLY'" if roles_ready else ""
+    role_condition = "AND " + delivery_roles.supply_owner_predicate("v") if roles_ready else ""
 
     sql = f"""
         WITH {adjustment_ctes},
@@ -1288,7 +1291,6 @@ def get_admin_report_rows(db: Session, y: int, m: int, tu: str | None = None, st
                 SUM(v.cnt_full_inv) AS cnt_full_inv,
                 SUM(v.cnt_regular) AS cnt_day_total
             FROM visit_by_day v
-            {role_join}
             LEFT JOIN supplies s
               ON s.point_code = v.point_code
              AND s.supply_date = v.visit_date

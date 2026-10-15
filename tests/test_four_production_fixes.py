@@ -62,7 +62,7 @@ class FourFixTests(unittest.TestCase):
                 yield db
         main.app.dependency_overrides[main.get_db] = dependency
         self.client = TestClient(main.app)
-        self.token = create_merchant_session("тестовый мерч")
+        self.token = create_merchant_session("тестовый мерч", 1)
         self.csrf = read_merchant_session(self.token)["csrf"]
         self.client.cookies.set("merchant_session", self.token)
 
@@ -269,7 +269,7 @@ class FourFixTests(unittest.TestCase):
             self.assertEqual(db.execute(text("SELECT merchant_id FROM point_adjustments")).scalar(),1)
             db.execute(text("INSERT INTO merchants (fio,fio_norm,pass_hash,tu) VALUES ('Тестовый Мерч','тестовый мерч',:hash,'ТУ-1')"),{"hash":services.hash_last4("1234")})
             db.commit()
-            context = set_request_merchant("тестовый мерч",0)
+            context = set_request_merchant("тестовый мерч",0,1)
             try:
                 self.assertIsNone(services.get_merchant_by_fio(db,"Тестовый Мерч"))
             finally:
