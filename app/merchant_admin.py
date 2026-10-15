@@ -25,6 +25,9 @@ MERCHANT_SORTS = {
 }
 
 DELETE_ALL_CONFIRMATION = "УДАЛИТЬ ВСЕХ МЕРЧЕНДАЙЗЕРОВ"
+# Payment state and immutable audit survive a credential reset. They are known
+# to the schema guard but are deliberately not exposed or counted in preview.
+MERCHANT_PRESERVED_TABLES = frozenset({'visit_payment_roles', 'delivery_events'})
 MERCHANT_OWNED_TABLES = (
     "reimbursement_receipts",
     "receipt_files",
@@ -503,7 +506,8 @@ def _existing_merchant_owned_tables(db: Session) -> dict[str, set[str]]:
     unknown = []
     for table_name in sorted(tables - {"merchants"}):
         columns = {column["name"] for column in inspector.get_columns(table_name)}
-        if "merchant_id" in columns and table_name not in MERCHANT_OWNED_TABLES:
+        if ("merchant_id" in columns and table_name not in MERCHANT_OWNED_TABLES
+                and table_name not in MERCHANT_PRESERVED_TABLES):
             unknown.append(table_name)
     if unknown:
         raise RuntimeError(
