@@ -47,7 +47,7 @@ class SlotHotfixTests(unittest.TestCase):
             16: {SLOT_DAY},       # Thursday
             17: {SLOT_MORNING, SLOT_EVENING},
             18: {SLOT_MORNING, SLOT_EVENING},
-            19: {SLOT_DAY},       # Sunday
+            19: {SLOT_MORNING, SLOT_EVENING},  # Sunday
         }
         for day, slots in expected.items():
             self.assertEqual(allowed_visit_slots(date(2026, 7, day)), slots)
@@ -133,8 +133,8 @@ class SlotHotfixTests(unittest.TestCase):
             self.assertEqual(wednesday.status_code, 303)
             self.assertIn("/calendar-page", wednesday.headers["location"])
             for response in (friday, saturday):
-                self.assertIn("Добавить утренний выход", response.text)
-                self.assertIn("Добавить вечерний полный инвент", response.text)
+                self.assertIn(">Утренний выход</button>", response.text)
+                self.assertIn(">Вечерний выход</button>", response.text)
         finally:
             app.dependency_overrides.clear()
 
@@ -174,7 +174,7 @@ class SlotHotfixTests(unittest.TestCase):
                             "fio": "Тестовый Мерч",
                             "point_code": "2674",
                             "day": 19,
-                            "slot": SLOT_DAY,
+                            "slot": SLOT_MORNING,
                             "csrf_token": csrf,
                         },
                     )
@@ -184,14 +184,15 @@ class SlotHotfixTests(unittest.TestCase):
                             "fio": "Тестовый Мерч",
                             "point_code": "2674",
                             "day": 19,
-                            "slot": SLOT_DAY,
+                            "slot": SLOT_MORNING,
                             "csrf_token": csrf,
                             "confirm_non_working": "1",
                         },
                         follow_redirects=False,
                     )
-            self.assertEqual(page.status_code, 303)
-            self.assertIn("/calendar-page", page.headers["location"])
+            self.assertEqual(page.status_code, 200)
+            self.assertIn(">Утренний выход</button>", page.text)
+            self.assertIn(">Вечерний выход</button>", page.text)
             self.assertEqual(rejected.status_code, 409)
             self.assertIn(
                 "Это выходной или праздничный день по производственному календарю.",
@@ -212,7 +213,7 @@ class SlotHotfixTests(unittest.TestCase):
             visits={},
             is_submitted=False,
             special_inventory_days=set(),
-            calendar_overrides={},
+            calendar_overrides={date(2026, 7, 1): True},  # holiday with a direct DAY toggle
             csrf_token="csrf-value",
         )
         self.assertIn('class="direct-day-form"', html)
