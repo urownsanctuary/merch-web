@@ -212,11 +212,18 @@ class DeliveryTests(unittest.TestCase):
             with self.subTest(day=day):
                 if day==8:
                     self.stack.enter_context(patch('app.main.get_special_inventory_days',return_value=[date(2026,7,8)]))
-                slot='DAY' if day==8 else 'MORNING'
+                slot='DAY' if day in (5,8) else 'MORNING'
                 self.supply(day);self.add_first(day,slot)
                 r,_=self.double(day=day,slot=slot);self.assertEqual(r.status_code,303,r.text)
-                page=self.client.get('/day-action-page',params=dict(fio=self.names[2],point_code='P1',day=day))
-                self.assertIn('Утренний выход',page.text);self.assertIn('Вечерний выход',page.text)
+                page=self.client.get('/day-action-page',params=dict(fio=self.names[2],point_code='P1',day=day),follow_redirects=False)
+                if day == 5:
+                    self.assertEqual(page.status_code,303)
+                    self.assertIn('/calendar-page',page.headers['location'])
+                elif day == 4:
+                    self.assertIn('Убрать утренний выход',page.text)
+                    self.assertIn('Добавить вечерний полный инвент',page.text)
+                else:
+                    self.assertIn('Утренний выход',page.text);self.assertIn('Вечерний выход',page.text)
         evening=self.post(self.form(8,'FULL_INVENT'))
         form=self.question_form(evening)
         self.assertEqual(self.post(form,delivery_choice='yes').status_code,303)
@@ -305,11 +312,11 @@ class DeliveryTests(unittest.TestCase):
 
 
     def test_evening_slots_never_receive_delivery_role(self):
-        self.stack.enter_context(patch('app.main.get_special_inventory_days',return_value=[date(2026,7,22)]))
+        self.stack.enter_context(patch('app.main.get_special_inventory_days',return_value=[date(2026,7,19),date(2026,7,22)]))
         for day in (3,11,19,22):
             self.supply(day)
-            self.add_first(day,'DAY' if day==22 else 'MORNING')
-            response,_=self.double(day=day,slot='FULL_INVENT' if day==22 else 'EVENING')
+            self.add_first(day,'DAY' if day in (19,22) else 'MORNING')
+            response,_=self.double(day=day,slot='FULL_INVENT' if day in (19,22) else 'EVENING')
             self.assertEqual(response.status_code,303,response.text)
         self.assertEqual(self.totals(2)['cnt_full_inv'],4)
         self.assertEqual(self.totals(2)['coffee_cnt'],0)
