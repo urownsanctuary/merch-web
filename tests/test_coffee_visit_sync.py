@@ -20,7 +20,7 @@ class CoffeeVisitSyncTests(unittest.TestCase):
 
     def visit(self,day,slot=None,status=303):
         if slot is None:
-            slot = 'MORNING' if date(2026, 7, day).weekday() in (4, 5, 6) else 'DAY'
+            slot = 'MORNING' if date(2026, 7, day).weekday() in (4, 5) else 'DAY'
         result=self.client.post('/toggle-day',data={'fio':'Тестовый Мерч','point_code':'P1',
             'day':day,'slot':slot,'csrf_token':self.csrf,'confirm_non_working':'1'},follow_redirects=False)
         self.assertEqual(result.status_code,status)
@@ -45,10 +45,15 @@ class CoffeeVisitSyncTests(unittest.TestCase):
     def test_saturday_morning(self):
         self.visit(4,'MORNING');self.assertEqual(self.total()['coffee_cnt'],1)
 
-    def test_sunday_morning_evening_one_coffee_day(self):
-        self.visit(5,'MORNING');self.assertEqual(self.total()['coffee_cnt'],1)
-        self.visit(5,'EVENING');self.assertEqual(self.total()['coffee_cnt'],1)
+    def test_historical_sunday_morning_evening_one_coffee_day(self):
+        with self.factory() as db:
+            db.execute(text("INSERT INTO visits(merchant_id,point_code,visit_date,slot) VALUES(1,'P1','2026-07-05','MORNING'),(1,'P1','2026-07-05','EVENING')"));db.commit()
+        self.assertEqual(self.total()['coffee_cnt'],1)
         self.visit(5,'MORNING');self.assertEqual(self.total()['coffee_cnt'],0)
+
+    def test_sunday_day_add_remove_coffee(self):
+        self.visit(5,'DAY');self.assertEqual(self.total()['coffee_cnt'],1)
+        self.visit(5,'DAY');self.assertEqual(self.total()['coffee_cnt'],0)
 
     def test_legacy_slots_on_same_date_not_double_counted(self):
         with self.factory() as db:

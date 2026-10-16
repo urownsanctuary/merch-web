@@ -74,6 +74,8 @@ from app.services import (
     SLOT_MORNING,
     SLOT_EVENING,
     SLOT_FULL_INVENT,
+    REGULAR_PAY_SLOTS,
+    INVENTORY_PAY_SLOTS,
     normalize_visit_slot,
 )
 from app.production_calendar import (
@@ -1604,7 +1606,7 @@ def build_calendar_html(
             badges += '<span class="badge badge-inv">И</span>'
 
         current_date = date(y, m, day)
-        inventory_allowed = current_date.weekday() in (4, 5, 6) or current_date in special_inventory_days
+        inventory_allowed = current_date.weekday() in (4, 5) or current_date in special_inventory_days
         allowed_slots = allowed_visit_slots(
             current_date,
             special_inventory=current_date in special_inventory_days,
@@ -1623,7 +1625,11 @@ def build_calendar_html(
             <div class="day-badges">{badges}</div>
         """
         if direct_day_toggle and not is_submitted:
-            adding_day = SLOT_DAY not in day_visits
+            # Remove an existing post-PR #20 Sunday morning without converting
+            # historical attendance or creating a second regular visit.
+            direct_slot = (SLOT_MORNING if current_date.weekday() == 6
+                           and SLOT_MORNING in day_visits and SLOT_DAY not in day_visits else SLOT_DAY)
+            adding_day = direct_slot not in day_visits
             confirmation_input = (
                 '<input type="hidden" name="confirm_non_working" value="1" />'
                 if non_working_day and adding_day
@@ -1639,9 +1645,9 @@ def build_calendar_html(
                 <input type="hidden" name="fio" value="{escape(fio)}" />
                 <input type="hidden" name="point_code" value="{escape(point_code)}" />
                 <input type="hidden" name="day" value="{day}" />
-                <input type="hidden" name="slot" value="{SLOT_DAY}" />
+                <input type="hidden" name="slot" value="{direct_slot}" />
                 <input type="hidden" name="csrf_token" value="{escape(csrf_token)}" />
-                {action_input(csrf_token, point_code, current_date, SLOT_DAY, adding_day)}
+                {action_input(csrf_token, point_code, current_date, direct_slot, adding_day)}
                 {confirmation_input}
                 <button class="{cls}" type="submit">{day_content}</button>
             </form>
@@ -1906,8 +1912,8 @@ def calendar_page(
             </div>
 
             <div class="calendar-note">
-                В обычные дни отмечается один выход. В пятницу, субботу, воскресенье
-                и дополнительные даты можно отдельно отметить утренний и вечерний выход.
+                В обычные дни, включая воскресенье, отмечается один выход.
+                В пятницу, субботу и дополнительные даты инвентаризации доступен выбор типа выхода.
             </div>
 
             <div class="calendar-note">
@@ -2755,18 +2761,29 @@ def day_action_page(
         )
 
     action_forms = []
-    if current_date.weekday() == 6 and SLOT_DAY in day_visits:
-        # A previously recorded Sunday DAY is already the morning exit.
-        allowed_slots = (allowed_slots - {SLOT_MORNING}) | {SLOT_DAY}
-    if special_inventory and current_date.weekday() == 6 and SLOT_FULL_INVENT in day_visits:
-        # Let the user toggle the existing inventory mark without changing its type.
-        allowed_slots = (allowed_slots - {SLOT_EVENING}) | {SLOT_FULL_INVENT}
+    if special_inventory and current_date.weekday() == 6:
+        # Existing post-PR #20 marks may only be removed, never reclassified.
+        if SLOT_MORNING in day_visits and SLOT_DAY not in day_visits:
+            allowed_slots = (allowed_slots - {SLOT_DAY}) | {SLOT_MORNING}
+        if SLOT_EVENING in day_visits and SLOT_FULL_INVENT not in day_visits:
+            allowed_slots = (allowed_slots - {SLOT_FULL_INVENT}) | {SLOT_EVENING}
 
     def visit_form(slot: str, button_text: str, *, inventory: bool = False) -> str:
         action = "/toggle-inventory" if inventory else "/toggle-day"
         slot_input = "" if inventory else f'<input type="hidden" name="slot" value="{slot}" />'
         button_class = "btn btn-secondary btn-small" if inventory else "btn btn-small"
         adding = slot not in day_visits
+        # Restore the exact pre-PR #20 Saturday labels, without changing slots.
+        if current_date.weekday() == 5:
+            if slot == SLOT_MORNING:
+                button_text = "Добавить утренний выход" if adding else "Убрать утренний выход"
+            elif slot == SLOT_EVENING:
+                button_text = "Добавить вечерний полный инвент" if adding else "Убрать вечерний полный инвент"
+        elif current_date.weekday() == 6 and special_inventory:
+            if slot in REGULAR_PAY_SLOTS:
+                button_text = "Добавить выход" if adding else "Убрать выход"
+            elif slot in INVENTORY_PAY_SLOTS:
+                button_text = "Добавить полный инвент" if adding else "Убрать полный инвент"
         confirmation = ""
         confirmation_attr = ""
         if non_working_day and adding:
@@ -2915,7 +2932,13 @@ def toggle_day_post(
         and SLOT_DAY in existing
         and SLOT_DAY not in allowed_slots
     )
-    if normalized_slot not in allowed_slots and not removing_legacy_day:
+    removing_legacy_sunday = (
+        current_date.weekday() == 6 and normalized_slot in existing
+        and (normalized_slot == SLOT_MORNING or (
+            normalized_slot == SLOT_EVENING and current_date in set(get_special_inventory_days(db))
+        ))
+    )
+    if normalized_slot not in allowed_slots and not (removing_legacy_day or removing_legacy_sunday):
         db.rollback()
         return HTMLResponse(
             "Для этой даты выбранный тип выхода недоступен. Вернитесь в календарь.",
@@ -3030,7 +3053,7 @@ def toggle_inventory_post(
     special_inventory = current_date in set(get_special_inventory_days(db))
     if SLOT_FULL_INVENT not in allowed_visit_slots(
         current_date, special_inventory=special_inventory
-    ) and not (special_inventory and current_date.weekday() == 6):
+    ):
         db.rollback()
         return HTMLResponse(
             "Полный инвент недоступен для этой даты. Вернитесь в календарь.",
